@@ -171,6 +171,27 @@ class BybitClient:
         except Exception as e:
             logger.warning("Failed to set trailing stop for %s: %s", symbol, e)
 
+    # ── Closed PnL ──────────────────────────────────────────
+
+    def get_closed_pnl(self, symbol: str, category: str = "linear", limit: int = 10) -> list[dict]:
+        """Get recent closed PnL records from exchange."""
+        resp = self.session.get_closed_pnl(
+            category=category, symbol=symbol, limit=limit
+        )
+        results = []
+        for r in resp["result"]["list"]:
+            results.append({
+                "order_id": r.get("orderId", ""),
+                "symbol": r["symbol"],
+                "side": r["side"],
+                "qty": float(r["qty"]),
+                "entry_price": float(r["avgEntryPrice"]),
+                "exit_price": float(r["avgExitPrice"]),
+                "pnl": float(r["closedPnl"]),
+                "closed_at": r.get("updatedTime", ""),
+            })
+        return results
+
     # ── Ticker (last price) ──────────────────────────────────
 
     def get_last_price(self, symbol: str, category: str = "linear") -> float:

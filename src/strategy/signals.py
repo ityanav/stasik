@@ -28,6 +28,12 @@ class SignalResult:
     details: dict[str, int]
 
 
+class Trend(Enum):
+    BULLISH = "BULLISH"
+    BEARISH = "BEARISH"
+    NEUTRAL = "NEUTRAL"
+
+
 class SignalGenerator:
     def __init__(self, config: dict):
         strat = config["strategy"]
@@ -142,3 +148,28 @@ class SignalGenerator:
             df.attrs.get("symbol", "?"), signal.value, total, rsi_val, vol_ratio, scores,
         )
         return SignalResult(signal=signal, score=total, details=scores)
+
+    def get_htf_trend(self, df: pd.DataFrame) -> Trend:
+        """Determine trend from higher timeframe using EMA + price position."""
+        if len(df) < self.ema_slow + 2:
+            return Trend.NEUTRAL
+
+        ema_fast, ema_slow = calculate_ema(df, self.ema_fast, self.ema_slow)
+        fast_val = ema_fast.iloc[-1]
+        slow_val = ema_slow.iloc[-1]
+        price = df["close"].iloc[-1]
+
+        # EMA alignment + price confirmation
+        if fast_val > slow_val and price > fast_val:
+            trend = Trend.BULLISH
+        elif fast_val < slow_val and price < fast_val:
+            trend = Trend.BEARISH
+        else:
+            trend = Trend.NEUTRAL
+
+        symbol = df.attrs.get("symbol", "?")
+        logger.info(
+            "HTF тренд %s: %s (EMA9=%.2f, EMA21=%.2f, price=%.2f)",
+            symbol, trend.value, fast_val, slow_val, price,
+        )
+        return trend

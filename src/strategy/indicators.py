@@ -38,6 +38,14 @@ def calculate_bollinger(
     return bb.bollinger_hband(), bb.bollinger_mavg(), bb.bollinger_lband()
 
 
+def calculate_adx(df: pd.DataFrame, period: int = 14) -> float:
+    """Returns current ADX value. >25 = trending, <20 = ranging."""
+    adx = ta.trend.ADXIndicator(
+        high=df["high"], low=df["low"], close=df["close"], window=period
+    )
+    return adx.adx().iloc[-1]
+
+
 def calculate_volume_signal(df: pd.DataFrame, period: int = 20) -> tuple[pd.Series, float]:
     """Returns volume SMA and current volume ratio (current / average)."""
     vol_sma = df["volume"].rolling(window=period).mean()

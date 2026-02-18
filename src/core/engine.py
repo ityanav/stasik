@@ -6,7 +6,7 @@ from src.exchange.client import BybitClient
 from src.risk.manager import RiskManager
 from src.storage.database import Database
 from src.strategy.ai_analyst import AIAnalyst, extract_indicator_values, format_risk_text, summarize_candles
-from src.strategy.signals import Signal, SignalGenerator
+from src.strategy.signals import Signal, SignalGenerator, Trend
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +29,17 @@ class TradingEngine:
         self._running = False
         self._instrument_cache: dict[str, dict] = {}
         self._tick_count: int = 0
+        self.htf_timeframe: str = str(config["trading"].get("htf_timeframe", "15"))
+        self._htf_cache: dict[str, tuple[Trend, float, float]] = {}  # symbol -> (trend, adx, timestamp)
+        self._adx_period: int = config["strategy"].get("adx_period", 14)
+        self._adx_min: float = config["strategy"].get("adx_min", 20)
+
+        # Correlation groups: symbol -> group name
+        self._corr_groups: dict[str, str] = {}
+        self._max_per_group: int = config["risk"].get("max_per_group", 1)
+        for group_name, symbols in config["risk"].get("correlation_groups", {}).items():
+            for s in symbols:
+                self._corr_groups[s] = group_name
 
     async def start(self):
         await self.db.connect()
@@ -105,6 +116,23 @@ class TradingEngine:
         if result.signal == Signal.HOLD:
             return
 
+        # HTF trend + ADX filter
+        htf_trend, adx = self._get_htf_data(symbol, category)
+
+        # ADX filter: skip if market is ranging (no clear trend)
+        if adx < self._adx_min:
+            logger.info("ADX фильтр: отклонён %s %s (ADX=%.1f < %d — боковик)",
+                        result.signal.value, symbol, adx, self._adx_min)
+            return
+
+        # HTF trend filter: only trade in direction of higher timeframe trend
+        if htf_trend == Trend.BEARISH and result.signal == Signal.BUY:
+            logger.info("HTF фильтр: отклонён BUY %s (тренд 15м медвежий)", symbol)
+            return
+        if htf_trend == Trend.BULLISH and result.signal == Signal.SELL:
+            logger.info("HTF фильтр: отклонён SELL %s (тренд 15м бычий)", symbol)
+            return
+
         # Check existing positions
         open_trades = await self.db.get_open_trades()
         symbol_open = [t for t in open_trades if t["symbol"] == symbol and t["category"] == category]
@@ -116,6 +144,20 @@ class TradingEngine:
         open_count = len(open_trades)
         if not self.risk.can_open_position(open_count):
             return
+
+        # Correlation group limit
+        group = self._corr_groups.get(symbol)
+        if group:
+            group_open = sum(
+                1 for t in open_trades
+                if self._corr_groups.get(t["symbol"]) == group
+            )
+            if group_open >= self._max_per_group:
+                logger.info(
+                    "Корреляция: отклонён %s — уже %d/%d из группы '%s'",
+                    symbol, group_open, self._max_per_group, group,
+                )
+                return
 
         side = "Buy" if result.signal == Signal.BUY else "Sell"
 
@@ -358,23 +400,35 @@ class TradingEngine:
         if still_open:
             return
 
-        # Position closed — calculate PnL
+        # Position closed — get real PnL from exchange
         entry_price = trade["entry_price"]
         qty = trade["qty"]
         side = trade["side"]
 
-        # Get current/last price as approximation of exit price
-        exit_price = self.client.get_last_price(symbol, category="linear")
+        exit_price = None
+        pnl = None
 
-        # Try to get actual closed PnL from exchange
         try:
-            pnl = self._get_closed_pnl(symbol, trade["order_id"])
+            closed_records = self.client.get_closed_pnl(symbol=symbol, limit=20)
+            # Find matching record by entry price and side
+            for rec in closed_records:
+                if rec["side"] == side and abs(rec["entry_price"] - entry_price) < entry_price * 0.001:
+                    pnl = rec["pnl"]
+                    exit_price = rec["exit_price"]
+                    logger.info("Got real PnL from exchange for %s: %.2f (exit=%.4f)", symbol, pnl, exit_price)
+                    break
         except Exception:
-            # Fallback: calculate manually
+            logger.warning("Failed to get closed PnL from exchange for %s", symbol)
+
+        # Fallback: calculate manually
+        if exit_price is None:
+            exit_price = self.client.get_last_price(symbol, category="linear")
+        if pnl is None:
             if side == "Buy":
                 pnl = (exit_price - entry_price) * qty
             else:
                 pnl = (entry_price - exit_price) * qty
+            logger.info("Using calculated PnL for %s: %.2f (fallback)", symbol, pnl)
 
         # Update DB
         balance = self.client.get_balance()
@@ -406,10 +460,29 @@ class TradingEngine:
         logger.info(msg)
         await self._notify(msg)
 
-    def _get_closed_pnl(self, symbol: str, order_id: str) -> float:
-        resp = self.session_closed_pnl(symbol)
-        # This is a best-effort; fallback handles failures
-        raise NotImplementedError
+    def _get_htf_data(self, symbol: str, category: str) -> tuple[Trend, float]:
+        """Get higher timeframe trend + ADX, cached for 5 minutes."""
+        import time
+        from src.strategy.indicators import calculate_adx
+        now = time.time()
+        cached = self._htf_cache.get(symbol)
+        if cached and now - cached[2] < 300:  # 5 min cache
+            return cached[0], cached[1]
+
+        try:
+            htf_df = self.client.get_klines(
+                symbol=symbol, interval=self.htf_timeframe, limit=100, category=category
+            )
+            htf_df.attrs["symbol"] = symbol
+            trend = self.signal_gen.get_htf_trend(htf_df)
+            adx = calculate_adx(htf_df, self._adx_period)
+        except Exception:
+            logger.warning("Failed to get HTF data for %s, allowing trade", symbol)
+            trend = Trend.NEUTRAL
+            adx = 25.0  # default: allow trading
+
+        self._htf_cache[symbol] = (trend, adx, now)
+        return trend, adx
 
     def _get_instrument_info(self, symbol: str, category: str) -> dict:
         key = f"{symbol}_{category}"
