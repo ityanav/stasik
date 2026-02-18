@@ -108,18 +108,30 @@ class TradingEngine:
         await self._notify("🚀 Бот запущен\nПары: " + ", ".join(self.pairs))
         logger.info("Trading engine started")
 
-        try:
-            await self._run_loop()
-        except asyncio.CancelledError:
-            logger.info("Trading engine cancelled")
-        finally:
-            await self.ai_analyst.close()
-            await self.db.close()
-            await self._notify("🛑 Бот остановлен")
-            logger.info("Trading engine stopped")
+        await self._run_loop()
 
     async def stop(self):
+        """Pause trading loop. DB and AI stay open for resume()."""
         self._running = False
+        logger.info("Trading engine paused")
+        await self._notify("⏸ Торговля приостановлена")
+
+    async def resume(self):
+        """Resume trading loop after stop()."""
+        if self._running:
+            return
+        self._running = True
+        logger.info("Trading engine resumed")
+        await self._notify("▶️ Торговля возобновлена\nПары: " + ", ".join(self.pairs))
+        asyncio.create_task(self._run_loop())
+
+    async def shutdown(self):
+        """Full shutdown — close all connections. Called on process exit."""
+        self._running = False
+        await self.ai_analyst.close()
+        await self.db.close()
+        await self._notify("🛑 Бот остановлен")
+        logger.info("Trading engine stopped")
 
     @staticmethod
     def _timeframe_to_seconds(tf: str) -> int:
@@ -963,10 +975,11 @@ class TradingEngine:
         tf_label = self.timeframe if self._is_swing else f"{self.timeframe}м"
 
         lines = [
+            f"💰 Баланс: {balance:,.2f} USDT",
+            "",
             f"━━━ [{name}] ━━━",
             f"{'🟢 РАБОТАЕТ' if self._running else '🔴 ОСТАНОВЛЕН'}",
             f"{'⛔ СТОП — дневной лимит потерь' if self.risk.is_halted else ''}",
-            f"Баланс: {balance:,.2f} USDT",
             f"Открытых сделок: {len(open_trades)}",
             f"За день: {daily:+,.2f} USDT",
             f"Всего: {total:+,.2f} USDT",

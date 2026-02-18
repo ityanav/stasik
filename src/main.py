@@ -86,7 +86,7 @@ async def main():
 
     # Graceful shutdown
     logger.info("Shutting down...")
-    await engine.stop()
+    await engine.shutdown()
     engine_task.cancel()
     try:
         await engine_task

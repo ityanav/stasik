@@ -1,4 +1,5 @@
 import logging
+import subprocess
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import (
@@ -18,7 +19,7 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
         [KeyboardButton("📊 Статус"), KeyboardButton("💰 PnL")],
         [KeyboardButton("📈 Позиции"), KeyboardButton("🪙 Пары")],
         [KeyboardButton("❌ Закрыть сделки"), KeyboardButton("❓ Помощь")],
-        [KeyboardButton("🛑 Стоп")],
+        [KeyboardButton("▶️ Старт"), KeyboardButton("🛑 Стоп")],
     ],
     resize_keyboard=True,
 )
@@ -29,9 +30,13 @@ class TelegramBot:
         self.token = config["telegram"]["token"]
         self.chat_id = str(config["telegram"]["chat_id"])
         self.engine = engine
+        self.config = config
         self.app: Application | None = None
         self._started = False
         self._notify_only = notify_only
+
+        # Other instances for start/stop control
+        self._other_instances = config.get("other_instances", [])
 
     async def start(self):
         if not self.token or not self.chat_id:
@@ -91,6 +96,32 @@ class TelegramBot:
     def _check_auth(self, update: Update) -> bool:
         return str(update.effective_chat.id) == self.chat_id
 
+    # ── Helpers ─────────────────────────────────────────────────
+
+    @staticmethod
+    def _systemctl(action: str, service: str) -> bool:
+        """Run systemctl action. Returns True on success."""
+        try:
+            result = subprocess.run(
+                ["systemctl", action, service],
+                capture_output=True, text=True, timeout=10,
+            )
+            return result.returncode == 0
+        except Exception:
+            logger.exception("systemctl %s %s failed", action, service)
+            return False
+
+    @staticmethod
+    def _is_service_active(service: str) -> bool:
+        try:
+            result = subprocess.run(
+                ["systemctl", "is-active", service],
+                capture_output=True, text=True, timeout=3,
+            )
+            return result.stdout.strip() == "active"
+        except Exception:
+            return False
+
     # ── Button handler ─────────────────────────────────────────
 
     async def _handle_button(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -105,6 +136,7 @@ class TelegramBot:
             "📈 Позиции": self._cmd_positions,
             "🪙 Пары": self._cmd_pairs,
             "❌ Закрыть сделки": self._cmd_close_all,
+            "▶️ Старт": self._cmd_run,
             "🛑 Стоп": self._cmd_stop,
             "❓ Помощь": self._cmd_help,
         }
@@ -132,13 +164,40 @@ class TelegramBot:
     async def _cmd_stop(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not self._check_auth(update):
             return
-        keyboard = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("Да, стоп", callback_data="confirm_stop"),
-                InlineKeyboardButton("Отмена", callback_data="cancel"),
-            ]
-        ])
-        await update.message.reply_text("Остановить торговлю?", reply_markup=keyboard)
+
+        instance_name = self.engine.instance_name or "SCALP"
+        buttons = [
+            [InlineKeyboardButton(f"🛑 {instance_name}", callback_data="stop_scalp")],
+        ]
+        for inst in self._other_instances:
+            name = inst.get("name", "???")
+            service = inst.get("service", "")
+            if service:
+                buttons.append([InlineKeyboardButton(f"🛑 {name}", callback_data=f"stop_inst_{service}")])
+        buttons.append([InlineKeyboardButton("🛑 Всё", callback_data="stop_all")])
+        buttons.append([InlineKeyboardButton("Отмена", callback_data="cancel")])
+
+        keyboard = InlineKeyboardMarkup(buttons)
+        await update.message.reply_text("Что остановить?", reply_markup=keyboard)
+
+    async def _cmd_run(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        if not self._check_auth(update):
+            return
+
+        instance_name = self.engine.instance_name or "SCALP"
+        buttons = [
+            [InlineKeyboardButton(f"▶️ {instance_name}", callback_data="start_scalp")],
+        ]
+        for inst in self._other_instances:
+            name = inst.get("name", "???")
+            service = inst.get("service", "")
+            if service:
+                buttons.append([InlineKeyboardButton(f"▶️ {name}", callback_data=f"start_inst_{service}_{name}")])
+        buttons.append([InlineKeyboardButton("▶️ Всё", callback_data="start_all")])
+        buttons.append([InlineKeyboardButton("Отмена", callback_data="cancel")])
+
+        keyboard = InlineKeyboardMarkup(buttons)
+        await update.message.reply_text("Что запустить?", reply_markup=keyboard)
 
     async def _cmd_status(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not self._check_auth(update):
@@ -195,6 +254,7 @@ class TelegramBot:
             "📈 Позиции — открытые сделки\n"
             "🪙 Пары — торговые пары\n"
             "❌ Закрыть сделки — закрыть все позиции\n"
+            "▶️ Старт — запустить бота\n"
             "🛑 Стоп — остановить бота\n"
             "❓ Помощь — эта справка",
             reply_markup=MAIN_KEYBOARD,
@@ -213,9 +273,74 @@ class TelegramBot:
         await query.answer()
         data = query.data
 
-        if data == "confirm_stop":
+        # ── Stop handlers ──
+        if data == "stop_scalp":
             await self.engine.stop()
-            await query.edit_message_text("🛑 Торговля остановлена.")
+            await query.edit_message_text("⏸ SCALP остановлен")
+
+        elif data.startswith("stop_inst_"):
+            service = data[len("stop_inst_"):]
+            name = service.replace("stasik-", "").upper()
+            ok = self._systemctl("stop", service)
+            if ok:
+                await query.edit_message_text(f"🛑 {name} остановлен")
+            else:
+                await query.edit_message_text(f"❌ Не удалось остановить {name}")
+
+        elif data == "stop_all":
+            await self.engine.stop()
+            results = ["⏸ SCALP остановлен"]
+            for inst in self._other_instances:
+                service = inst.get("service", "")
+                name = inst.get("name", "???")
+                if service:
+                    ok = self._systemctl("stop", service)
+                    results.append(f"{'🛑' if ok else '❌'} {name} {'остановлен' if ok else 'ошибка'}")
+            await query.edit_message_text("\n".join(results))
+
+        # ── Start handlers ──
+        elif data == "start_scalp":
+            if self.engine._running:
+                await query.edit_message_text("SCALP уже работает")
+            else:
+                await self.engine.resume()
+                await query.edit_message_text("▶️ SCALP запущен")
+
+        elif data.startswith("start_inst_"):
+            parts = data[len("start_inst_"):].split("_", 1)
+            service = parts[0]
+            name = parts[1] if len(parts) > 1 else service.replace("stasik-", "").upper()
+            if self._is_service_active(service):
+                await query.edit_message_text(f"{name} уже работает")
+            else:
+                ok = self._systemctl("start", service)
+                if ok:
+                    await query.edit_message_text(f"▶️ {name} запущен")
+                else:
+                    await query.edit_message_text(f"❌ Не удалось запустить {name}")
+
+        elif data == "start_all":
+            results = []
+            if self.engine._running:
+                results.append("SCALP уже работает")
+            else:
+                await self.engine.resume()
+                results.append("▶️ SCALP запущен")
+            for inst in self._other_instances:
+                service = inst.get("service", "")
+                name = inst.get("name", "???")
+                if service:
+                    if self._is_service_active(service):
+                        results.append(f"{name} уже работает")
+                    else:
+                        ok = self._systemctl("start", service)
+                        results.append(f"{'▶️' if ok else '❌'} {name} {'запущен' if ok else 'ошибка'}")
+            await query.edit_message_text("\n".join(results))
+
+        # ── Legacy / other handlers ──
+        elif data == "confirm_stop":
+            await self.engine.stop()
+            await query.edit_message_text("⏸ Торговля остановлена.")
 
         elif data == "confirm_close_all":
             logger.info("Closing all positions...")
