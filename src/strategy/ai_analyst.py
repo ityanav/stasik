@@ -16,21 +16,65 @@ from src.strategy.indicators import (
 logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = """\
-Ты — опытный криптотрейдер-аналитик. Твоя задача — подтвердить или отклонить торговый сигнал.
+Ты — опытный криптотрейдер-аналитик. Твоя задача — подтвердить или отклонить торговый сигнал \
+и предложить оптимальные параметры для конкретной сделки.
 
 Ты получаешь:
 - Направление сигнала (BUY/SELL) и оценку от технических индикаторов
 - Текущие значения индикаторов (RSI, EMA, MACD, Bollinger Bands, Volume)
 - Последние 20 свечей (OHLCV)
+- Текущие параметры риска (SL%, TP%)
 
 Правила:
 - Будь консервативен. Лучше пропустить сделку, чем потерять деньги.
 - Если только 1 индикатор за вход — скорее всего REJECT.
 - Подтверждай (CONFIRM) только если видишь реальную конвергенцию сигналов.
 - Учитывай паттерны свечей, тренд, объём.
+- Предлагай SL/TP исходя из волатильности и текущей ситуации.
 
 Отвечай СТРОГО в формате JSON (без markdown, без ```):
-{"decision": "CONFIRM" или "REJECT", "confidence": число от 1 до 10, "reasoning": "краткое объяснение на русском"}
+{
+  "decision": "CONFIRM" или "REJECT",
+  "confidence": число от 1 до 10,
+  "reasoning": "краткое объяснение на русском",
+  "stop_loss": число (SL в процентах, например 1.2) или null (использовать дефолт),
+  "take_profit": число (TP в процентах, например 2.5) или null (использовать дефолт),
+  "position_size": число (множитель размера позиции: 0.5=половина, 1.0=норма, 1.5=увеличить) или null
+}
+"""
+
+REVIEW_PROMPT = """\
+Ты — опытный квант-аналитик. Тебе дают результаты торгового бота за последний период \
+и текущие параметры стратегии. Проанализируй и предложи корректировки.
+
+Текущие параметры стратегии:
+{strategy_text}
+
+Текущие параметры риска:
+{risk_text}
+
+Последние сделки:
+{trades_text}
+
+Правила:
+- Меняй только то, что действительно нужно. Не трогай то, что работает.
+- Если мало данных (< 5 сделок) — будь осторожен с выводами.
+- Допустимые параметры для изменения:
+  * rsi_oversold (20-45), rsi_overbought (55-80)
+  * ema_fast (5-15), ema_slow (15-50)
+  * bb_period (10-30), bb_std (1.5-3.0)
+  * vol_threshold (1.0-3.0)
+  * min_score (1-4)
+  * stop_loss (0.5-3.0%), take_profit (1.0-5.0%)
+  * risk_per_trade (1.0-10.0%)
+- Не меняй macd — его параметры стандартные.
+
+Отвечай СТРОГО в формате JSON (без markdown, без ```):
+{{
+  "changes": {{"имя_параметра": новое_значение, ...}},
+  "reasoning": "объяснение на русском, что и почему меняешь"
+}}
+Если менять ничего не нужно — верни пустой changes: {{}}.
 """
 
 
@@ -38,6 +82,16 @@ SYSTEM_PROMPT = """\
 class AIVerdict:
     confirmed: bool = False
     confidence: int = 0
+    reasoning: str = ""
+    stop_loss: float | None = None
+    take_profit: float | None = None
+    position_size: float | None = None
+    error: str | None = None
+
+
+@dataclass
+class StrategyUpdate:
+    changes: dict = field(default_factory=dict)
     reasoning: str = ""
     error: str | None = None
 
@@ -49,6 +103,7 @@ class AIAnalyst:
     min_confidence: int = 6
     timeout: int = 10
     enabled: bool = False
+    review_interval: int = 60
     _client: httpx.AsyncClient = field(default=None, repr=False)
 
     def __post_init__(self):
@@ -64,11 +119,14 @@ class AIAnalyst:
             min_confidence=ai_cfg.get("min_confidence", 6),
             timeout=ai_cfg.get("timeout", 10),
             enabled=ai_cfg.get("enabled", False),
+            review_interval=ai_cfg.get("review_interval", 60),
         )
 
     async def close(self):
         if self._client:
             await self._client.aclose()
+
+    # ── Per-trade analysis ─────────────────────────────────
 
     async def analyze(
         self,
@@ -77,6 +135,7 @@ class AIAnalyst:
         details: dict,
         indicator_text: str,
         candles_text: str,
+        risk_text: str = "",
     ) -> AIVerdict:
         if not self.enabled or not self._client:
             return AIVerdict(error="AI disabled")
@@ -87,30 +146,12 @@ class AIAnalyst:
             f"Текущие значения индикаторов:\n{indicator_text}\n\n"
             f"Последние 20 свечей (новые внизу):\n{candles_text}"
         )
+        if risk_text:
+            user_prompt += f"\n\nТекущие параметры риска:\n{risk_text}"
 
         try:
-            resp = await self._client.post(
-                "https://openrouter.ai/api/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {self.api_key}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": self.model,
-                    "messages": [
-                        {"role": "system", "content": SYSTEM_PROMPT},
-                        {"role": "user", "content": user_prompt},
-                    ],
-                    "temperature": 0.3,
-                    "max_tokens": 300,
-                },
-            )
-            resp.raise_for_status()
-            data = resp.json()
-
-            content = data["choices"][0]["message"]["content"].strip()
-            return self._parse_response(content)
-
+            content = await self._call_api(SYSTEM_PROMPT, user_prompt)
+            return self._parse_verdict(content)
         except httpx.TimeoutException:
             logger.warning("AI analyst timeout after %ds", self.timeout)
             return AIVerdict(error="timeout")
@@ -118,13 +159,89 @@ class AIAnalyst:
             logger.exception("AI analyst error")
             return AIVerdict(error="api_error")
 
-    def _parse_response(self, content: str) -> AIVerdict:
-        # Strip markdown code fences if present
+    # ── Periodic strategy review ───────────────────────────
+
+    async def review_strategy(
+        self,
+        strategy_config: dict,
+        risk_config: dict,
+        recent_trades: list[dict],
+    ) -> StrategyUpdate:
+        if not self.enabled or not self._client:
+            return StrategyUpdate(error="AI disabled")
+
+        strategy_text = "\n".join(f"  {k}: {v}" for k, v in strategy_config.items())
+        risk_text = "\n".join(f"  {k}: {v}" for k, v in risk_config.items())
+
+        if not recent_trades:
+            trades_text = "Нет закрытых сделок за период."
+        else:
+            lines = []
+            for t in recent_trades:
+                pnl = t.get("pnl") or 0
+                direction = "ЛОНГ" if t["side"] == "Buy" else "ШОРТ"
+                result = f"+{pnl:.2f}" if pnl >= 0 else f"{pnl:.2f}"
+                lines.append(
+                    f"  {direction} {t['symbol']} | вход={t.get('entry_price', '?')} "
+                    f"выход={t.get('exit_price', '?')} | {result} USDT | {t.get('status', '?')}"
+                )
+            trades_text = "\n".join(lines)
+
+        prompt = REVIEW_PROMPT.format(
+            strategy_text=strategy_text,
+            risk_text=risk_text,
+            trades_text=trades_text,
+        )
+
+        try:
+            content = await self._call_api(
+                "Ты — квант-аналитик. Отвечай строго JSON.",
+                prompt,
+            )
+            return self._parse_review(content)
+        except httpx.TimeoutException:
+            logger.warning("AI review timeout")
+            return StrategyUpdate(error="timeout")
+        except Exception:
+            logger.exception("AI review error")
+            return StrategyUpdate(error="api_error")
+
+    # ── API call ───────────────────────────────────────────
+
+    async def _call_api(self, system: str, user: str) -> str:
+        resp = await self._client.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": self.model,
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                "temperature": 0.3,
+                "max_tokens": 500,
+            },
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return data["choices"][0]["message"]["content"].strip()
+
+    # ── Parsing ────────────────────────────────────────────
+
+    @staticmethod
+    def _strip_fences(content: str) -> str:
         if content.startswith("```"):
             content = content.split("\n", 1)[-1]
             if content.endswith("```"):
                 content = content[:-3]
             content = content.strip()
+        return content
+
+    def _parse_verdict(self, content: str) -> AIVerdict:
+        content = self._strip_fences(content)
 
         try:
             parsed = json.loads(content)
@@ -135,14 +252,66 @@ class AIAnalyst:
         decision = parsed.get("decision", "").upper()
         confidence = int(parsed.get("confidence", 0))
         reasoning = parsed.get("reasoning", "")
-
         confirmed = decision == "CONFIRM" and confidence >= self.min_confidence
+
+        # Per-trade parameter overrides
+        sl = parsed.get("stop_loss")
+        tp = parsed.get("take_profit")
+        ps = parsed.get("position_size")
 
         return AIVerdict(
             confirmed=confirmed,
             confidence=confidence,
             reasoning=reasoning,
+            stop_loss=float(sl) if sl is not None else None,
+            take_profit=float(tp) if tp is not None else None,
+            position_size=float(ps) if ps is not None else None,
         )
+
+    def _parse_review(self, content: str) -> StrategyUpdate:
+        content = self._strip_fences(content)
+
+        try:
+            parsed = json.loads(content)
+        except json.JSONDecodeError:
+            logger.warning("AI review returned invalid JSON: %s", content[:200])
+            return StrategyUpdate(error="invalid_json", reasoning=content[:200])
+
+        changes = parsed.get("changes", {})
+        reasoning = parsed.get("reasoning", "")
+
+        # Validate changes against allowed ranges
+        allowed = {
+            "rsi_oversold": (20, 45),
+            "rsi_overbought": (55, 80),
+            "ema_fast": (5, 15),
+            "ema_slow": (15, 50),
+            "bb_period": (10, 30),
+            "bb_std": (1.5, 3.0),
+            "vol_threshold": (1.0, 3.0),
+            "min_score": (1, 4),
+            "stop_loss": (0.5, 3.0),
+            "take_profit": (1.0, 5.0),
+            "risk_per_trade": (1.0, 10.0),
+        }
+
+        validated = {}
+        for key, value in changes.items():
+            if key not in allowed:
+                logger.warning("AI suggested unknown parameter: %s", key)
+                continue
+            lo, hi = allowed[key]
+            try:
+                val = float(value)
+            except (TypeError, ValueError):
+                logger.warning("AI suggested invalid value for %s: %s", key, value)
+                continue
+            if lo <= val <= hi:
+                validated[key] = val
+            else:
+                logger.warning("AI suggested out-of-range %s=%s (allowed %s-%s)", key, val, lo, hi)
+
+        return StrategyUpdate(changes=validated, reasoning=reasoning)
 
 
 def extract_indicator_values(df: pd.DataFrame, config: dict) -> str:
@@ -169,6 +338,14 @@ def extract_indicator_values(df: pd.DataFrame, config: dict) -> str:
         f"Volume ratio: {vol_ratio:.2f}x (порог: {strat.get('vol_threshold', 1.5)}x)",
     ]
     return "\n".join(lines)
+
+
+def format_risk_text(config: dict) -> str:
+    risk = config["risk"]
+    return (
+        f"SL: {risk['stop_loss']}% | TP: {risk['take_profit']}%\n"
+        f"Размер позиции: {risk['risk_per_trade']}% от баланса"
+    )
 
 
 def summarize_candles(df: pd.DataFrame, n: int = 20) -> str:

@@ -5,7 +5,7 @@ from datetime import datetime
 from src.exchange.client import BybitClient
 from src.risk.manager import RiskManager
 from src.storage.database import Database
-from src.strategy.ai_analyst import AIAnalyst, extract_indicator_values, summarize_candles
+from src.strategy.ai_analyst import AIAnalyst, extract_indicator_values, format_risk_text, summarize_candles
 from src.strategy.signals import Signal, SignalGenerator
 
 logger = logging.getLogger(__name__)
@@ -28,6 +28,7 @@ class TradingEngine:
 
         self._running = False
         self._instrument_cache: dict[str, dict] = {}
+        self._tick_count: int = 0
 
     async def start(self):
         await self.db.connect()
@@ -56,10 +57,14 @@ class TradingEngine:
 
     async def _run_loop(self):
         interval_sec = int(self.timeframe) * 60
+        review_every = self.ai_analyst.review_interval  # in ticks (minutes)
         while self._running:
             try:
                 await self._check_closed_trades()
                 await self._tick()
+                self._tick_count += 1
+                if self.ai_analyst.enabled and review_every > 0 and self._tick_count % review_every == 0:
+                    await self._ai_review_strategy()
             except Exception:
                 logger.exception("Error in trading tick")
             await asyncio.sleep(interval_sec)
@@ -120,15 +125,20 @@ class TradingEngine:
 
         # AI analyst filter
         ai_reasoning = ""
+        ai_sl = None
+        ai_tp = None
+        ai_size_mult = None
         if self.ai_analyst.enabled:
             indicator_text = extract_indicator_values(df, self.config)
             candles_text = summarize_candles(df)
+            risk_text = format_risk_text(self.config)
             verdict = await self.ai_analyst.analyze(
                 signal=result.signal.value,
                 score=result.score,
                 details=result.details,
                 indicator_text=indicator_text,
                 candles_text=candles_text,
+                risk_text=risk_text,
             )
 
             if verdict.error:
@@ -146,11 +156,26 @@ class TradingEngine:
                 return
             else:
                 ai_reasoning = f"🤖 AI ({verdict.confidence}/10): {verdict.reasoning}"
+                ai_sl = verdict.stop_loss
+                ai_tp = verdict.take_profit
+                ai_size_mult = verdict.position_size
                 logger.info("AI confirmed %s %s — confidence %d/10", side, symbol, verdict.confidence)
 
-        await self._open_trade(symbol, side, category, result.score, result.details, ai_reasoning)
+        await self._open_trade(
+            symbol, side, category, result.score, result.details,
+            ai_reasoning=ai_reasoning,
+            ai_sl_pct=ai_sl,
+            ai_tp_pct=ai_tp,
+            ai_size_mult=ai_size_mult,
+        )
 
-    async def _open_trade(self, symbol: str, side: str, category: str, score: int, details: dict, ai_reasoning: str = ""):
+    async def _open_trade(
+        self, symbol: str, side: str, category: str, score: int, details: dict,
+        ai_reasoning: str = "",
+        ai_sl_pct: float | None = None,
+        ai_tp_pct: float | None = None,
+        ai_size_mult: float | None = None,
+    ):
         price = self.client.get_last_price(symbol, category=category)
         balance = self.client.get_balance()
 
@@ -161,11 +186,31 @@ class TradingEngine:
             qty_step=info["qty_step"],
             min_qty=info["min_qty"],
         )
+
+        # AI position size multiplier
+        if ai_size_mult is not None and 0.1 <= ai_size_mult <= 2.0:
+            import math
+            qty = math.floor((qty * ai_size_mult) / info["qty_step"]) * info["qty_step"]
+            qty = round(qty, 8)
+
         if qty <= 0:
             logger.info("Position size too small for %s, skipping", symbol)
             return
 
-        sl, tp = self.risk.calculate_sl_tp(price, side)
+        # AI-adjusted or default SL/TP
+        if ai_sl_pct is not None and 0.3 <= ai_sl_pct <= 5.0:
+            sl = price * (1 - ai_sl_pct / 100) if side == "Buy" else price * (1 + ai_sl_pct / 100)
+            sl = round(sl, 6)
+        else:
+            ai_sl_pct = None
+            sl = self.risk.calculate_sl_tp(price, side)[0]
+
+        if ai_tp_pct is not None and 0.5 <= ai_tp_pct <= 10.0:
+            tp = price * (1 + ai_tp_pct / 100) if side == "Buy" else price * (1 - ai_tp_pct / 100)
+            tp = round(tp, 6)
+        else:
+            ai_tp_pct = None
+            tp = self.risk.calculate_sl_tp(price, side)[1]
 
         order = self.client.place_order(
             symbol=symbol,
@@ -208,15 +253,79 @@ class TradingEngine:
 
         direction = "ЛОНГ 📈" if side == "Buy" else "ШОРТ 📉"
         pos_value = qty * price
+        sl_note = f" (AI: {ai_sl_pct}%)" if ai_sl_pct else ""
+        tp_note = f" (AI: {ai_tp_pct}%)" if ai_tp_pct else ""
+        size_note = f" (AI: x{ai_size_mult})" if ai_size_mult else ""
         msg = (
             f"{'🟢' if side == 'Buy' else '🔴'} Открыл {direction} {symbol}\n"
             f"Цена: {price}\n"
-            f"Объём: {qty} (~{pos_value:,.0f} USDT)\n"
-            f"SL: {sl} | TP: {tp}{trailing_msg}\n"
+            f"Объём: {qty}{size_note} (~{pos_value:,.0f} USDT)\n"
+            f"SL: {sl}{sl_note} | TP: {tp}{tp_note}{trailing_msg}\n"
             f"Баланс: {balance:,.0f} USDT"
         )
         if ai_reasoning:
             msg += f"\n{ai_reasoning}"
+        logger.info(msg)
+        await self._notify(msg)
+
+    # ── AI strategy review ──────────────────────────────────
+
+    async def _ai_review_strategy(self):
+        recent = await self.db.get_recent_trades(20)
+        closed = [t for t in recent if t.get("status") == "closed"]
+
+        if len(closed) < 3:
+            logger.info("AI review: too few closed trades (%d), skipping", len(closed))
+            return
+
+        update = await self.ai_analyst.review_strategy(
+            strategy_config=self.config["strategy"],
+            risk_config=self.config["risk"],
+            recent_trades=closed,
+        )
+
+        if update.error:
+            logger.warning("AI review failed: %s", update.error)
+            return
+
+        if not update.changes:
+            logger.info("AI review: no changes needed")
+            return
+
+        # Apply changes
+        strategy_keys = {"rsi_oversold", "rsi_overbought", "ema_fast", "ema_slow",
+                         "bb_period", "bb_std", "vol_threshold", "min_score"}
+        risk_keys = {"stop_loss", "take_profit", "risk_per_trade"}
+
+        changes_text = []
+        for key, value in update.changes.items():
+            if key in strategy_keys:
+                old = self.config["strategy"].get(key)
+                self.config["strategy"][key] = value
+                changes_text.append(f"  {key}: {old} → {value}")
+            elif key in risk_keys:
+                old = self.config["risk"].get(key)
+                self.config["risk"][key] = value
+                changes_text.append(f"  {key}: {old} → {value}")
+
+        if not changes_text:
+            return
+
+        # Rebuild signal generator with new parameters
+        self.signal_gen = SignalGenerator(self.config)
+        # Update risk manager SL/TP if changed
+        if "stop_loss" in update.changes:
+            self.risk.stop_loss_pct = update.changes["stop_loss"] / 100
+        if "take_profit" in update.changes:
+            self.risk.take_profit_pct = update.changes["take_profit"] / 100
+        if "risk_per_trade" in update.changes:
+            self.risk.risk_per_trade = update.changes["risk_per_trade"] / 100
+
+        msg = (
+            f"🧠 AI пересмотрел стратегию\n"
+            f"Изменения:\n" + "\n".join(changes_text) + "\n"
+            f"Причина: {update.reasoning}"
+        )
         logger.info(msg)
         await self._notify(msg)
 
