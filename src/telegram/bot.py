@@ -111,7 +111,7 @@ class TelegramBot:
         if not self._check_auth(update):
             return
         await update.message.reply_text(
-            "🤖 Bybit Scalper Bot\n\n"
+            "🤖 Stasik Trading Bot\n\n"
             "Используй кнопки внизу или команды:\n"
             "/status — Статус бота\n"
             "/pnl — Прибыль и убытки\n"
@@ -181,7 +181,7 @@ class TelegramBot:
         if not self._check_auth(update):
             return
         await update.message.reply_text(
-            "🤖 Bybit Scalper Bot\n\n"
+            "🤖 Stasik Trading Bot\n\n"
             "📊 Статус — баланс, состояние\n"
             "💰 PnL — прибыль/убытки\n"
             "📈 Позиции — открытые сделки\n"
