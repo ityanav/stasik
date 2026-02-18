@@ -4,6 +4,7 @@ import time
 from datetime import datetime
 
 import httpx
+import pandas as pd
 
 from src.exchange.client import BybitClient
 from src.risk.manager import RiskManager
@@ -45,6 +46,10 @@ class TradingEngine:
         # Funding rate
         self._funding_rate_max: float = config["strategy"].get("funding_rate_max", 0.0003)
         self._funding_cache: dict[str, tuple[float, float]] = {}  # symbol -> (rate, timestamp)
+
+        # Multi-TF cache for AI
+        self._mtf_cache: dict[str, tuple[pd.DataFrame, float]] = {}  # "symbol_tf" -> (df, timestamp)
+        self._extra_timeframes: list[str] = config.get("ai", {}).get("extra_timeframes", ["5", "15", "60"])
 
         # Correlation groups: symbol -> group name
         self._corr_groups: dict[str, str] = {}
@@ -210,6 +215,10 @@ class TradingEngine:
             indicator_text = extract_indicator_values(df, self.config)
             candles_text = summarize_candles(df)
             risk_text = format_risk_text(self.config)
+
+            # Multi-TF context
+            mtf_data = self._get_mtf_data(symbol, category)
+
             verdict = await self.ai_analyst.analyze(
                 signal=result.signal.value,
                 score=result.score,
@@ -217,6 +226,8 @@ class TradingEngine:
                 indicator_text=indicator_text,
                 candles_text=candles_text,
                 risk_text=risk_text,
+                mtf_data=mtf_data,
+                config=self.config,
             )
 
             if verdict.error:
@@ -418,6 +429,8 @@ class TradingEngine:
             if trade["category"] != "linear":
                 continue
             try:
+                if not trade.get("partial_closed"):
+                    await self._check_partial_close(trade)
                 await self._check_trade_closed(trade)
             except Exception:
                 logger.exception("Error checking trade %s", trade["id"])
@@ -495,6 +508,106 @@ class TradingEngine:
         )
         logger.info(msg)
         await self._notify(msg)
+
+    async def _check_partial_close(self, trade: dict):
+        """Close 50% of position when price reaches 50% of TP distance."""
+        if not self.config["risk"].get("partial_close_enabled", True):
+            return
+
+        import math
+
+        partial_pct = self.config["risk"].get("partial_close_pct", 50) / 100
+        partial_trigger = self.config["risk"].get("partial_close_trigger", 50) / 100
+
+        symbol = trade["symbol"]
+        entry = trade["entry_price"]
+        tp = trade["take_profit"]
+        side = trade["side"]
+        qty = trade["qty"]
+
+        current_price = self.client.get_last_price(symbol, category="linear")
+
+        if side == "Buy":
+            tp_distance = tp - entry
+            current_progress = current_price - entry
+        else:
+            tp_distance = entry - tp
+            current_progress = entry - current_price
+
+        if tp_distance <= 0:
+            return
+
+        progress_ratio = current_progress / tp_distance
+        if progress_ratio < partial_trigger:
+            return
+
+        # Close partial position
+        close_qty = qty * partial_pct
+        info = self._get_instrument_info(symbol, "linear")
+        close_qty = math.floor(close_qty / info["qty_step"]) * info["qty_step"]
+        close_qty = round(close_qty, 8)
+
+        if close_qty < info["min_qty"]:
+            return
+
+        remaining_qty = round(qty - close_qty, 8)
+        close_side = "Sell" if side == "Buy" else "Buy"
+
+        try:
+            self.client.place_order(
+                symbol=symbol, side=close_side, qty=close_qty, category="linear",
+            )
+        except Exception:
+            logger.exception("Failed to partial close %s", symbol)
+            return
+
+        # Move SL to breakeven
+        try:
+            self.client.session.set_trading_stop(
+                category="linear", symbol=symbol,
+                stopLoss=str(round(entry, 6)), positionIdx=0,
+            )
+        except Exception:
+            logger.warning("Failed to move SL to breakeven for %s", symbol)
+
+        await self.db.mark_partial_close(trade["id"], remaining_qty)
+
+        if side == "Buy":
+            partial_pnl = (current_price - entry) * close_qty
+        else:
+            partial_pnl = (entry - current_price) * close_qty
+
+        msg = (
+            f"✂️ Частичное закрытие {symbol}\n"
+            f"Закрыто: {close_qty} из {qty} ({partial_pct*100:.0f}%)\n"
+            f"Прибыль: +{partial_pnl:,.2f} USDT\n"
+            f"SL → безубыток ({entry})\n"
+            f"Остаток: {remaining_qty} — бежит к TP"
+        )
+        logger.info(msg)
+        await self._notify(msg)
+
+    def _get_mtf_data(self, symbol: str, category: str) -> dict[str, pd.DataFrame]:
+        """Fetch multi-timeframe klines for AI context, with per-TF caching."""
+        mtf_data: dict[str, pd.DataFrame] = {}
+        now = time.time()
+        for tf in self._extra_timeframes:
+            cache_key = f"{symbol}_{tf}"
+            cached = self._mtf_cache.get(cache_key)
+            cache_ttl = int(tf) * 60  # cache for one candle period
+            if cached and now - cached[1] < cache_ttl:
+                mtf_data[tf] = cached[0]
+                continue
+            try:
+                tf_df = self.client.get_klines(
+                    symbol=symbol, interval=tf, limit=100, category=category
+                )
+                tf_df.attrs["symbol"] = symbol
+                mtf_data[tf] = tf_df
+                self._mtf_cache[cache_key] = (tf_df, now)
+            except Exception:
+                logger.warning("Failed to fetch %sm klines for %s", tf, symbol)
+        return mtf_data
 
     async def _get_fear_greed(self) -> int | None:
         """Fetch Fear & Greed Index from alternative.me, cached for 1 hour."""

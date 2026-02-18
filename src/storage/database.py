@@ -53,6 +53,16 @@ class Database:
         """)
         await self._db.commit()
 
+        # Migration: add partial_closed column if not exists
+        try:
+            await self._db.execute(
+                "ALTER TABLE trades ADD COLUMN partial_closed INTEGER DEFAULT 0"
+            )
+            await self._db.commit()
+            logger.info("Migration: added partial_closed column")
+        except Exception:
+            pass  # column already exists
+
     # ── Trades ───────────────────────────────────────────────
 
     async def insert_trade(
@@ -92,6 +102,14 @@ class Database:
         rows = await cursor.fetchall()
         return [dict(r) for r in rows]
 
+    async def mark_partial_close(self, trade_id: int, new_qty: float):
+        """Mark trade as partially closed, update remaining quantity."""
+        await self._db.execute(
+            "UPDATE trades SET partial_closed = 1, qty = ? WHERE id = ?",
+            (new_qty, trade_id),
+        )
+        await self._db.commit()
+
     async def get_recent_trades(self, limit: int = 10) -> list[dict]:
         cursor = await self._db.execute(
             "SELECT * FROM trades ORDER BY id DESC LIMIT ?", (limit,)
@@ -125,3 +143,23 @@ class Database:
         cursor = await self._db.execute("SELECT COALESCE(SUM(pnl), 0) as total FROM daily_pnl")
         row = await cursor.fetchone()
         return float(row["total"])
+
+    async def get_daily_pnl_history(self, days: int = 30) -> list[dict]:
+        cursor = await self._db.execute(
+            "SELECT trade_date, pnl, trades_count FROM daily_pnl ORDER BY trade_date DESC LIMIT ?",
+            (days,),
+        )
+        rows = await cursor.fetchall()
+        return [dict(r) for r in reversed(rows)]
+
+    async def get_trade_stats(self) -> dict:
+        """Aggregate trade statistics."""
+        cursor = await self._db.execute(
+            "SELECT COUNT(*) as total, "
+            "COALESCE(SUM(CASE WHEN pnl >= 0 THEN 1 ELSE 0 END), 0) as wins, "
+            "COALESCE(SUM(CASE WHEN pnl < 0 THEN 1 ELSE 0 END), 0) as losses, "
+            "COALESCE(SUM(pnl), 0) as total_pnl "
+            "FROM trades WHERE status = 'closed'"
+        )
+        row = await cursor.fetchone()
+        return dict(row)

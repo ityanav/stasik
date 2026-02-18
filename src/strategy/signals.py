@@ -10,6 +10,7 @@ from src.strategy.indicators import (
     calculate_macd,
     calculate_rsi,
     calculate_volume_signal,
+    detect_candlestick_patterns,
 )
 
 logger = logging.getLogger(__name__)
@@ -50,6 +51,7 @@ class SignalGenerator:
         self.vol_period = strat.get("vol_period", 20)
         self.vol_threshold = strat.get("vol_threshold", 1.5)
         self.min_score = strat["min_score"]
+        self.patterns_enabled = strat.get("patterns_enabled", True)
 
     def generate(self, df: pd.DataFrame) -> SignalResult:
         scores: dict[str, int] = {}
@@ -133,6 +135,13 @@ class SignalGenerator:
                 scores["vol"] = 0
         else:
             scores["vol"] = 0
+
+        # ── Candlestick patterns ─────────────────────────────
+        if self.patterns_enabled:
+            pat_result = detect_candlestick_patterns(df)
+            scores["pattern"] = pat_result["score"]
+        else:
+            scores["pattern"] = 0
 
         total = sum(scores.values())
 

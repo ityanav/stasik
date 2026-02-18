@@ -7,6 +7,7 @@ from pathlib import Path
 import yaml
 
 from src.core.engine import TradingEngine
+from src.dashboard.app import Dashboard
 from src.telegram.bot import TelegramBot
 
 logging.basicConfig(
@@ -36,6 +37,12 @@ async def main():
     # Wire notifier: engine -> telegram
     engine.notifier = tg_bot.send_message
 
+    # Dashboard
+    dashboard = None
+    if config.get("dashboard", {}).get("enabled", False):
+        dashboard = Dashboard(config, engine.db, engine)
+
+
     loop = asyncio.get_running_loop()
     stop_event = asyncio.Event()
 
@@ -48,6 +55,10 @@ async def main():
 
     # Start Telegram bot
     await tg_bot.start()
+
+    # Start dashboard
+    if dashboard:
+        await dashboard.start()
 
     # Start engine in background
     engine_task = asyncio.create_task(engine.start())
@@ -63,6 +74,8 @@ async def main():
         await engine_task
     except asyncio.CancelledError:
         pass
+    if dashboard:
+        await dashboard.stop()
     await tg_bot.stop()
     logger.info("Shutdown complete")
 

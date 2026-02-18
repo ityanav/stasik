@@ -11,6 +11,7 @@ from src.strategy.indicators import (
     calculate_macd,
     calculate_rsi,
     calculate_volume_signal,
+    detect_candlestick_patterns,
 )
 
 logger = logging.getLogger(__name__)
@@ -22,7 +23,9 @@ SYSTEM_PROMPT = """\
 Ты получаешь:
 - Направление сигнала (BUY/SELL) и оценку от технических индикаторов
 - Текущие значения индикаторов (RSI, EMA, MACD, Bollinger Bands, Volume)
+- Обнаруженные свечные паттерны (hammer, engulfing, doji, morning/evening star)
 - Последние 20 свечей (OHLCV)
+- Данные с нескольких таймфреймов (5м, 15м, 1ч) для контекста тренда и уровней
 - Текущие параметры риска (SL%, TP%)
 
 Правила:
@@ -30,6 +33,8 @@ SYSTEM_PROMPT = """\
 - Если только 1 индикатор за вход — скорее всего REJECT.
 - Подтверждай (CONFIRM) только если видишь реальную конвергенцию сигналов.
 - Учитывай паттерны свечей, тренд, объём.
+- Используй старшие таймфреймы для определения тренда и ключевых уровней.
+- Сигнал на 1м ПРОТИВ тренда на 15м/1ч — повод для REJECT.
 - Предлагай SL/TP исходя из волатильности и текущей ситуации.
 
 Отвечай СТРОГО в формате JSON (без markdown, без ```):
@@ -136,6 +141,8 @@ class AIAnalyst:
         indicator_text: str,
         candles_text: str,
         risk_text: str = "",
+        mtf_data: dict | None = None,
+        config: dict | None = None,
     ) -> AIVerdict:
         if not self.enabled or not self._client:
             return AIVerdict(error="AI disabled")
@@ -148,6 +155,21 @@ class AIAnalyst:
         )
         if risk_text:
             user_prompt += f"\n\nТекущие параметры риска:\n{risk_text}"
+
+        # Multi-timeframe context
+        if mtf_data and config:
+            mtf_sections = []
+            for tf in sorted(mtf_data, key=lambda x: int(x)):
+                tf_df = mtf_data[tf]
+                if len(tf_df) < 30:
+                    continue
+                tf_indicators = extract_indicator_values(tf_df, config)
+                tf_candles = summarize_candles(tf_df, n=10)
+                mtf_sections.append(
+                    f"=== Таймфрейм {tf}м ===\n{tf_indicators}\n\nПоследние 10 свечей:\n{tf_candles}"
+                )
+            if mtf_sections:
+                user_prompt += "\n\n--- МУЛЬТИ-ТАЙМФРЕЙМ КОНТЕКСТ ---\n" + "\n\n".join(mtf_sections)
 
         try:
             content = await self._call_api(SYSTEM_PROMPT, user_prompt)
@@ -222,7 +244,7 @@ class AIAnalyst:
                     {"role": "user", "content": user},
                 ],
                 "temperature": 0.3,
-                "max_tokens": 500,
+                "max_tokens": 700,
             },
         )
         resp.raise_for_status()
@@ -337,6 +359,14 @@ def extract_indicator_values(df: pd.DataFrame, config: dict) -> str:
         f"BB Upper: {upper.iloc[-1]:.2f} | Mid: {middle.iloc[-1]:.2f} | Lower: {lower.iloc[-1]:.2f}",
         f"Volume ratio: {vol_ratio:.2f}x (порог: {strat.get('vol_threshold', 1.5)}x)",
     ]
+
+    pat = detect_candlestick_patterns(df)
+    if pat["patterns"]:
+        pat_names = ", ".join(f"{k}({v:+d})" for k, v in pat["patterns"].items())
+        lines.append(f"Свечные паттерны: {pat_names} (итого: {pat['score']:+d})")
+    else:
+        lines.append("Свечные паттерны: не обнаружены")
+
     return "\n".join(lines)
 
 
