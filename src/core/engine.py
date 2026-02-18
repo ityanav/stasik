@@ -1,6 +1,9 @@
 import asyncio
 import logging
+import time
 from datetime import datetime
+
+import httpx
 
 from src.exchange.client import BybitClient
 from src.risk.manager import RiskManager
@@ -33,6 +36,15 @@ class TradingEngine:
         self._htf_cache: dict[str, tuple[Trend, float, float]] = {}  # symbol -> (trend, adx, timestamp)
         self._adx_period: int = config["strategy"].get("adx_period", 14)
         self._adx_min: float = config["strategy"].get("adx_min", 20)
+
+        # Fear & Greed Index
+        self._fng_extreme_greed: int = config["strategy"].get("fng_extreme_greed", 80)
+        self._fng_extreme_fear: int = config["strategy"].get("fng_extreme_fear", 20)
+        self._fng_cache: tuple[int, float] | None = None  # (value, timestamp)
+
+        # Funding rate
+        self._funding_rate_max: float = config["strategy"].get("funding_rate_max", 0.0003)
+        self._funding_cache: dict[str, tuple[float, float]] = {}  # symbol -> (rate, timestamp)
 
         # Correlation groups: symbol -> group name
         self._corr_groups: dict[str, str] = {}
@@ -132,6 +144,30 @@ class TradingEngine:
         if htf_trend == Trend.BULLISH and result.signal == Signal.SELL:
             logger.info("HTF фильтр: отклонён SELL %s (тренд 15м бычий)", symbol)
             return
+
+        # Fear & Greed Index filter
+        fng_value = await self._get_fear_greed()
+        if fng_value is not None:
+            if fng_value > self._fng_extreme_greed and result.signal == Signal.BUY:
+                logger.info("FnG фильтр: отклонён BUY %s (FnG=%d > %d — Extreme Greed)",
+                            symbol, fng_value, self._fng_extreme_greed)
+                return
+            if fng_value < self._fng_extreme_fear and result.signal == Signal.SELL:
+                logger.info("FnG фильтр: отклонён SELL %s (FnG=%d < %d — Extreme Fear)",
+                            symbol, fng_value, self._fng_extreme_fear)
+                return
+
+        # Funding rate filter
+        funding_rate = self._get_funding_rate_cached(symbol, category)
+        if abs(funding_rate) > self._funding_rate_max:
+            if funding_rate > 0 and result.signal == Signal.BUY:
+                logger.info("Funding фильтр: отклонён BUY %s (funding=%.4f%% > 0 — перегрев лонгов)",
+                            symbol, funding_rate * 100)
+                return
+            if funding_rate < 0 and result.signal == Signal.SELL:
+                logger.info("Funding фильтр: отклонён SELL %s (funding=%.4f%% < 0 — перегрев шортов)",
+                            symbol, funding_rate * 100)
+                return
 
         # Check existing positions
         open_trades = await self.db.get_open_trades()
@@ -460,9 +496,37 @@ class TradingEngine:
         logger.info(msg)
         await self._notify(msg)
 
+    async def _get_fear_greed(self) -> int | None:
+        """Fetch Fear & Greed Index from alternative.me, cached for 1 hour."""
+        now = time.time()
+        if self._fng_cache and now - self._fng_cache[1] < 3600:
+            return self._fng_cache[0]
+
+        try:
+            async with httpx.AsyncClient(timeout=5) as client:
+                resp = await client.get("https://api.alternative.me/fng/?limit=1")
+                data = resp.json()
+                value = int(data["data"][0]["value"])
+                self._fng_cache = (value, now)
+                logger.info("Fear & Greed Index: %d (%s)", value, data["data"][0].get("value_classification", ""))
+                return value
+        except Exception as e:
+            logger.warning("Failed to fetch Fear & Greed Index: %s", e)
+            return None
+
+    def _get_funding_rate_cached(self, symbol: str, category: str) -> float:
+        """Get funding rate with 30 min cache."""
+        now = time.time()
+        cached = self._funding_cache.get(symbol)
+        if cached and now - cached[1] < 1800:
+            return cached[0]
+
+        rate = self.client.get_funding_rate(symbol, category)
+        self._funding_cache[symbol] = (rate, now)
+        return rate
+
     def _get_htf_data(self, symbol: str, category: str) -> tuple[Trend, float]:
         """Get higher timeframe trend + ADX, cached for 5 minutes."""
-        import time
         from src.strategy.indicators import calculate_adx
         now = time.time()
         cached = self._htf_cache.get(symbol)

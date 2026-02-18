@@ -198,6 +198,18 @@ class BybitClient:
         resp = self.session.get_tickers(category=category, symbol=symbol)
         return float(resp["result"]["list"][0]["lastPrice"])
 
+    # ── Funding rate ──────────────────────────────────────────
+
+    def get_funding_rate(self, symbol: str, category: str = "linear") -> float:
+        """Get current funding rate from tickers API. Returns 0.0 on error."""
+        try:
+            resp = self.session.get_tickers(category=category, symbol=symbol)
+            rate_str = resp["result"]["list"][0].get("fundingRate", "0")
+            return float(rate_str)
+        except Exception as e:
+            logger.warning("Failed to get funding rate for %s: %s", symbol, e)
+            return 0.0
+
     # ── Instrument info (min qty, tick size) ─────────────────
 
     def get_instrument_info(self, symbol: str, category: str = "linear") -> dict:
