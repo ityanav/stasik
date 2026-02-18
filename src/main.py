@@ -1,0 +1,71 @@
+import asyncio
+import logging
+import signal
+import sys
+from pathlib import Path
+
+import yaml
+
+from src.core.engine import TradingEngine
+from src.telegram.bot import TelegramBot
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler(Path(__file__).resolve().parent.parent / "bot.log"),
+    ],
+)
+logger = logging.getLogger(__name__)
+
+
+def load_config() -> dict:
+    config_path = Path(__file__).resolve().parent.parent / "config" / "config.yaml"
+    with open(config_path) as f:
+        return yaml.safe_load(f)
+
+
+async def main():
+    config = load_config()
+    logger.info("Config loaded")
+
+    engine = TradingEngine(config)
+    tg_bot = TelegramBot(config, engine)
+
+    # Wire notifier: engine -> telegram
+    engine.notifier = tg_bot.send_message
+
+    loop = asyncio.get_running_loop()
+    stop_event = asyncio.Event()
+
+    def _signal_handler():
+        logger.info("Shutdown signal received")
+        stop_event.set()
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, _signal_handler)
+
+    # Start Telegram bot
+    await tg_bot.start()
+
+    # Start engine in background
+    engine_task = asyncio.create_task(engine.start())
+
+    # Wait for stop signal
+    await stop_event.wait()
+
+    # Graceful shutdown
+    logger.info("Shutting down...")
+    await engine.stop()
+    engine_task.cancel()
+    try:
+        await engine_task
+    except asyncio.CancelledError:
+        pass
+    await tg_bot.stop()
+    logger.info("Shutdown complete")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
