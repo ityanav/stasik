@@ -27,3 +27,21 @@ def calculate_macd(
         window_sign=signal,
     )
     return macd_ind.macd(), macd_ind.macd_signal(), macd_ind.macd_diff()
+
+
+def calculate_bollinger(
+    df: pd.DataFrame, period: int = 20, std_dev: float = 2.0
+) -> tuple[pd.Series, pd.Series, pd.Series]:
+    bb = ta.volatility.BollingerBands(
+        close=df["close"], window=period, window_dev=std_dev
+    )
+    return bb.bollinger_hband(), bb.bollinger_mavg(), bb.bollinger_lband()
+
+
+def calculate_volume_signal(df: pd.DataFrame, period: int = 20) -> tuple[pd.Series, float]:
+    """Returns volume SMA and current volume ratio (current / average)."""
+    vol_sma = df["volume"].rolling(window=period).mean()
+    current_vol = df["volume"].iloc[-1]
+    avg_vol = vol_sma.iloc[-1]
+    ratio = current_vol / avg_vol if avg_vol > 0 else 1.0
+    return vol_sma, ratio

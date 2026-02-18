@@ -11,16 +11,22 @@ class BybitClient:
     def __init__(self, config: dict):
         self.config = config
         bybit_cfg = config["bybit"]
-        self.testnet = bybit_cfg["testnet"]
-        self.session = HTTP(
-            testnet=self.testnet,
-            api_key=bybit_cfg["api_key"],
-            api_secret=bybit_cfg["api_secret"],
-        )
+        self.testnet = bybit_cfg.get("testnet", False)
+        self.demo = bybit_cfg.get("demo", False)
+
+        http_kwargs: dict = {
+            "api_key": bybit_cfg["api_key"],
+            "api_secret": bybit_cfg["api_secret"],
+        }
+        if self.demo:
+            http_kwargs["demo"] = True
+        else:
+            http_kwargs["testnet"] = self.testnet
+
+        self.session = HTTP(**http_kwargs)
         self.leverage = config["trading"].get("leverage", 1)
-        logger.info(
-            "BybitClient initialized (testnet=%s)", self.testnet
-        )
+        mode = "demo" if self.demo else f"testnet={self.testnet}"
+        logger.info("BybitClient initialized (%s)", mode)
 
     # ── Balance ──────────────────────────────────────────────
 
@@ -141,6 +147,30 @@ class BybitClient:
             else:
                 logger.warning("Failed to set leverage for %s: %s", symbol, e)
 
+    # ── Trailing stop ─────────────────────────────────────────
+
+    def set_trailing_stop(
+        self,
+        symbol: str,
+        trailing_stop: float,
+        active_price: float,
+        category: str = "linear",
+    ):
+        try:
+            self.session.set_trading_stop(
+                category=category,
+                symbol=symbol,
+                trailingStop=str(round(trailing_stop, 6)),
+                activePrice=str(round(active_price, 6)),
+                positionIdx=0,
+            )
+            logger.info(
+                "Trailing stop set: %s trail=%s activePrice=%s",
+                symbol, trailing_stop, active_price,
+            )
+        except Exception as e:
+            logger.warning("Failed to set trailing stop for %s: %s", symbol, e)
+
     # ── Ticker (last price) ──────────────────────────────────
 
     def get_last_price(self, symbol: str, category: str = "linear") -> float:
@@ -154,9 +184,11 @@ class BybitClient:
         info = resp["result"]["list"][0]
         lot_filter = info["lotSizeFilter"]
         price_filter = info["priceFilter"]
+        # Spot uses "basePrecision" instead of "qtyStep"
+        qty_step = lot_filter.get("qtyStep") or lot_filter.get("basePrecision", "1")
         return {
             "min_qty": float(lot_filter["minOrderQty"]),
             "max_qty": float(lot_filter["maxOrderQty"]),
-            "qty_step": float(lot_filter["qtyStep"]),
+            "qty_step": float(qty_step),
             "tick_size": float(price_filter["tickSize"]),
         }

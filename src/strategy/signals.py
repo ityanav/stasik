@@ -4,7 +4,13 @@ from enum import Enum
 
 import pandas as pd
 
-from src.strategy.indicators import calculate_ema, calculate_macd, calculate_rsi
+from src.strategy.indicators import (
+    calculate_bollinger,
+    calculate_ema,
+    calculate_macd,
+    calculate_rsi,
+    calculate_volume_signal,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -33,12 +39,16 @@ class SignalGenerator:
         self.macd_fast = strat["macd_fast"]
         self.macd_slow = strat["macd_slow"]
         self.macd_signal = strat["macd_signal"]
+        self.bb_period = strat.get("bb_period", 20)
+        self.bb_std = strat.get("bb_std", 2.0)
+        self.vol_period = strat.get("vol_period", 20)
+        self.vol_threshold = strat.get("vol_threshold", 1.5)
         self.min_score = strat["min_score"]
 
     def generate(self, df: pd.DataFrame) -> SignalResult:
         scores: dict[str, int] = {}
 
-        # RSI
+        # ── RSI ───────────────────────────────────────────
         rsi = calculate_rsi(df, self.rsi_period)
         rsi_val = rsi.iloc[-1]
         if rsi_val < self.rsi_oversold:
@@ -48,7 +58,7 @@ class SignalGenerator:
         else:
             scores["rsi"] = 0
 
-        # EMA crossover
+        # ── EMA crossover ─────────────────────────────────
         ema_fast, ema_slow = calculate_ema(df, self.ema_fast, self.ema_slow)
         if len(ema_fast) >= 2 and len(ema_slow) >= 2:
             prev_fast = ema_fast.iloc[-2]
@@ -64,7 +74,7 @@ class SignalGenerator:
         else:
             scores["ema"] = 0
 
-        # MACD crossover
+        # ── MACD crossover ────────────────────────────────
         macd_line, signal_line, _ = calculate_macd(
             df, self.macd_fast, self.macd_slow, self.macd_signal
         )
@@ -82,6 +92,42 @@ class SignalGenerator:
         else:
             scores["macd"] = 0
 
+        # ── Bollinger Bands ───────────────────────────────
+        upper, middle, lower = calculate_bollinger(df, self.bb_period, self.bb_std)
+        close = df["close"].iloc[-1]
+        prev_close = df["close"].iloc[-2]
+
+        if close <= lower.iloc[-1] and prev_close > lower.iloc[-2]:
+            # Цена пробила нижнюю полосу — перепроданность → покупка
+            scores["bb"] = 1
+        elif close >= upper.iloc[-1] and prev_close < upper.iloc[-2]:
+            # Цена пробила верхнюю полосу — перекупленность → продажа
+            scores["bb"] = -1
+        elif close < lower.iloc[-1]:
+            # Цена ниже нижней полосы — сильная перепроданность
+            scores["bb"] = 1
+        elif close > upper.iloc[-1]:
+            # Цена выше верхней полосы — сильная перекупленность
+            scores["bb"] = -1
+        else:
+            scores["bb"] = 0
+
+        # ── Volume analysis ───────────────────────────────
+        _, vol_ratio = calculate_volume_signal(df, self.vol_period)
+
+        # Объём усиливает сигнал: если объём выше порога,
+        # добавляем +1/-1 в направлении движения свечи
+        if vol_ratio >= self.vol_threshold:
+            candle_change = close - df["open"].iloc[-1]
+            if candle_change > 0:
+                scores["vol"] = 1   # бычья свеча на высоком объёме
+            elif candle_change < 0:
+                scores["vol"] = -1  # медвежья свеча на высоком объёме
+            else:
+                scores["vol"] = 0
+        else:
+            scores["vol"] = 0
+
         total = sum(scores.values())
 
         if total >= self.min_score:
@@ -91,8 +137,8 @@ class SignalGenerator:
         else:
             signal = Signal.HOLD
 
-        logger.debug(
-            "Signal: %s (score=%d, rsi=%.1f, details=%s)",
-            signal.value, total, rsi_val, scores,
+        logger.info(
+            "Сигнал %s: %s (score=%d, rsi=%.1f, vol=%.1fx, details=%s)",
+            df.attrs.get("symbol", "?"), signal.value, total, rsi_val, vol_ratio, scores,
         )
         return SignalResult(signal=signal, score=total, details=scores)

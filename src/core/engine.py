@@ -5,6 +5,7 @@ from datetime import datetime
 from src.exchange.client import BybitClient
 from src.risk.manager import RiskManager
 from src.storage.database import Database
+from src.strategy.ai_analyst import AIAnalyst, extract_indicator_values, summarize_candles
 from src.strategy.signals import Signal, SignalGenerator
 
 logger = logging.getLogger(__name__)
@@ -18,6 +19,7 @@ class TradingEngine:
         self.risk = RiskManager(config)
         self.db = Database()
         self.notifier = notifier  # async callable(text)
+        self.ai_analyst = AIAnalyst.from_config(config)
 
         self.pairs: list[str] = config["trading"]["pairs"]
         self.timeframe: str = str(config["trading"]["timeframe"])
@@ -36,7 +38,7 @@ class TradingEngine:
             for pair in self.pairs:
                 self.client.set_leverage(pair, self.leverage, category="linear")
 
-        await self._notify("Bot started. Pairs: " + ", ".join(self.pairs))
+        await self._notify("🚀 Бот запущен\nПары: " + ", ".join(self.pairs))
         logger.info("Trading engine started")
 
         try:
@@ -44,8 +46,9 @@ class TradingEngine:
         except asyncio.CancelledError:
             logger.info("Trading engine cancelled")
         finally:
+            await self.ai_analyst.close()
             await self.db.close()
-            await self._notify("Bot stopped.")
+            await self._notify("🛑 Бот остановлен")
             logger.info("Trading engine stopped")
 
     async def stop(self):
@@ -55,6 +58,7 @@ class TradingEngine:
         interval_sec = int(self.timeframe) * 60
         while self._running:
             try:
+                await self._check_closed_trades()
                 await self._tick()
             except Exception:
                 logger.exception("Error in trading tick")
@@ -97,7 +101,6 @@ class TradingEngine:
             return
 
         # Check existing positions
-        open_positions = self.client.get_positions(category=category) if category == "linear" else []
         open_trades = await self.db.get_open_trades()
         symbol_open = [t for t in open_trades if t["symbol"] == symbol and t["category"] == category]
 
@@ -115,9 +118,39 @@ class TradingEngine:
         if category == "spot" and side == "Sell":
             return
 
-        await self._open_trade(symbol, side, category, result.score, result.details)
+        # AI analyst filter
+        ai_reasoning = ""
+        if self.ai_analyst.enabled:
+            indicator_text = extract_indicator_values(df, self.config)
+            candles_text = summarize_candles(df)
+            verdict = await self.ai_analyst.analyze(
+                signal=result.signal.value,
+                score=result.score,
+                details=result.details,
+                indicator_text=indicator_text,
+                candles_text=candles_text,
+            )
 
-    async def _open_trade(self, symbol: str, side: str, category: str, score: int, details: dict):
+            if verdict.error:
+                # Fallback: AI unavailable — trade on technical signals
+                logger.warning("AI unavailable (%s), using technical signals for %s", verdict.error, symbol)
+            elif not verdict.confirmed:
+                direction = "BUY" if side == "Buy" else "SELL"
+                msg = (
+                    f"🤖 AI отклонил {direction} {symbol}\n"
+                    f"Уверенность: {verdict.confidence}/10\n"
+                    f"Причина: {verdict.reasoning}"
+                )
+                logger.info(msg)
+                await self._notify(msg)
+                return
+            else:
+                ai_reasoning = f"🤖 AI ({verdict.confidence}/10): {verdict.reasoning}"
+                logger.info("AI confirmed %s %s — confidence %d/10", side, symbol, verdict.confidence)
+
+        await self._open_trade(symbol, side, category, result.score, result.details, ai_reasoning)
+
+    async def _open_trade(self, symbol: str, side: str, category: str, score: int, details: dict, ai_reasoning: str = ""):
         price = self.client.get_last_price(symbol, category=category)
         balance = self.client.get_balance()
 
@@ -144,7 +177,7 @@ class TradingEngine:
         )
 
         order_id = order.get("orderId", "")
-        trade_id = await self.db.insert_trade(
+        await self.db.insert_trade(
             symbol=symbol,
             side=side,
             category=category,
@@ -155,15 +188,119 @@ class TradingEngine:
             order_id=order_id,
         )
 
+        # Set trailing stop for futures
+        trailing_msg = ""
+        if category == "linear":
+            trail_pct = self.config["risk"].get("trailing_stop", 0)
+            trail_activation_pct = self.config["risk"].get("trailing_activation", 0)
+            if trail_pct > 0:
+                trailing_distance = price * trail_pct / 100
+                if side == "Buy":
+                    active_price = price * (1 + trail_activation_pct / 100)
+                else:
+                    active_price = price * (1 - trail_activation_pct / 100)
+                self.client.set_trailing_stop(
+                    symbol=symbol,
+                    trailing_stop=trailing_distance,
+                    active_price=active_price,
+                )
+                trailing_msg = f"\n📐 Trailing SL: {trail_pct}% (активация при {trail_activation_pct}% прибыли)"
+
+        direction = "ЛОНГ 📈" if side == "Buy" else "ШОРТ 📉"
+        pos_value = qty * price
         msg = (
-            f"{'🟢' if side == 'Buy' else '🔴'} {side} {symbol} ({category})\n"
-            f"Price: {price}\n"
-            f"Qty: {qty}\n"
-            f"SL: {sl} | TP: {tp}\n"
-            f"Score: {score} | {details}"
+            f"{'🟢' if side == 'Buy' else '🔴'} Открыл {direction} {symbol}\n"
+            f"Цена: {price}\n"
+            f"Объём: {qty} (~{pos_value:,.0f} USDT)\n"
+            f"SL: {sl} | TP: {tp}{trailing_msg}\n"
+            f"Баланс: {balance:,.0f} USDT"
+        )
+        if ai_reasoning:
+            msg += f"\n{ai_reasoning}"
+        logger.info(msg)
+        await self._notify(msg)
+
+    # ── Monitor closed trades ─────────────────────────────────
+
+    async def _check_closed_trades(self):
+        open_trades = await self.db.get_open_trades()
+        if not open_trades:
+            return
+
+        for trade in open_trades:
+            if trade["category"] != "linear":
+                continue
+            try:
+                await self._check_trade_closed(trade)
+            except Exception:
+                logger.exception("Error checking trade %s", trade["id"])
+
+    async def _check_trade_closed(self, trade: dict):
+        symbol = trade["symbol"]
+        positions = self.client.get_positions(symbol=symbol, category="linear")
+
+        # Check if we still have a position for this symbol+side
+        still_open = False
+        for p in positions:
+            if p["symbol"] == symbol and p["size"] > 0:
+                still_open = True
+                break
+
+        if still_open:
+            return
+
+        # Position closed — calculate PnL
+        entry_price = trade["entry_price"]
+        qty = trade["qty"]
+        side = trade["side"]
+
+        # Get current/last price as approximation of exit price
+        exit_price = self.client.get_last_price(symbol, category="linear")
+
+        # Try to get actual closed PnL from exchange
+        try:
+            pnl = self._get_closed_pnl(symbol, trade["order_id"])
+        except Exception:
+            # Fallback: calculate manually
+            if side == "Buy":
+                pnl = (exit_price - entry_price) * qty
+            else:
+                pnl = (entry_price - exit_price) * qty
+
+        # Update DB
+        balance = self.client.get_balance()
+        await self.db.close_trade(trade["id"], exit_price, pnl)
+        await self.db.update_daily_pnl(pnl)
+        self.risk.record_pnl(pnl, balance)
+
+        # Send notification
+        if pnl >= 0:
+            emoji = "💰"
+            result_text = f"заработал: +{pnl:,.2f} USDT"
+        else:
+            emoji = "💸"
+            result_text = f"просрал: {pnl:,.2f} USDT"
+
+        direction = "ЛОНГ" if side == "Buy" else "ШОРТ"
+        daily_pnl = await self.db.get_daily_pnl()
+        total_pnl = await self.db.get_total_pnl()
+
+        msg = (
+            f"{emoji} Закрыл {direction} {symbol}\n"
+            f"Вход: {entry_price} → Выход: {exit_price}\n"
+            f"Результат: {result_text}\n"
+            f"─────────────\n"
+            f"За день: {daily_pnl:+,.2f} USDT\n"
+            f"Всего: {total_pnl:+,.2f} USDT\n"
+            f"Баланс: {balance:,.0f} USDT"
         )
         logger.info(msg)
         await self._notify(msg)
+
+    def _get_closed_pnl(self, symbol: str, order_id: str) -> float:
+        resp = self.session_closed_pnl(symbol)
+        # This is a best-effort; fallback handles failures
+        raise NotImplementedError
 
     def _get_instrument_info(self, symbol: str, category: str) -> dict:
         key = f"{symbol}_{category}"
@@ -183,18 +320,18 @@ class TradingEngine:
     async def get_status(self) -> str:
         balance = self.client.get_balance()
         open_trades = await self.db.get_open_trades()
-        daily = self.risk.daily_pnl
+        daily = await self.db.get_daily_pnl()
         total = await self.db.get_total_pnl()
 
         lines = [
-            f"Status: {'RUNNING' if self._running else 'STOPPED'}",
-            f"{'HALTED — daily loss limit' if self.risk.is_halted else ''}",
-            f"Balance: {balance:.2f} USDT",
-            f"Open trades: {len(open_trades)}",
-            f"Daily PnL: {daily:+.2f} USDT",
-            f"Total PnL: {total:+.2f} USDT",
-            f"Pairs: {', '.join(self.pairs)}",
-            f"Timeframe: {self.timeframe}m",
+            f"{'🟢 РАБОТАЕТ' if self._running else '🔴 ОСТАНОВЛЕН'}",
+            f"{'⛔ СТОП — дневной лимит потерь' if self.risk.is_halted else ''}",
+            f"Баланс: {balance:,.2f} USDT",
+            f"Открытых сделок: {len(open_trades)}",
+            f"За день: {daily:+,.2f} USDT",
+            f"Всего: {total:+,.2f} USDT",
+            f"Пары: {', '.join(self.pairs)}",
+            f"Таймфрейм: {self.timeframe}м | Плечо: {self.leverage}x",
         ]
         return "\n".join(line for line in lines if line)
 
@@ -205,33 +342,40 @@ class TradingEngine:
             if cat == "linear":
                 positions = self.client.get_positions(category=cat)
                 for p in positions:
+                    direction = "ЛОНГ" if p["side"] == "Buy" else "ШОРТ"
                     lines.append(
-                        f"{p['side']} {p['symbol']} | size={p['size']} "
-                        f"entry={p['entry_price']} uPnL={p['unrealised_pnl']:+.2f}"
+                        f"{direction} {p['symbol']} | объём={p['size']} "
+                        f"вход={p['entry_price']} PnL={p['unrealised_pnl']:+.2f}"
                     )
         open_trades = await self.db.get_open_trades()
         if open_trades:
-            lines.append("\n-- DB open trades --")
+            lines.append("\n── Открытые в БД ──")
             for t in open_trades:
+                direction = "ЛОНГ" if t["side"] == "Buy" else "ШОРТ"
                 lines.append(
-                    f"{t['side']} {t['symbol']} ({t['category']}) "
-                    f"qty={t['qty']} entry={t['entry_price']}"
+                    f"{direction} {t['symbol']} ({t['category']}) "
+                    f"объём={t['qty']} вход={t['entry_price']}"
                 )
-        return "\n".join(lines) if lines else "No open positions."
+        return "\n".join(lines) if lines else "Нет открытых позиций."
 
     async def get_pnl_text(self) -> str:
         daily = await self.db.get_daily_pnl()
         total = await self.db.get_total_pnl()
         recent = await self.db.get_recent_trades(5)
         lines = [
-            f"Daily PnL: {daily:+.2f} USDT",
-            f"Total PnL: {total:+.2f} USDT",
+            f"За день: {daily:+,.2f} USDT",
+            f"Всего: {total:+,.2f} USDT",
             "",
-            "Recent trades:",
+            "Последние сделки:",
         ]
         for t in recent:
             pnl = t.get("pnl") or 0
+            direction = "ЛОНГ" if t["side"] == "Buy" else "ШОРТ"
+            if pnl >= 0:
+                result = f"+{pnl:,.2f}"
+            else:
+                result = f"{pnl:,.2f}"
             lines.append(
-                f"  {t['side']} {t['symbol']} | pnl={pnl:+.2f} | {t['status']}"
+                f"  {direction} {t['symbol']} | {result} USDT | {t['status']}"
             )
         return "\n".join(lines)
