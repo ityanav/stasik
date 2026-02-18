@@ -10,18 +10,24 @@ from src.exchange.client import BybitClient
 from src.risk.manager import RiskManager
 from src.storage.database import Database
 from src.strategy.ai_analyst import AIAnalyst, extract_indicator_values, format_risk_text, summarize_candles
+from src.strategy.indicators import calculate_atr
 from src.strategy.signals import Signal, SignalGenerator, Trend
 
 logger = logging.getLogger(__name__)
 
 
 class TradingEngine:
-    def __init__(self, config: dict, notifier=None):
+    def __init__(self, config: dict, notifier=None, db_path: str | None = None):
         self.config = config
+        self.instance_name = config.get("instance_name", "")
         self.client = BybitClient(config)
         self.signal_gen = SignalGenerator(config)
         self.risk = RiskManager(config)
-        self.db = Database()
+        if db_path:
+            from pathlib import Path
+            self.db = Database(db_path=Path(db_path), instance_name=self.instance_name)
+        else:
+            self.db = Database(instance_name=self.instance_name)
         self.notifier = notifier  # async callable(text)
         self.ai_analyst = AIAnalyst.from_config(config)
 
@@ -58,6 +64,38 @@ class TradingEngine:
             for s in symbols:
                 self._corr_groups[s] = group_name
 
+        # ATR config
+        self._atr_period: int = config["risk"].get("atr_period", 14)
+        self._atr_sl_mult: float = config["risk"].get("atr_sl_multiplier", 1.5)
+        self._atr_tp_mult: float = config["risk"].get("atr_tp_multiplier", 3.0)
+        self._atr_trail_mult: float = config["risk"].get("atr_trailing_multiplier", 1.0)
+
+        # Cooldown after loss
+        self._cooldowns: dict[str, float] = {}  # symbol -> cooldown_until timestamp
+        self._cooldown_seconds: int = config["risk"].get("cooldown_after_loss", 5) * 60
+
+        # Breakeven
+        self._breakeven_done: set[int] = set()  # trade IDs that already moved to breakeven
+        self._breakeven_activation: float = config["risk"].get("breakeven_activation", 0.5) / 100
+
+        # Trading hours filter
+        trading_hours = config["trading"].get("trading_hours")
+        if trading_hours and len(trading_hours) == 2:
+            self._trading_hour_start: int = trading_hours[0]
+            self._trading_hour_end: int = trading_hours[1]
+        else:
+            self._trading_hour_start = 0
+            self._trading_hour_end = 24
+
+        # Swing mode: candle dedup (only process signals on new candle)
+        candle_sec = self._timeframe_to_seconds(str(config["trading"]["timeframe"]))
+        self._is_swing = candle_sec >= 3600  # 1h+ = swing-like
+        self._last_candle_ts: dict[str, float] = {}  # symbol -> last candle open timestamp
+
+        # Weekly report
+        self._weekly_report_day: int = config.get("weekly_report_day", 0)  # 0=Monday
+        self._last_weekly_report: str = ""  # ISO date of last report
+
     async def start(self):
         await self.db.connect()
         self._running = True
@@ -83,8 +121,22 @@ class TradingEngine:
     async def stop(self):
         self._running = False
 
+    @staticmethod
+    def _timeframe_to_seconds(tf: str) -> int:
+        """Convert Bybit timeframe string to seconds."""
+        tf_map = {"D": 86400, "W": 604800, "M": 2592000}
+        if tf in tf_map:
+            return tf_map[tf]
+        return int(tf) * 60
+
     async def _run_loop(self):
-        interval_sec = int(self.timeframe) * 60
+        interval_sec = self._timeframe_to_seconds(self.timeframe)
+        # For D/W/M: check every hour for position monitoring, not once per candle
+        check_interval = min(interval_sec, self.config["trading"].get("check_interval", 3600))
+        if interval_sec > 3600:
+            logger.info("Swing mode: TF=%s, candle=%ds, check every %ds",
+                        self.timeframe, interval_sec, check_interval)
+            interval_sec = check_interval
         review_every = self.ai_analyst.review_interval  # in ticks (minutes)
         while self._running:
             try:
@@ -93,6 +145,7 @@ class TradingEngine:
                 self._tick_count += 1
                 if self.ai_analyst.enabled and review_every > 0 and self._tick_count % review_every == 0:
                     await self._ai_review_strategy()
+                await self._maybe_weekly_report()
             except Exception:
                 logger.exception("Error in trading tick")
             await asyncio.sleep(interval_sec)
@@ -100,6 +153,17 @@ class TradingEngine:
     async def _tick(self):
         if self.risk.is_halted:
             logger.info("Trading halted — daily loss limit")
+            return
+
+        # Trading hours filter (UTC)
+        current_hour = datetime.utcnow().hour
+        if self._trading_hour_start < self._trading_hour_end:
+            in_session = self._trading_hour_start <= current_hour < self._trading_hour_end
+        else:
+            in_session = current_hour >= self._trading_hour_start or current_hour < self._trading_hour_end
+        if not in_session:
+            logger.info("Вне торговой сессии (UTC %d:00, окно %d-%d). Мониторинг позиций продолжается.",
+                        current_hour, self._trading_hour_start, self._trading_hour_end)
             return
 
         categories = self._get_categories()
@@ -121,12 +185,32 @@ class TradingEngine:
             return ["spot", "linear"]
 
     async def _process_pair(self, symbol: str, category: str):
+        # Cooldown check (before API calls to save quota)
+        now = time.time()
+        cooldown_until = self._cooldowns.get(symbol, 0)
+        if now < cooldown_until:
+            remaining = int(cooldown_until - now)
+            logger.debug("Кулдаун %s: ещё %d сек", symbol, remaining)
+            return
+
         df = self.client.get_klines(
             symbol=symbol, interval=self.timeframe, limit=200, category=category
         )
         if len(df) < 50:
             logger.warning("Not enough data for %s (%s): %d candles", symbol, category, len(df))
             return
+
+        # Swing mode: skip if no new candle since last check
+        if self._is_swing:
+            last_ts = df.index[-1].timestamp() if hasattr(df.index[-1], 'timestamp') else 0
+            prev_ts = self._last_candle_ts.get(symbol, 0)
+            if last_ts <= prev_ts:
+                logger.debug("Swing %s: нет новой свечи, пропуск", symbol)
+                return
+            self._last_candle_ts[symbol] = last_ts
+
+        # Calculate ATR for dynamic SL/TP
+        atr = calculate_atr(df, self._atr_period)
 
         result = self.signal_gen.generate(df)
 
@@ -256,6 +340,7 @@ class TradingEngine:
             ai_sl_pct=ai_sl,
             ai_tp_pct=ai_tp,
             ai_size_mult=ai_size_mult,
+            atr=atr,
         )
 
     async def _open_trade(
@@ -264,16 +349,28 @@ class TradingEngine:
         ai_sl_pct: float | None = None,
         ai_tp_pct: float | None = None,
         ai_size_mult: float | None = None,
+        atr: float | None = None,
     ):
         price = self.client.get_last_price(symbol, category=category)
         balance = self.client.get_balance()
 
+        # ATR-based SL/TP (default), AI overrides take priority
+        atr_sl_pct = None
+        atr_tp_pct = None
+        if atr and atr > 0:
+            _, _, atr_sl_pct, atr_tp_pct = self.risk.calculate_sl_tp_atr(
+                price, side, atr, self._atr_sl_mult, self._atr_tp_mult
+            )
+
         info = self._get_instrument_info(symbol, category)
+        # Use ATR SL% for adaptive position sizing
+        sizing_sl = atr_sl_pct if atr_sl_pct else None
         qty = self.risk.calculate_position_size(
             balance=balance,
             price=price,
             qty_step=info["qty_step"],
             min_qty=info["min_qty"],
+            sl_pct=sizing_sl,
         )
 
         # AI position size multiplier
@@ -286,19 +383,28 @@ class TradingEngine:
             logger.info("Position size too small for %s, skipping", symbol)
             return
 
-        # AI-adjusted or default SL/TP
+        # SL/TP priority: AI > ATR > fixed
+        sl_source = "fixed"
+        tp_source = "fixed"
+
         if ai_sl_pct is not None and 0.3 <= ai_sl_pct <= 5.0:
             sl = price * (1 - ai_sl_pct / 100) if side == "Buy" else price * (1 + ai_sl_pct / 100)
             sl = round(sl, 6)
+            sl_source = f"AI:{ai_sl_pct:.1f}%"
+        elif atr_sl_pct:
+            sl = self.risk.calculate_sl_tp_atr(price, side, atr, self._atr_sl_mult, self._atr_tp_mult)[0]
+            sl_source = f"ATR:{atr_sl_pct*100:.2f}%"
         else:
-            ai_sl_pct = None
             sl = self.risk.calculate_sl_tp(price, side)[0]
 
         if ai_tp_pct is not None and 0.5 <= ai_tp_pct <= 10.0:
             tp = price * (1 + ai_tp_pct / 100) if side == "Buy" else price * (1 - ai_tp_pct / 100)
             tp = round(tp, 6)
+            tp_source = f"AI:{ai_tp_pct:.1f}%"
+        elif atr_tp_pct:
+            tp = self.risk.calculate_sl_tp_atr(price, side, atr, self._atr_sl_mult, self._atr_tp_mult)[1]
+            tp_source = f"ATR:{atr_tp_pct*100:.2f}%"
         else:
-            ai_tp_pct = None
             tp = self.risk.calculate_sl_tp(price, side)[1]
 
         order = self.client.place_order(
@@ -322,13 +428,15 @@ class TradingEngine:
             order_id=order_id,
         )
 
-        # Set trailing stop for futures
+        # Set trailing stop for futures (ATR-based or fixed)
         trailing_msg = ""
         if category == "linear":
-            trail_pct = self.config["risk"].get("trailing_stop", 0)
-            trail_activation_pct = self.config["risk"].get("trailing_activation", 0)
-            if trail_pct > 0:
-                trailing_distance = price * trail_pct / 100
+            if atr and atr > 0:
+                trailing_distance = self.risk.calculate_trailing_distance_atr(
+                    atr, price, self._atr_trail_mult
+                )
+                trail_pct = trailing_distance / price * 100
+                trail_activation_pct = self.config["risk"].get("trailing_activation", 0)
                 if side == "Buy":
                     active_price = price * (1 + trail_activation_pct / 100)
                 else:
@@ -338,18 +446,32 @@ class TradingEngine:
                     trailing_stop=trailing_distance,
                     active_price=active_price,
                 )
-                trailing_msg = f"\n📐 Trailing SL: {trail_pct}% (активация при {trail_activation_pct}% прибыли)"
+                trailing_msg = f"\n📐 Trailing SL: {trail_pct:.2f}% ATR (активация при {trail_activation_pct}% прибыли)"
+            else:
+                trail_pct = self.config["risk"].get("trailing_stop", 0)
+                trail_activation_pct = self.config["risk"].get("trailing_activation", 0)
+                if trail_pct > 0:
+                    trailing_distance = price * trail_pct / 100
+                    if side == "Buy":
+                        active_price = price * (1 + trail_activation_pct / 100)
+                    else:
+                        active_price = price * (1 - trail_activation_pct / 100)
+                    self.client.set_trailing_stop(
+                        symbol=symbol,
+                        trailing_stop=trailing_distance,
+                        active_price=active_price,
+                    )
+                    trailing_msg = f"\n📐 Trailing SL: {trail_pct}% (активация при {trail_activation_pct}% прибыли)"
 
         direction = "ЛОНГ 📈" if side == "Buy" else "ШОРТ 📉"
         pos_value = qty * price
-        sl_note = f" (AI: {ai_sl_pct}%)" if ai_sl_pct else ""
-        tp_note = f" (AI: {ai_tp_pct}%)" if ai_tp_pct else ""
         size_note = f" (AI: x{ai_size_mult})" if ai_size_mult else ""
+        atr_note = f"\n📊 ATR: {atr:.4f}" if atr and atr > 0 else ""
         msg = (
             f"{'🟢' if side == 'Buy' else '🔴'} Открыл {direction} {symbol}\n"
             f"Цена: {price}\n"
             f"Объём: {qty}{size_note} (~{pos_value:,.0f} USDT)\n"
-            f"SL: {sl}{sl_note} | TP: {tp}{tp_note}{trailing_msg}\n"
+            f"SL: {sl} ({sl_source}) | TP: {tp} ({tp_source}){trailing_msg}{atr_note}\n"
             f"Баланс: {balance:,.0f} USDT"
         )
         if ai_reasoning:
@@ -429,6 +551,7 @@ class TradingEngine:
             if trade["category"] != "linear":
                 continue
             try:
+                await self._check_breakeven(trade)
                 if not trade.get("partial_closed"):
                     await self._check_partial_close(trade)
                 await self._check_trade_closed(trade)
@@ -485,6 +608,15 @@ class TradingEngine:
         await self.db.update_daily_pnl(pnl)
         self.risk.record_pnl(pnl, balance)
 
+        # Cooldown after loss
+        if pnl < 0 and self._cooldown_seconds > 0:
+            self._cooldowns[symbol] = time.time() + self._cooldown_seconds
+            cooldown_min = self._cooldown_seconds // 60
+            logger.info("Кулдаун %s: %d мин после убытка", symbol, cooldown_min)
+
+        # Clean up breakeven tracking
+        self._breakeven_done.discard(trade["id"])
+
         # Send notification
         if pnl >= 0:
             emoji = "💰"
@@ -497,14 +629,59 @@ class TradingEngine:
         daily_pnl = await self.db.get_daily_pnl()
         total_pnl = await self.db.get_total_pnl()
 
+        cooldown_note = ""
+        if pnl < 0 and self._cooldown_seconds > 0:
+            cooldown_note = f"\n⏳ Кулдаун {symbol}: {self._cooldown_seconds // 60} мин"
+
         msg = (
             f"{emoji} Закрыл {direction} {symbol}\n"
             f"Вход: {entry_price} → Выход: {exit_price}\n"
-            f"Результат: {result_text}\n"
+            f"Результат: {result_text}{cooldown_note}\n"
             f"─────────────\n"
             f"За день: {daily_pnl:+,.2f} USDT\n"
             f"Всего: {total_pnl:+,.2f} USDT\n"
             f"Баланс: {balance:,.0f} USDT"
+        )
+        logger.info(msg)
+        await self._notify(msg)
+
+    async def _check_breakeven(self, trade: dict):
+        """Move SL to entry when profit reaches breakeven_activation threshold."""
+        trade_id = trade["id"]
+        if trade_id in self._breakeven_done:
+            return
+
+        if self._breakeven_activation <= 0:
+            return
+
+        symbol = trade["symbol"]
+        entry = trade["entry_price"]
+        side = trade["side"]
+
+        current_price = self.client.get_last_price(symbol, category="linear")
+
+        if side == "Buy":
+            profit_pct = (current_price - entry) / entry
+        else:
+            profit_pct = (entry - current_price) / entry
+
+        if profit_pct < self._breakeven_activation:
+            return
+
+        # Move SL to entry (breakeven)
+        try:
+            self.client.session.set_trading_stop(
+                category="linear", symbol=symbol,
+                stopLoss=str(round(entry, 6)), positionIdx=0,
+            )
+        except Exception:
+            logger.warning("Failed to set breakeven SL for %s", symbol)
+            return
+
+        self._breakeven_done.add(trade_id)
+        msg = (
+            f"🛡️ Безубыток {symbol}\n"
+            f"Прибыль: {profit_pct*100:.2f}% → SL перенесён на вход ({entry})"
         )
         logger.info(msg)
         await self._notify(msg)
@@ -670,9 +847,109 @@ class TradingEngine:
     async def _notify(self, text: str):
         if self.notifier:
             try:
+                if self.instance_name:
+                    text = f"[{self.instance_name}] {text}"
                 await self.notifier(text)
             except Exception:
                 logger.exception("Failed to send notification")
+
+    # ── Weekly report ─────────────────────────────────────────
+
+    async def _maybe_weekly_report(self):
+        """Send weekly report on configured day (default Monday) at first tick after 8:00 UTC."""
+        from datetime import date
+        today = date.today()
+        if today.weekday() != self._weekly_report_day:
+            return
+        if datetime.utcnow().hour < 8:
+            return
+        today_str = today.isoformat()
+        if self._last_weekly_report == today_str:
+            return
+
+        self._last_weekly_report = today_str
+        await self._send_weekly_report()
+
+    async def _send_weekly_report(self):
+        """Generate and send weekly performance report."""
+        import aiosqlite
+        from pathlib import Path
+
+        name = self.instance_name or "BOT"
+        stats = await self.db.get_weekly_stats()
+
+        if stats["total"] == 0:
+            lines = [
+                f"📊 Недельный отчёт [{name}]",
+                "─────────────",
+                "Сделок за неделю: 0",
+                "Бот не торговал.",
+            ]
+        else:
+            wr = stats["win_rate"]
+            lines = [
+                f"📊 Недельный отчёт [{name}]",
+                "─────────────",
+                f"PnL за неделю: {stats['weekly_pnl']:+,.2f} USDT",
+                f"Сделок: {stats['total']} ({stats['wins']}W / {stats['losses']}L)",
+                f"Win Rate: {wr:.1f}%",
+                f"Средний PnL: {stats['avg_pnl']:+,.2f} USDT",
+            ]
+
+            if stats["best_trade"]:
+                bt = stats["best_trade"]
+                d = "ЛОНГ" if bt["side"] == "Buy" else "ШОРТ"
+                lines.append(f"🏆 Лучшая: {d} {bt['symbol']} → +{stats['best']:,.2f} USDT")
+
+            if stats["worst_trade"]:
+                wt = stats["worst_trade"]
+                d = "ЛОНГ" if wt["side"] == "Buy" else "ШОРТ"
+                lines.append(f"💀 Худшая: {d} {wt['symbol']} → {stats['worst']:,.2f} USDT")
+
+        # Other instances
+        for inst in self.config.get("other_instances", []):
+            inst_name = inst.get("name", "???")
+            db_path = inst.get("db_path", "")
+            if not db_path or not Path(db_path).exists():
+                continue
+            try:
+                async with aiosqlite.connect(db_path) as db:
+                    db.row_factory = aiosqlite.Row
+                    from datetime import date as dt_date, timedelta
+                    week_ago = (dt_date.today() - timedelta(days=7)).isoformat()
+
+                    cur = await db.execute(
+                        "SELECT COALESCE(SUM(pnl), 0) as pnl FROM daily_pnl WHERE trade_date >= ?",
+                        (week_ago,),
+                    )
+                    row = await cur.fetchone()
+                    inst_pnl = float(row["pnl"])
+
+                    cur = await db.execute(
+                        "SELECT COUNT(*) as total, "
+                        "COALESCE(SUM(CASE WHEN pnl >= 0 THEN 1 ELSE 0 END), 0) as wins, "
+                        "COALESCE(SUM(CASE WHEN pnl < 0 THEN 1 ELSE 0 END), 0) as losses "
+                        "FROM trades WHERE status = 'closed' AND closed_at >= ?",
+                        (week_ago,),
+                    )
+                    row = await cur.fetchone()
+                    i_total = int(row["total"])
+                    i_wins = int(row["wins"])
+                    i_losses = int(row["losses"])
+
+                    lines.append(f"\n📊 [{inst_name}] за неделю")
+                    lines.append(f"PnL: {inst_pnl:+,.2f} USDT")
+                    if i_total > 0:
+                        i_wr = i_wins / i_total * 100
+                        lines.append(f"Сделок: {i_total} ({i_wins}W / {i_losses}L) WR: {i_wr:.1f}%")
+                    else:
+                        lines.append("Сделок: 0")
+            except Exception:
+                logger.warning("Failed to read weekly stats for %s", inst_name)
+
+        msg = "\n".join(lines)
+        logger.info(msg)
+        await self._notify(msg)
 
     # ── Status info ──────────────────────────────────────────
 
@@ -682,7 +959,11 @@ class TradingEngine:
         daily = await self.db.get_daily_pnl()
         total = await self.db.get_total_pnl()
 
+        name = self.instance_name or "BOT"
+        tf_label = self.timeframe if self._is_swing else f"{self.timeframe}м"
+
         lines = [
+            f"━━━ [{name}] ━━━",
             f"{'🟢 РАБОТАЕТ' if self._running else '🔴 ОСТАНОВЛЕН'}",
             f"{'⛔ СТОП — дневной лимит потерь' if self.risk.is_halted else ''}",
             f"Баланс: {balance:,.2f} USDT",
@@ -690,9 +971,85 @@ class TradingEngine:
             f"За день: {daily:+,.2f} USDT",
             f"Всего: {total:+,.2f} USDT",
             f"Пары: {', '.join(self.pairs)}",
-            f"Таймфрейм: {self.timeframe}м | Плечо: {self.leverage}x",
+            f"Таймфрейм: {tf_label} | Плечо: {self.leverage}x",
         ]
+
+        # Show other instances
+        for inst in self.config.get("other_instances", []):
+            inst_lines = await self._get_other_instance_status(inst)
+            if inst_lines:
+                lines.append("")
+                lines.extend(inst_lines)
+
         return "\n".join(line for line in lines if line)
+
+    async def _get_other_instance_status(self, inst: dict) -> list[str]:
+        """Read another instance's DB and show its status."""
+        import subprocess
+        from pathlib import Path
+
+        name = inst.get("name", "???")
+        db_path = inst.get("db_path", "")
+        service = inst.get("service", "")
+        tf = inst.get("timeframe", "?")
+        leverage = inst.get("leverage", "?")
+        pairs = inst.get("pairs", [])
+
+        # Check if service is running
+        running = False
+        if service:
+            try:
+                result = subprocess.run(
+                    ["systemctl", "is-active", service],
+                    capture_output=True, text=True, timeout=3,
+                )
+                running = result.stdout.strip() == "active"
+            except Exception:
+                pass
+
+        status_emoji = "🟢 РАБОТАЕТ" if running else "🔴 ОСТАНОВЛЕН"
+
+        # Read PnL from DB
+        daily = 0.0
+        total = 0.0
+        open_count = 0
+        if db_path and Path(db_path).exists():
+            try:
+                import aiosqlite
+                async with aiosqlite.connect(db_path) as db:
+                    db.row_factory = aiosqlite.Row
+                    # Daily PnL
+                    from datetime import date
+                    cur = await db.execute(
+                        "SELECT pnl FROM daily_pnl WHERE trade_date = ?",
+                        (date.today().isoformat(),),
+                    )
+                    row = await cur.fetchone()
+                    if row:
+                        daily = float(row["pnl"])
+                    # Total PnL
+                    cur = await db.execute("SELECT COALESCE(SUM(pnl), 0) as total FROM daily_pnl")
+                    row = await cur.fetchone()
+                    if row:
+                        total = float(row["total"])
+                    # Open trades
+                    cur = await db.execute("SELECT COUNT(*) as cnt FROM trades WHERE status = 'open'")
+                    row = await cur.fetchone()
+                    if row:
+                        open_count = int(row["cnt"])
+            except Exception:
+                logger.warning("Failed to read DB for instance %s", name)
+
+        lines = [
+            f"━━━ [{name}] ━━━",
+            status_emoji,
+            f"Открытых сделок: {open_count}",
+            f"За день: {daily:+,.2f} USDT",
+            f"Всего: {total:+,.2f} USDT",
+            f"Пары: {', '.join(pairs)}",
+            f"Таймфрейм: {tf} | Плечо: {leverage}x",
+        ]
+        return lines
 
     async def close_all_positions(self) -> str:
         categories = self._get_categories()
@@ -767,23 +1124,88 @@ class TradingEngine:
         return "\n".join(lines) if lines else "Нет открытых позиций."
 
     async def get_pnl_text(self) -> str:
+        import aiosqlite
+        from pathlib import Path
+
+        name = self.instance_name or "BOT"
+
+        # Main instance
         daily = await self.db.get_daily_pnl()
         total = await self.db.get_total_pnl()
-        recent = await self.db.get_recent_trades(5)
+
         lines = [
+            f"━━━ [{name}] ━━━",
             f"За день: {daily:+,.2f} USDT",
             f"Всего: {total:+,.2f} USDT",
-            "",
-            "Последние сделки:",
         ]
-        for t in recent:
+
+        # Other instances
+        other_daily_sum = 0.0
+        other_total_sum = 0.0
+        for inst in self.config.get("other_instances", []):
+            inst_name = inst.get("name", "???")
+            db_path = inst.get("db_path", "")
+            inst_daily = 0.0
+            inst_total = 0.0
+            if db_path and Path(db_path).exists():
+                try:
+                    async with aiosqlite.connect(db_path) as db:
+                        db.row_factory = aiosqlite.Row
+                        from datetime import date
+                        cur = await db.execute(
+                            "SELECT pnl FROM daily_pnl WHERE trade_date = ?",
+                            (date.today().isoformat(),),
+                        )
+                        row = await cur.fetchone()
+                        if row:
+                            inst_daily = float(row["pnl"])
+                        cur = await db.execute("SELECT COALESCE(SUM(pnl), 0) as total FROM daily_pnl")
+                        row = await cur.fetchone()
+                        if row:
+                            inst_total = float(row["total"])
+                except Exception:
+                    pass
+            other_daily_sum += inst_daily
+            other_total_sum += inst_total
+            lines.append(f"\n━━━ [{inst_name}] ━━━")
+            lines.append(f"За день: {inst_daily:+,.2f} USDT")
+            lines.append(f"Всего: {inst_total:+,.2f} USDT")
+
+        # Collect recent trades from all instances
+        all_trades = []
+        main_recent = await self.db.get_recent_trades(10)
+        for t in main_recent:
+            t["instance"] = t.get("instance") or name
+            all_trades.append(t)
+
+        for inst in self.config.get("other_instances", []):
+            inst_name = inst.get("name", "???")
+            db_path = inst.get("db_path", "")
+            if db_path and Path(db_path).exists():
+                try:
+                    async with aiosqlite.connect(db_path) as db:
+                        db.row_factory = aiosqlite.Row
+                        cur = await db.execute(
+                            "SELECT * FROM trades ORDER BY id DESC LIMIT 10"
+                        )
+                        rows = await cur.fetchall()
+                        for r in rows:
+                            t = dict(r)
+                            t["instance"] = t.get("instance") or inst_name
+                            all_trades.append(t)
+                except Exception:
+                    pass
+
+        all_trades.sort(key=lambda t: t.get("opened_at", ""), reverse=True)
+
+        lines.append("")
+        lines.append("Последние сделки:")
+        for t in all_trades[:7]:
             pnl = t.get("pnl") or 0
             direction = "ЛОНГ" if t["side"] == "Buy" else "ШОРТ"
-            if pnl >= 0:
-                result = f"+{pnl:,.2f}"
-            else:
-                result = f"{pnl:,.2f}"
+            result = f"+{pnl:,.2f}" if pnl >= 0 else f"{pnl:,.2f}"
+            tag = t.get("instance", "")
             lines.append(
-                f"  {direction} {t['symbol']} | {result} USDT | {t['status']}"
+                f"  [{tag}] {direction} {t['symbol']} | {result} USDT | {t['status']}"
             )
         return "\n".join(lines)

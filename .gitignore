@@ -5,5 +5,7 @@ __pycache__/
 data/
 bot.log
 config/config.yaml
+config/swing.yaml
+*.log
 .idea/
 .vscode/

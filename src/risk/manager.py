@@ -70,9 +70,13 @@ class RiskManager:
         price: float,
         qty_step: float,
         min_qty: float,
+        sl_pct: float | None = None,
     ) -> float:
         risk_amount = balance * self.risk_per_trade
-        position_value = risk_amount / self.stop_loss_pct
+        effective_sl = sl_pct if sl_pct is not None else self.stop_loss_pct
+        if effective_sl <= 0:
+            effective_sl = self.stop_loss_pct
+        position_value = risk_amount / effective_sl
         qty = position_value / price
         # Round down to qty_step
         qty = math.floor(qty / qty_step) * qty_step
@@ -92,3 +96,38 @@ class RiskManager:
             sl = price * (1 + self.stop_loss_pct)
             tp = price * (1 - self.take_profit_pct)
         return round(sl, 6), round(tp, 6)
+
+    # ── ATR-based SL / TP ─────────────────────────────────────
+
+    def calculate_sl_tp_atr(
+        self, price: float, side: str, atr: float,
+        sl_mult: float = 1.5, tp_mult: float = 3.0,
+    ) -> tuple[float, float, float, float]:
+        """ATR-based SL/TP with clamping. Returns (sl, tp, sl_pct, tp_pct)."""
+        sl_dist = atr * sl_mult
+        tp_dist = atr * tp_mult
+
+        sl_pct = sl_dist / price
+        tp_pct = tp_dist / price
+
+        # Clamp SL: 0.3% - 3%
+        sl_pct = max(0.003, min(0.03, sl_pct))
+        # Clamp TP: 0.5% - 5%
+        tp_pct = max(0.005, min(0.05, tp_pct))
+
+        if side == "Buy":
+            sl = price * (1 - sl_pct)
+            tp = price * (1 + tp_pct)
+        else:
+            sl = price * (1 + sl_pct)
+            tp = price * (1 - tp_pct)
+
+        return round(sl, 6), round(tp, 6), sl_pct, tp_pct
+
+    def calculate_trailing_distance_atr(
+        self, atr: float, price: float, mult: float = 1.0,
+    ) -> float:
+        """ATR-based trailing distance, clamped to 0.2%-2% of price."""
+        trail_pct = (atr * mult) / price
+        trail_pct = max(0.002, min(0.02, trail_pct))
+        return price * trail_pct

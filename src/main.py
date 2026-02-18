@@ -1,3 +1,4 @@
+import argparse
 import asyncio
 import logging
 import signal
@@ -10,29 +11,46 @@ from src.core.engine import TradingEngine
 from src.dashboard.app import Dashboard
 from src.telegram.bot import TelegramBot
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler(Path(__file__).resolve().parent.parent / "bot.log"),
-    ],
-)
-logger = logging.getLogger(__name__)
 
-
-def load_config() -> dict:
-    config_path = Path(__file__).resolve().parent.parent / "config" / "config.yaml"
-    with open(config_path) as f:
+def load_config(config_path: str | None = None) -> dict:
+    if config_path:
+        path = Path(config_path)
+    else:
+        path = Path(__file__).resolve().parent.parent / "config" / "config.yaml"
+    with open(path) as f:
         return yaml.safe_load(f)
 
 
-async def main():
-    config = load_config()
-    logger.info("Config loaded")
+def setup_logging(config: dict):
+    instance = config.get("instance_name", "stasik")
+    log_file = Path(__file__).resolve().parent.parent / f"{instance}.log"
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        handlers=[
+            logging.StreamHandler(),
+            logging.FileHandler(log_file),
+        ],
+    )
 
-    engine = TradingEngine(config)
-    tg_bot = TelegramBot(config, engine)
+
+async def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", "-c", help="Path to config file")
+    args = parser.parse_args()
+
+    config = load_config(args.config)
+    setup_logging(config)
+    logger = logging.getLogger(__name__)
+    logger.info("Config loaded: %s", args.config or "config/config.yaml")
+
+    # Database path from config
+    db_path = config.get("database", {}).get("path")
+
+    engine = TradingEngine(config, db_path=db_path)
+
+    notify_only = config.get("telegram", {}).get("notify_only", False)
+    tg_bot = TelegramBot(config, engine, notify_only=notify_only)
 
     # Wire notifier: engine -> telegram
     engine.notifier = tg_bot.send_message

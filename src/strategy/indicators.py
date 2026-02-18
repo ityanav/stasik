@@ -38,6 +38,15 @@ def calculate_bollinger(
     return bb.bollinger_hband(), bb.bollinger_mavg(), bb.bollinger_lband()
 
 
+def calculate_atr(df: pd.DataFrame, period: int = 14) -> float:
+    """Returns current ATR value (Average True Range)."""
+    atr = ta.volatility.AverageTrueRange(
+        high=df["high"], low=df["low"], close=df["close"], window=period
+    )
+    value = atr.average_true_range().iloc[-1]
+    return value if pd.notna(value) else 0.0
+
+
 def calculate_adx(df: pd.DataFrame, period: int = 14) -> float:
     """Returns current ADX value. >25 = trending, <20 = ranging."""
     adx = ta.trend.ADXIndicator(

@@ -25,12 +25,13 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
 
 
 class TelegramBot:
-    def __init__(self, config: dict, engine):
+    def __init__(self, config: dict, engine, notify_only: bool = False):
         self.token = config["telegram"]["token"]
         self.chat_id = str(config["telegram"]["chat_id"])
         self.engine = engine
         self.app: Application | None = None
         self._started = False
+        self._notify_only = notify_only
 
     async def start(self):
         if not self.token or not self.chat_id:
@@ -38,20 +39,27 @@ class TelegramBot:
             return
 
         self.app = Application.builder().token(self.token).build()
-        self._register_handlers()
+
+        if not self._notify_only:
+            self._register_handlers()
 
         await self.app.initialize()
         await self.app.start()
-        await self.app.updater.start_polling(
-            drop_pending_updates=True,
-            allowed_updates=["message", "callback_query"],
-        )
+
+        if not self._notify_only:
+            await self.app.updater.start_polling(
+                drop_pending_updates=True,
+                allowed_updates=["message", "callback_query"],
+            )
+
         self._started = True
-        logger.info("Telegram bot started")
+        mode = "notify-only" if self._notify_only else "full"
+        logger.info("Telegram bot started (%s)", mode)
 
     async def stop(self):
         if self._started and self.app:
-            await self.app.updater.stop()
+            if not self._notify_only:
+                await self.app.updater.stop()
             await self.app.stop()
             await self.app.shutdown()
             self._started = False

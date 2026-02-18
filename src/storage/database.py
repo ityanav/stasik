@@ -10,10 +10,11 @@ DB_PATH = Path(__file__).resolve().parent.parent.parent / "data" / "trades.db"
 
 
 class Database:
-    def __init__(self, db_path: Path = DB_PATH):
+    def __init__(self, db_path: Path = DB_PATH, instance_name: str = ""):
         self.db_path = db_path
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._db: aiosqlite.Connection | None = None
+        self.instance_name = instance_name
 
     async def connect(self):
         self._db = await aiosqlite.connect(str(self.db_path))
@@ -63,6 +64,16 @@ class Database:
         except Exception:
             pass  # column already exists
 
+        # Migration: add instance column
+        try:
+            await self._db.execute(
+                "ALTER TABLE trades ADD COLUMN instance TEXT DEFAULT ''"
+            )
+            await self._db.commit()
+            logger.info("Migration: added instance column")
+        except Exception:
+            pass  # column already exists
+
     # ── Trades ───────────────────────────────────────────────
 
     async def insert_trade(
@@ -78,10 +89,10 @@ class Database:
     ) -> int:
         cursor = await self._db.execute(
             """INSERT INTO trades
-               (symbol, side, category, qty, entry_price, stop_loss, take_profit, order_id, opened_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               (symbol, side, category, qty, entry_price, stop_loss, take_profit, order_id, opened_at, instance)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (symbol, side, category, qty, entry_price, stop_loss, take_profit, order_id,
-             datetime.utcnow().isoformat()),
+             datetime.utcnow().isoformat(), self.instance_name),
         )
         await self._db.commit()
         return cursor.lastrowid
@@ -110,9 +121,9 @@ class Database:
         )
         await self._db.commit()
 
-    async def get_recent_trades(self, limit: int = 10) -> list[dict]:
+    async def get_recent_trades(self, limit: int = 10, offset: int = 0) -> list[dict]:
         cursor = await self._db.execute(
-            "SELECT * FROM trades ORDER BY id DESC LIMIT ?", (limit,)
+            "SELECT * FROM trades ORDER BY id DESC LIMIT ? OFFSET ?", (limit, offset)
         )
         rows = await cursor.fetchall()
         return [dict(r) for r in rows]
@@ -151,6 +162,71 @@ class Database:
         )
         rows = await cursor.fetchall()
         return [dict(r) for r in reversed(rows)]
+
+    async def get_weekly_stats(self) -> dict:
+        """Get trade stats for the last 7 days."""
+        from datetime import timedelta
+        week_ago = (date.today() - timedelta(days=7)).isoformat()
+        today = date.today().isoformat()
+
+        # PnL for the week
+        cursor = await self._db.execute(
+            "SELECT COALESCE(SUM(pnl), 0) as pnl, COALESCE(SUM(trades_count), 0) as cnt "
+            "FROM daily_pnl WHERE trade_date >= ?",
+            (week_ago,),
+        )
+        row = await cursor.fetchone()
+        weekly_pnl = float(row["pnl"])
+        weekly_trades_count = int(row["cnt"])
+
+        # Wins / losses for the week
+        cursor = await self._db.execute(
+            "SELECT "
+            "COUNT(*) as total, "
+            "COALESCE(SUM(CASE WHEN pnl >= 0 THEN 1 ELSE 0 END), 0) as wins, "
+            "COALESCE(SUM(CASE WHEN pnl < 0 THEN 1 ELSE 0 END), 0) as losses, "
+            "COALESCE(MAX(pnl), 0) as best, "
+            "COALESCE(MIN(pnl), 0) as worst, "
+            "COALESCE(AVG(pnl), 0) as avg_pnl "
+            "FROM trades WHERE status = 'closed' AND closed_at >= ?",
+            (week_ago,),
+        )
+        row = await cursor.fetchone()
+
+        # Best and worst trade details
+        best_trade = None
+        worst_trade = None
+        if row["total"] > 0:
+            cursor = await self._db.execute(
+                "SELECT symbol, side, pnl, instance FROM trades "
+                "WHERE status = 'closed' AND closed_at >= ? ORDER BY pnl DESC LIMIT 1",
+                (week_ago,),
+            )
+            best_row = await cursor.fetchone()
+            if best_row:
+                best_trade = dict(best_row)
+
+            cursor = await self._db.execute(
+                "SELECT symbol, side, pnl, instance FROM trades "
+                "WHERE status = 'closed' AND closed_at >= ? ORDER BY pnl ASC LIMIT 1",
+                (week_ago,),
+            )
+            worst_row = await cursor.fetchone()
+            if worst_row:
+                worst_trade = dict(worst_row)
+
+        return {
+            "weekly_pnl": weekly_pnl,
+            "total": int(row["total"]),
+            "wins": int(row["wins"]),
+            "losses": int(row["losses"]),
+            "win_rate": (int(row["wins"]) / int(row["total"]) * 100) if int(row["total"]) > 0 else 0,
+            "best": float(row["best"]),
+            "worst": float(row["worst"]),
+            "avg_pnl": float(row["avg_pnl"]),
+            "best_trade": best_trade,
+            "worst_trade": worst_trade,
+        }
 
     async def get_trade_stats(self) -> dict:
         """Aggregate trade statistics."""

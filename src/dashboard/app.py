@@ -1,7 +1,12 @@
 import logging
+import subprocess
+from datetime import date
+from pathlib import Path
 
+import aiosqlite
 from aiohttp import web
 
+from src.dashboard.auth import AuthManager, COOKIE_NAME
 from src.storage.database import Database
 
 logger = logging.getLogger(__name__)
@@ -13,28 +18,87 @@ class Dashboard:
         self.db = db
         self.engine = engine
         self.port = config.get("dashboard", {}).get("port", 8080)
-        self.app = web.Application()
+        self.auth = AuthManager(config)
+        self.app = web.Application(middlewares=[self.auth.middleware()])
         self._setup_routes()
         self._runner: web.AppRunner | None = None
 
     def _setup_routes(self):
+        self.app.router.add_get("/login", self._login_page)
+        self.app.router.add_post("/login", self._login_post)
+        self.app.router.add_get("/logout", self._logout)
         self.app.router.add_get("/", self._index)
         self.app.router.add_get("/api/stats", self._api_stats)
         self.app.router.add_get("/api/trades", self._api_trades)
         self.app.router.add_get("/api/pnl", self._api_pnl)
         self.app.router.add_get("/api/positions", self._api_positions)
+        self.app.router.add_get("/api/instances", self._api_instances)
 
     async def start(self):
         self._runner = web.AppRunner(self.app)
         await self._runner.setup()
-        site = web.TCPSite(self._runner, "0.0.0.0", self.port)
+        site = web.TCPSite(self._runner, "127.0.0.1", self.port)
         await site.start()
-        logger.info("Dashboard started on port %d", self.port)
+        logger.info("Dashboard started on 127.0.0.1:%d", self.port)
 
     async def stop(self):
         if self._runner:
             await self._runner.cleanup()
             logger.info("Dashboard stopped")
+
+    # --- Auth routes ---
+
+    async def _login_page(self, request: web.Request) -> web.Response:
+        ip = request.headers.get("X-Real-IP", request.remote)
+        error = ""
+        blocked = self.auth.is_blocked(ip)
+        if blocked:
+            error = '<div class="error">IP заблокирован. Подождите 15 минут.</div>'
+        question, token = self.auth.generate_captcha()
+        html = _LOGIN_HTML.replace("{{error}}", error)
+        html = html.replace("{{captcha_question}}", question)
+        html = html.replace("{{captcha_token}}", token)
+        html = html.replace("{{blocked}}", "disabled" if blocked else "")
+        return web.Response(text=html, content_type="text/html")
+
+    async def _login_post(self, request: web.Request) -> web.Response:
+        ip = request.headers.get("X-Real-IP", request.remote)
+        if self.auth.is_blocked(ip):
+            raise web.HTTPFound("/login")
+
+        data = await request.post()
+        username = data.get("username", "")
+        password = data.get("password", "")
+        captcha_answer = data.get("captcha", "")
+        captcha_token = data.get("captcha_token", "")
+
+        if not self.auth.verify_captcha(captcha_token, captcha_answer):
+            self.auth.record_fail(ip)
+            raise web.HTTPFound("/login")
+
+        if not self.auth.check_password(username, password):
+            self.auth.record_fail(ip)
+            raise web.HTTPFound("/login")
+
+        self.auth.clear_fails(ip)
+        cookie_value = self.auth.create_session_cookie(username)
+        resp = web.HTTPFound("/")
+        resp.set_cookie(
+            COOKIE_NAME,
+            cookie_value,
+            max_age=86400,
+            httponly=True,
+            secure=True,
+            samesite="Lax",
+        )
+        return resp
+
+    async def _logout(self, request: web.Request) -> web.Response:
+        resp = web.HTTPFound("/login")
+        resp.del_cookie(COOKIE_NAME)
+        return resp
+
+    # --- API routes ---
 
     async def _index(self, request: web.Request) -> web.Response:
         return web.Response(text=_DASHBOARD_HTML, content_type="text/html")
@@ -70,14 +134,90 @@ class Dashboard:
         return web.json_response(data)
 
     async def _api_trades(self, request: web.Request) -> web.Response:
-        limit = int(request.query.get("limit", "50"))
-        trades = await self.db.get_recent_trades(limit)
-        return web.json_response(trades)
+        page = int(request.query.get("page", "1"))
+        per_page = int(request.query.get("per_page", "20"))
+
+        instance_name = self.config.get("instance_name", "SCALP")
+
+        # Collect all trades from all instances
+        all_trades = []
+
+        # Main instance trades
+        main_trades = await self.db.get_recent_trades(1000)
+        for t in main_trades:
+            t["instance"] = t.get("instance") or instance_name
+            all_trades.append(t)
+
+        # Other instances trades
+        for inst in self.config.get("other_instances", []):
+            db_path = inst.get("db_path", "")
+            inst_name = inst.get("name", "???")
+            if db_path and Path(db_path).exists():
+                try:
+                    async with aiosqlite.connect(db_path) as db:
+                        db.row_factory = aiosqlite.Row
+                        cur = await db.execute(
+                            "SELECT * FROM trades ORDER BY id DESC LIMIT 1000"
+                        )
+                        rows = await cur.fetchall()
+                        for r in rows:
+                            t = dict(r)
+                            t["instance"] = t.get("instance") or inst_name
+                            all_trades.append(t)
+                except Exception:
+                    logger.warning("Failed to read trades from %s", inst_name)
+
+        # Sort by opened_at descending
+        all_trades.sort(key=lambda t: t.get("opened_at", ""), reverse=True)
+
+        # Paginate
+        offset = (page - 1) * per_page
+        page_trades = all_trades[offset:offset + per_page + 1]
+        has_next = len(page_trades) > per_page
+        if has_next:
+            page_trades = page_trades[:per_page]
+
+        return web.json_response({"trades": page_trades, "page": page, "has_next": has_next})
 
     async def _api_pnl(self, request: web.Request) -> web.Response:
         days = int(request.query.get("days", "30"))
-        data = await self.db.get_daily_pnl_history(days)
-        return web.json_response(data)
+
+        instance_name = self.config.get("instance_name", "SCALP")
+
+        # Main instance PnL
+        main_data = await self.db.get_daily_pnl_history(days)
+        # Tag with instance
+        pnl_by_date: dict[str, dict] = {}
+        for d in main_data:
+            key = d["trade_date"]
+            pnl_by_date[key] = {"trade_date": key, "pnl": d["pnl"], "trades_count": d["trades_count"]}
+            pnl_by_date[key][instance_name] = d["pnl"]
+
+        # Other instances PnL
+        for inst in self.config.get("other_instances", []):
+            db_path = inst.get("db_path", "")
+            inst_name = inst.get("name", "???")
+            if db_path and Path(db_path).exists():
+                try:
+                    async with aiosqlite.connect(db_path) as db:
+                        db.row_factory = aiosqlite.Row
+                        cur = await db.execute(
+                            "SELECT trade_date, pnl, trades_count FROM daily_pnl ORDER BY trade_date DESC LIMIT ?",
+                            (days,),
+                        )
+                        rows = await cur.fetchall()
+                        for r in rows:
+                            key = r["trade_date"]
+                            if key not in pnl_by_date:
+                                pnl_by_date[key] = {"trade_date": key, "pnl": 0, "trades_count": 0}
+                            pnl_by_date[key]["pnl"] += r["pnl"]
+                            pnl_by_date[key]["trades_count"] += r["trades_count"]
+                            pnl_by_date[key][inst_name] = r["pnl"]
+                except Exception:
+                    logger.warning("Failed to read PnL from %s", inst_name)
+
+        result = sorted(pnl_by_date.values(), key=lambda x: x["trade_date"])
+        return web.json_response(result)
 
     async def _api_positions(self, request: web.Request) -> web.Response:
         positions = []
@@ -96,6 +236,194 @@ class Dashboard:
                 pass
         return web.json_response(positions)
 
+    async def _api_instances(self, request: web.Request) -> web.Response:
+        instances = []
+
+        # Current instance (scalper)
+        scalp_daily = await self.db.get_daily_pnl()
+        scalp_total = await self.db.get_total_pnl()
+        scalp_stats = await self.db.get_trade_stats()
+        scalp_open = await self.db.get_open_trades()
+        running = self.engine._running if self.engine else False
+
+        instances.append({
+            "name": self.config.get("instance_name", "SCALP"),
+            "running": running,
+            "daily_pnl": scalp_daily,
+            "total_pnl": scalp_total,
+            "open_positions": len(scalp_open),
+            "total_trades": scalp_stats["total"],
+            "wins": scalp_stats["wins"],
+            "losses": scalp_stats["losses"],
+            "win_rate": (scalp_stats["wins"] / scalp_stats["total"] * 100) if scalp_stats["total"] > 0 else 0,
+            "timeframe": str(self.config["trading"]["timeframe"]),
+            "leverage": self.config["trading"].get("leverage", 1),
+            "pairs": self.config["trading"]["pairs"],
+        })
+
+        # Other instances
+        for inst in self.config.get("other_instances", []):
+            data = await self._read_instance_data(inst)
+            instances.append(data)
+
+        return web.json_response(instances)
+
+    async def _read_instance_data(self, inst: dict) -> dict:
+        name = inst.get("name", "???")
+        db_path = inst.get("db_path", "")
+        service = inst.get("service", "")
+
+        # Check service status
+        running = False
+        if service:
+            try:
+                result = subprocess.run(
+                    ["systemctl", "is-active", service],
+                    capture_output=True, text=True, timeout=3,
+                )
+                running = result.stdout.strip() == "active"
+            except Exception:
+                pass
+
+        daily = 0.0
+        total = 0.0
+        open_count = 0
+        total_trades = 0
+        wins = 0
+        losses = 0
+
+        if db_path and Path(db_path).exists():
+            try:
+                async with aiosqlite.connect(db_path) as db:
+                    db.row_factory = aiosqlite.Row
+                    cur = await db.execute(
+                        "SELECT pnl FROM daily_pnl WHERE trade_date = ?",
+                        (date.today().isoformat(),),
+                    )
+                    row = await cur.fetchone()
+                    if row:
+                        daily = float(row["pnl"])
+
+                    cur = await db.execute("SELECT COALESCE(SUM(pnl), 0) as total FROM daily_pnl")
+                    row = await cur.fetchone()
+                    if row:
+                        total = float(row["total"])
+
+                    cur = await db.execute("SELECT COUNT(*) as cnt FROM trades WHERE status = 'open'")
+                    row = await cur.fetchone()
+                    if row:
+                        open_count = int(row["cnt"])
+
+                    cur = await db.execute(
+                        "SELECT COUNT(*) as total, "
+                        "COALESCE(SUM(CASE WHEN pnl >= 0 THEN 1 ELSE 0 END), 0) as wins, "
+                        "COALESCE(SUM(CASE WHEN pnl < 0 THEN 1 ELSE 0 END), 0) as losses "
+                        "FROM trades WHERE status = 'closed'"
+                    )
+                    row = await cur.fetchone()
+                    if row:
+                        total_trades = int(row["total"])
+                        wins = int(row["wins"])
+                        losses = int(row["losses"])
+            except Exception:
+                logger.warning("Failed to read DB for instance %s", name)
+
+        return {
+            "name": name,
+            "running": running,
+            "daily_pnl": daily,
+            "total_pnl": total,
+            "open_positions": open_count,
+            "total_trades": total_trades,
+            "wins": wins,
+            "losses": losses,
+            "win_rate": (wins / total_trades * 100) if total_trades > 0 else 0,
+            "timeframe": inst.get("timeframe", "?"),
+            "leverage": inst.get("leverage", "?"),
+            "pairs": inst.get("pairs", []),
+        }
+
+
+# ── Login page ────────────────────────────────────────────────────
+
+_LOGIN_HTML = """<!DOCTYPE html>
+<html lang="ru"><head>
+<meta charset="utf-8">
+<title>Stasik — Вход</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{
+  font-family:'Segoe UI',-apple-system,sans-serif;
+  background:linear-gradient(135deg,#0f0f23 0%,#1a1a3e 50%,#0f0f23 100%);
+  min-height:100vh;display:flex;align-items:center;justify-content:center;
+  color:#e0e0e0;
+}
+.login-box{
+  background:rgba(26,26,62,0.85);backdrop-filter:blur(20px);
+  border:1px solid rgba(255,255,255,0.06);
+  border-radius:20px;padding:40px 36px;width:100%;max-width:400px;
+  box-shadow:0 20px 60px rgba(0,0,0,0.5);
+}
+.logo{text-align:center;margin-bottom:28px}
+.logo .icon{font-size:48px;display:block;margin-bottom:8px}
+.logo h1{font-size:22px;font-weight:700;color:#fff;letter-spacing:1px}
+.logo p{font-size:13px;color:#666;margin-top:4px}
+.error{
+  background:rgba(255,82,82,0.15);color:#ff5252;
+  padding:10px 14px;border-radius:10px;font-size:13px;
+  margin-bottom:16px;text-align:center;
+}
+label{font-size:12px;color:#888;text-transform:uppercase;letter-spacing:1px;display:block;margin-bottom:6px}
+input[type=text],input[type=password]{
+  width:100%;padding:12px 14px;border:1px solid rgba(255,255,255,0.08);
+  border-radius:10px;background:rgba(15,15,35,0.6);color:#fff;
+  font-size:15px;outline:none;transition:border 0.2s;margin-bottom:16px;
+}
+input:focus{border-color:#6366f1}
+.captcha-row{display:flex;align-items:center;gap:10px;margin-bottom:16px}
+.captcha-q{
+  background:rgba(99,102,241,0.12);border:1px solid rgba(99,102,241,0.2);
+  border-radius:10px;padding:10px 16px;font-size:16px;font-weight:600;
+  color:#a5b4fc;white-space:nowrap;
+}
+.captcha-row input{margin-bottom:0;flex:1}
+button{
+  width:100%;padding:13px;border:none;border-radius:10px;
+  background:linear-gradient(135deg,#6366f1,#8b5cf6);
+  color:#fff;font-size:15px;font-weight:600;cursor:pointer;
+  transition:opacity 0.2s,transform 0.1s;
+}
+button:hover{opacity:0.9}
+button:active{transform:scale(0.98)}
+button:disabled{opacity:0.4;cursor:not-allowed}
+</style>
+</head><body>
+<div class="login-box">
+  <div class="logo">
+    <div class="icon">🤖</div>
+    <h1>Stasik Trading Bot</h1>
+    <p>Авторизация в панели управления</p>
+  </div>
+  {{error}}
+  <form method="POST" action="/login">
+    <label>Логин</label>
+    <input type="text" name="username" autocomplete="username" required {{blocked}}>
+    <label>Пароль</label>
+    <input type="password" name="password" autocomplete="current-password" required {{blocked}}>
+    <label>Капча: сколько будет {{captcha_question}} ?</label>
+    <div class="captcha-row">
+      <div class="captcha-q">{{captcha_question}} = ?</div>
+      <input type="text" name="captcha" inputmode="numeric" required {{blocked}}>
+    </div>
+    <input type="hidden" name="captcha_token" value="{{captcha_token}}">
+    <button type="submit" {{blocked}}>Войти</button>
+  </form>
+</div>
+</body></html>"""
+
+
+# ── Main dashboard HTML ───────────────────────────────────────────
 
 _DASHBOARD_HTML = """<!DOCTYPE html>
 <html lang="ru"><head>
@@ -104,76 +432,312 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
 <style>
+:root{
+  --bg:#0f0f23;--bg2:#1a1a3e;--bg3:#12122e;
+  --green:#00e676;--red:#ff5252;--purple:#6366f1;
+  --text:#e0e0e0;--muted:#888;--border:rgba(255,255,255,0.06);
+}
 *{box-sizing:border-box;margin:0;padding:0}
-body{font-family:-apple-system,sans-serif;background:#0f0f23;color:#e0e0e0;padding:20px}
-h1{font-size:24px;margin-bottom:20px;color:#fff}
-h2{font-size:18px;margin:30px 0 15px;color:#aaa}
-.cards{display:flex;gap:12px;flex-wrap:wrap}
-.card{background:#1a1a3e;border-radius:12px;padding:18px;min-width:140px;flex:1}
-.card h3{font-size:12px;color:#888;text-transform:uppercase;letter-spacing:1px}
-.card .val{font-size:28px;font-weight:700;margin-top:6px}
-.g{color:#00e676}.r{color:#ff5252}
-.status{display:inline-block;padding:4px 12px;border-radius:20px;font-size:12px;font-weight:600}
-.status.on{background:#00e67633;color:#00e676}
-.status.off{background:#ff525233;color:#ff5252}
-#chart-box{max-width:900px;margin:30px 0;background:#1a1a3e;border-radius:12px;padding:20px}
-table{width:100%;border-collapse:collapse;margin-top:10px}
-th{text-align:left;padding:10px;color:#888;font-size:12px;text-transform:uppercase;border-bottom:2px solid #2a2a4e}
-td{padding:10px;border-bottom:1px solid #1a1a3e;font-size:14px}
-tr:hover{background:#1a1a3e}
-.tbl-wrap{background:#12122e;border-radius:12px;padding:15px;overflow-x:auto}
+body{font-family:'Segoe UI',-apple-system,sans-serif;background:var(--bg);color:var(--text);min-height:100vh}
+
+.header{
+  background:linear-gradient(90deg,var(--bg2),rgba(99,102,241,0.15));
+  border-bottom:1px solid var(--border);
+  padding:16px 24px;display:flex;align-items:center;justify-content:space-between;
+  position:sticky;top:0;z-index:100;backdrop-filter:blur(12px);
+}
+.header-left{display:flex;align-items:center;gap:12px}
+.header .icon{font-size:32px}
+.header h1{font-size:20px;font-weight:700;color:#fff}
+.header h1 span{color:var(--purple);font-weight:400}
+.header-right{display:flex;align-items:center;gap:16px}
+#status-badge{
+  padding:5px 14px;border-radius:20px;font-size:12px;font-weight:600;letter-spacing:0.5px;
+}
+#status-badge.on{background:rgba(0,230,118,0.15);color:var(--green);border:1px solid rgba(0,230,118,0.3)}
+#status-badge.off{background:rgba(255,82,82,0.15);color:var(--red);border:1px solid rgba(255,82,82,0.3)}
+.logout-btn{
+  background:rgba(255,255,255,0.06);border:1px solid var(--border);
+  color:#aaa;padding:6px 16px;border-radius:10px;font-size:13px;
+  text-decoration:none;transition:all 0.2s;
+}
+.logout-btn:hover{background:rgba(255,82,82,0.15);color:var(--red);border-color:rgba(255,82,82,0.3)}
+
+.container{max-width:1200px;margin:0 auto;padding:24px}
+
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:14px;margin-bottom:24px}
+.card{
+  background:var(--bg2);border:1px solid var(--border);border-radius:16px;
+  padding:20px;transition:transform 0.2s,box-shadow 0.2s;position:relative;overflow:hidden;
+}
+.card:hover{transform:translateY(-2px);box-shadow:0 8px 30px rgba(0,0,0,0.3)}
+.card::before{
+  content:'';position:absolute;top:0;left:0;right:0;height:3px;
+  background:linear-gradient(90deg,var(--purple),transparent);border-radius:16px 16px 0 0;
+}
+.card .card-icon{font-size:24px;margin-bottom:8px;display:block}
+.card h3{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:1.2px}
+.card .val{font-size:26px;font-weight:700;margin-top:6px;transition:all 0.3s}
+.g{color:var(--green)}.r{color:var(--red)}
+
+.chart-section{
+  background:var(--bg2);border:1px solid var(--border);border-radius:16px;
+  padding:24px;margin-bottom:24px;
+}
+.chart-section h2{font-size:16px;color:#fff;margin-bottom:16px;display:flex;align-items:center;gap:8px}
+
+.section{
+  background:var(--bg3);border:1px solid var(--border);border-radius:16px;
+  padding:20px;margin-bottom:24px;
+}
+.section h2{font-size:16px;color:#fff;margin-bottom:14px;display:flex;align-items:center;gap:8px}
+
+table{width:100%;border-collapse:collapse}
+th{text-align:left;padding:10px 12px;color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:1px;border-bottom:2px solid var(--bg2)}
+td{padding:10px 12px;font-size:13px;border-bottom:1px solid rgba(255,255,255,0.03)}
+tr{transition:background 0.2s}
+tr:hover{background:rgba(99,102,241,0.06)}
+.side-long{color:var(--green);font-weight:600}
+.side-short{color:var(--red);font-weight:600}
+.status-closed{color:var(--muted)}
+.status-open{color:var(--purple);font-weight:600}
+.inst-tag{font-size:10px;padding:2px 8px;border-radius:8px;font-weight:600;letter-spacing:0.5px}
+.inst-scalp{background:rgba(99,102,241,0.15);color:#a5b4fc}
+.inst-swing{background:rgba(245,158,11,0.15);color:#fbbf24}
+.tbl-wrap{overflow-x:auto}
+
+.pagination{display:flex;align-items:center;justify-content:center;gap:12px;margin-top:14px}
+.pagination button{
+  background:rgba(99,102,241,0.12);border:1px solid rgba(99,102,241,0.2);
+  color:var(--purple);padding:8px 18px;border-radius:8px;font-size:13px;
+  cursor:pointer;transition:all 0.2s;
+}
+.pagination button:hover{background:rgba(99,102,241,0.25)}
+.pagination button:disabled{opacity:0.3;cursor:not-allowed}
+.pagination .page-info{color:var(--muted);font-size:13px}
+
+.instances{
+  display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:14px;margin-bottom:20px;
+}
+.instance-card{
+  background:var(--bg2);border:1px solid var(--border);border-radius:16px;
+  padding:20px;position:relative;overflow:hidden;
+}
+.instance-card::before{
+  content:'';position:absolute;top:0;left:0;right:0;height:3px;border-radius:16px 16px 0 0;
+}
+.instance-card.scalp::before{background:linear-gradient(90deg,#6366f1,#a78bfa)}
+.instance-card.swing::before{background:linear-gradient(90deg,#f59e0b,#fbbf24)}
+.instance-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px}
+.instance-name{font-size:18px;font-weight:700;color:#fff;display:flex;align-items:center;gap:8px}
+.instance-name .badge{
+  font-size:10px;padding:3px 10px;border-radius:12px;font-weight:600;letter-spacing:0.5px;
+}
+.badge-scalp{background:rgba(99,102,241,0.15);color:#a5b4fc;border:1px solid rgba(99,102,241,0.3)}
+.badge-swing{background:rgba(245,158,11,0.15);color:#fbbf24;border:1px solid rgba(245,158,11,0.3)}
+.instance-status{font-size:12px;font-weight:600;padding:4px 12px;border-radius:12px}
+.instance-status.on{background:rgba(0,230,118,0.12);color:var(--green)}
+.instance-status.off{background:rgba(255,82,82,0.12);color:var(--red)}
+.instance-stats{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}
+.instance-stat h4{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:1px;margin-bottom:4px}
+.instance-stat .val{font-size:20px;font-weight:700}
+.instance-meta{margin-top:12px;font-size:11px;color:var(--muted);display:flex;gap:14px;flex-wrap:wrap}
+
+@keyframes fadeIn{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:translateY(0)}}
+.fade-in{animation:fadeIn 0.4s ease}
+.last-update{text-align:center;color:#555;font-size:11px;padding:16px}
+
+@media(max-width:600px){
+  .container{padding:14px}
+  .cards{grid-template-columns:repeat(2,1fr);gap:10px}
+  .card{padding:14px}
+  .card .val{font-size:20px}
+  .header{padding:12px 16px;flex-wrap:wrap;gap:10px}
+  .header h1{font-size:16px}
+}
 </style>
 </head><body>
-<h1>Stasik Trading Bot <span id="status" class="status off">...</span></h1>
-<div class="cards" id="stats"></div>
-<div id="chart-box"><canvas id="pnlChart"></canvas></div>
-<h2>Последние сделки</h2>
-<div class="tbl-wrap">
-<table><thead><tr>
-<th>Пара</th><th>Сторона</th><th>Вход</th><th>Выход</th><th>PnL</th><th>Статус</th>
-</tr></thead><tbody id="tbody"></tbody></table>
+
+<div class="header">
+  <div class="header-left">
+    <div class="icon">🤖</div>
+    <h1>Stasik <span>Trading Bot</span></h1>
+  </div>
+  <div class="header-right">
+    <div id="status-badge" class="off">...</div>
+    <a href="/logout" class="logout-btn">Выход</a>
+  </div>
 </div>
+
+<div class="container">
+  <div class="instances" id="instances"></div>
+  <div class="cards" id="stats"></div>
+
+  <div class="chart-section">
+    <h2>📈 PnL за 30 дней</h2>
+    <canvas id="pnlChart"></canvas>
+  </div>
+
+  <div class="section">
+    <h2>📊 Открытые позиции</h2>
+    <div class="tbl-wrap">
+      <table>
+        <thead><tr><th>Пара</th><th>Сторона</th><th>Размер</th><th>Вход</th><th>Unrealized PnL</th></tr></thead>
+        <tbody id="pos-body"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="section">
+    <h2>📋 История сделок</h2>
+    <div class="tbl-wrap">
+      <table>
+        <thead><tr>
+          <th>Бот</th><th>Пара</th><th>Сторона</th><th>Вход</th><th>Выход</th><th>PnL</th><th>Статус</th>
+        </tr></thead>
+        <tbody id="tbody"></tbody>
+      </table>
+    </div>
+    <div class="pagination">
+      <button id="prev-btn" disabled onclick="changePage(-1)">← Назад</button>
+      <span class="page-info" id="page-info">Стр. 1</span>
+      <button id="next-btn" disabled onclick="changePage(1)">Вперёд →</button>
+    </div>
+  </div>
+
+  <div class="last-update" id="last-update"></div>
+</div>
+
 <script>
-let chart=null;
-async function load(){
+let chart=null,currentPage=1,hasNext=false;
+function fmt(v){return(v>=0?'+':'')+v.toFixed(2)}
+function cls(v){return v>=0?'g':'r'}
+
+async function loadInstances(){
+  try{
+    const list=await(await fetch('/api/instances')).json();
+    const el=document.getElementById('instances');
+    el.innerHTML=list.map(i=>{
+      const key=i.name.toLowerCase();
+      const isScalp=key.includes('scalp');
+      const cardCls=isScalp?'scalp':'swing';
+      const badgeCls=isScalp?'badge-scalp':'badge-swing';
+      const tf=isScalp?i.timeframe+'м':i.timeframe;
+      return`<div class="instance-card ${cardCls} fade-in">
+        <div class="instance-header">
+          <div class="instance-name">
+            ${isScalp?'⚡':'🌊'}
+            <span>${i.name}</span>
+            <span class="badge ${badgeCls}">${tf} / ${i.leverage}x</span>
+          </div>
+          <div class="instance-status ${i.running?'on':'off'}">${i.running?'РАБОТАЕТ':'СТОП'}</div>
+        </div>
+        <div class="instance-stats">
+          <div class="instance-stat"><h4>За день</h4><div class="val ${cls(i.daily_pnl)}">${fmt(i.daily_pnl)}</div></div>
+          <div class="instance-stat"><h4>Всего PnL</h4><div class="val ${cls(i.total_pnl)}">${fmt(i.total_pnl)}</div></div>
+          <div class="instance-stat"><h4>Win Rate</h4><div class="val">${i.total_trades?i.win_rate.toFixed(1)+'%':'—'}</div></div>
+        </div>
+        <div class="instance-meta">
+          <span>📊 Позиции: ${i.open_positions}</span>
+          <span>🔢 Сделок: ${i.total_trades} (${i.wins}W / ${i.losses}L)</span>
+          <span>🪙 ${i.pairs.length} пар</span>
+        </div>
+      </div>`;
+    }).join('');
+  }catch(e){console.error('instances',e)}
+}
+
+async function loadStats(){
   try{
     const s=await(await fetch('/api/stats')).json();
-    document.getElementById('status').className='status '+(s.running?'on':'off');
-    document.getElementById('status').textContent=s.running?'РАБОТАЕТ':'СТОП';
-    const pc=v=>v>=0?'g':'r';
-    const fm=v=>(v>=0?'+':'')+v.toFixed(2);
+    const b=document.getElementById('status-badge');
+    b.className=s.running?'on':'off';
+    b.textContent=s.running?'РАБОТАЕТ':'ОСТАНОВЛЕН';
     document.getElementById('stats').innerHTML=`
-      <div class="card"><h3>Баланс</h3><div class="val">${s.balance.toFixed(0)} USDT</div></div>
-      <div class="card"><h3>За день</h3><div class="val ${pc(s.daily_pnl)}">${fm(s.daily_pnl)}</div></div>
-      <div class="card"><h3>Всего PnL</h3><div class="val ${pc(s.total_pnl)}">${fm(s.total_pnl)}</div></div>
-      <div class="card"><h3>Win Rate</h3><div class="val">${s.win_rate.toFixed(1)}%</div></div>
-      <div class="card"><h3>Позиции</h3><div class="val">${s.open_positions}</div></div>
-      <div class="card"><h3>Сделок</h3><div class="val">${s.total_trades}</div></div>
-    `;
-    const pnl=await(await fetch('/api/pnl?days=30')).json();
-    let cum=0;const cumData=pnl.map(d=>{cum+=d.pnl;return cum});
-    const labels=pnl.map(d=>d.trade_date);
-    if(chart){chart.destroy()}
-    chart=new Chart(document.getElementById('pnlChart'),{
-      type:'line',
-      data:{labels,datasets:[{
-        label:'Cumulative PnL (USDT)',data:cumData,
-        borderColor:cum>=0?'#00e676':'#ff5252',borderWidth:2,
-        fill:true,backgroundColor:cum>=0?'rgba(0,230,118,0.08)':'rgba(255,82,82,0.08)',
-        tension:0.3,pointRadius:3
-      }]},
-      options:{responsive:true,plugins:{legend:{labels:{color:'#888'}}},
-        scales:{x:{ticks:{color:'#666'}},y:{ticks:{color:'#666'},grid:{color:'#1a1a3e'}}}}
-    });
-    const trades=await(await fetch('/api/trades?limit=20')).json();
-    document.getElementById('tbody').innerHTML=trades.map(t=>{
-      const p=t.pnl||0;const c=p>=0?'g':'r';
-      return`<tr><td>${t.symbol}</td><td>${t.side==='Buy'?'ЛОНГ':'ШОРТ'}</td>
-      <td>${t.entry_price||'-'}</td><td>${t.exit_price||'-'}</td>
-      <td class="${c}">${p?p.toFixed(2):'-'}</td><td>${t.status}</td></tr>`;
-    }).join('');
-  }catch(e){console.error(e)}
+      <div class="card fade-in"><span class="card-icon">💰</span><h3>Баланс</h3><div class="val">${s.balance.toFixed(0)} USDT</div></div>
+      <div class="card fade-in"><span class="card-icon">📅</span><h3>За день</h3><div class="val ${cls(s.daily_pnl)}">${fmt(s.daily_pnl)}</div></div>
+      <div class="card fade-in"><span class="card-icon">💎</span><h3>Всего PnL</h3><div class="val ${cls(s.total_pnl)}">${fmt(s.total_pnl)}</div></div>
+      <div class="card fade-in"><span class="card-icon">🎯</span><h3>Win Rate</h3><div class="val">${s.win_rate.toFixed(1)}%</div></div>
+      <div class="card fade-in"><span class="card-icon">📊</span><h3>Позиции</h3><div class="val">${s.open_positions}</div></div>
+      <div class="card fade-in"><span class="card-icon">🔢</span><h3>Всего сделок</h3><div class="val">${s.total_trades}</div></div>`;
+  }catch(e){console.error('stats',e)}
 }
-load();setInterval(load,60000);
+
+async function loadChart(){
+  try{
+    const pnl=await(await fetch('/api/pnl?days=30')).json();
+    if(!pnl.length)return;
+    let cum=0;
+    const cumData=pnl.map(d=>{cum+=d.pnl;return cum});
+    const labels=pnl.map(d=>d.trade_date);
+    const pos=cum>=0;
+    if(chart)chart.destroy();
+    const ctx=document.getElementById('pnlChart').getContext('2d');
+    const grad=ctx.createLinearGradient(0,0,0,300);
+    grad.addColorStop(0,pos?'rgba(0,230,118,0.2)':'rgba(255,82,82,0.2)');
+    grad.addColorStop(1,'rgba(0,0,0,0)');
+    chart=new Chart(ctx,{type:'line',
+      data:{labels,datasets:[{label:'Cumulative PnL (USDT)',data:cumData,
+        borderColor:pos?'#00e676':'#ff5252',borderWidth:2,
+        fill:true,backgroundColor:grad,tension:0.35,pointRadius:4,pointHoverRadius:7,
+        pointBackgroundColor:pos?'#00e676':'#ff5252',pointBorderColor:'transparent'}]},
+      options:{responsive:true,interaction:{intersect:false,mode:'index'},
+        plugins:{legend:{display:false},
+          tooltip:{backgroundColor:'rgba(26,26,62,0.95)',titleColor:'#fff',bodyColor:'#e0e0e0',
+            borderColor:'rgba(99,102,241,0.3)',borderWidth:1,cornerRadius:10,padding:12,displayColors:false,
+            callbacks:{label:c=>'PnL: '+c.parsed.y.toFixed(2)+' USDT'}}},
+        scales:{x:{ticks:{color:'#555',maxRotation:45},grid:{display:false}},
+          y:{ticks:{color:'#555',callback:v=>v.toFixed(0)},grid:{color:'rgba(255,255,255,0.03)'}}}}
+    });
+  }catch(e){console.error('chart',e)}
+}
+
+async function loadPositions(){
+  try{
+    const pos=await(await fetch('/api/positions')).json();
+    const body=document.getElementById('pos-body');
+    if(!pos.length){body.innerHTML='<tr><td colspan="5" style="text-align:center;color:#555;padding:20px">Нет открытых позиций</td></tr>';return}
+    body.innerHTML=pos.map(p=>{
+      const pnl=parseFloat(p.unrealised_pnl)||0;
+      return`<tr class="fade-in"><td><strong>${p.symbol}</strong></td>
+        <td class="${p.side==='Buy'?'side-long':'side-short'}">${p.side==='Buy'?'ЛОНГ':'ШОРТ'}</td>
+        <td>${p.size}</td><td>${parseFloat(p.entry_price).toFixed(4)}</td>
+        <td class="${cls(pnl)}"><strong>${fmt(pnl)}</strong></td></tr>`;
+    }).join('');
+  }catch(e){console.error('positions',e)}
+}
+
+async function loadTrades(page){
+  try{
+    const r=await(await fetch('/api/trades?page='+page+'&per_page=20')).json();
+    currentPage=r.page;hasNext=r.has_next;
+    document.getElementById('prev-btn').disabled=currentPage<=1;
+    document.getElementById('next-btn').disabled=!hasNext;
+    document.getElementById('page-info').textContent='Стр. '+currentPage;
+    document.getElementById('tbody').innerHTML=r.trades.map(t=>{
+      const p=t.pnl||0;
+      const inst=(t.instance||'').toUpperCase();
+      const isCls=inst.includes('SCALP')?'inst-scalp':'inst-swing';
+      const iLabel=inst.includes('SCALP')?'SCALP':'SWING';
+      return`<tr class="fade-in">
+        <td><span class="inst-tag ${isCls}">${iLabel}</span></td>
+        <td><strong>${t.symbol}</strong></td>
+        <td class="${t.side==='Buy'?'side-long':'side-short'}">${t.side==='Buy'?'ЛОНГ':'ШОРТ'}</td>
+        <td>${t.entry_price||'-'}</td><td>${t.exit_price||'-'}</td>
+        <td class="${cls(p)}"><strong>${p?p.toFixed(2):'-'}</strong></td>
+        <td class="${t.status==='closed'?'status-closed':'status-open'}">${t.status}</td></tr>`;
+    }).join('');
+  }catch(e){console.error('trades',e)}
+}
+
+function changePage(d){loadTrades(currentPage+d)}
+
+async function loadAll(){
+  await Promise.all([loadInstances(),loadStats(),loadChart(),loadPositions(),loadTrades(currentPage)]);
+  document.getElementById('last-update').textContent=
+    'Обновлено: '+new Date().toLocaleTimeString('ru-RU')+' (автообновление каждые 30 сек)';
+}
+loadAll();
+setInterval(()=>{loadInstances();loadStats();loadChart();loadPositions()},30000);
 </script>
 </body></html>"""
