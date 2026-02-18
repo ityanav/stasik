@@ -444,27 +444,76 @@ class TradingEngine:
         ]
         return "\n".join(line for line in lines if line)
 
+    async def close_all_positions(self) -> str:
+        categories = self._get_categories()
+        closed = []
+        for cat in categories:
+            if cat != "linear":
+                continue
+            positions = self.client.get_positions(category=cat)
+            for p in positions:
+                try:
+                    close_side = "Sell" if p["side"] == "Buy" else "Buy"
+                    self.client.place_order(
+                        symbol=p["symbol"],
+                        side=close_side,
+                        qty=p["size"],
+                        category=cat,
+                    )
+                    closed.append(f"{p['symbol']} ({p['side']})")
+                except Exception:
+                    logger.exception("Failed to close position %s", p["symbol"])
+
+        # Mark DB trades as closed
+        open_trades = await self.db.get_open_trades()
+        for t in open_trades:
+            try:
+                exit_price = self.client.get_last_price(t["symbol"], category=t["category"])
+                if t["side"] == "Buy":
+                    pnl = (exit_price - t["entry_price"]) * t["qty"]
+                else:
+                    pnl = (t["entry_price"] - exit_price) * t["qty"]
+                await self.db.close_trade(t["id"], exit_price, pnl)
+                await self.db.update_daily_pnl(pnl)
+                balance = self.client.get_balance()
+                self.risk.record_pnl(pnl, balance)
+            except Exception:
+                logger.exception("Failed to update DB for %s", t["symbol"])
+
+        if closed:
+            msg = f"❌ Закрыто {len(closed)} позиций:\n" + "\n".join(f"  • {c}" for c in closed)
+        else:
+            msg = "Нет позиций для закрытия."
+        logger.info(msg)
+        await self._notify(msg)
+        return msg
+
     async def get_positions_text(self) -> str:
         categories = self._get_categories()
         lines = []
+        total_pnl = 0.0
         for cat in categories:
             if cat == "linear":
                 positions = self.client.get_positions(category=cat)
                 for p in positions:
                     direction = "ЛОНГ" if p["side"] == "Buy" else "ШОРТ"
+                    upnl = p["unrealised_pnl"]
+                    total_pnl += upnl
+                    entry = p["entry_price"]
+                    # PnL в процентах от входа
+                    if entry > 0 and p["size"] > 0:
+                        pnl_pct = (upnl / (entry * p["size"])) * 100
+                    else:
+                        pnl_pct = 0.0
+                    emoji = "🟢" if upnl >= 0 else "🔴"
                     lines.append(
-                        f"{direction} {p['symbol']} | объём={p['size']} "
-                        f"вход={p['entry_price']} PnL={p['unrealised_pnl']:+.2f}"
+                        f"{emoji} {direction} {p['symbol']}\n"
+                        f"   Вход: {entry} | Объём: {p['size']}\n"
+                        f"   PnL: {upnl:+,.2f} USDT ({pnl_pct:+.2f}%)"
                     )
-        open_trades = await self.db.get_open_trades()
-        if open_trades:
-            lines.append("\n── Открытые в БД ──")
-            for t in open_trades:
-                direction = "ЛОНГ" if t["side"] == "Buy" else "ШОРТ"
-                lines.append(
-                    f"{direction} {t['symbol']} ({t['category']}) "
-                    f"объём={t['qty']} вход={t['entry_price']}"
-                )
+        if lines:
+            total_emoji = "🟢" if total_pnl >= 0 else "🔴"
+            lines.append(f"\n{total_emoji} Итого PnL: {total_pnl:+,.2f} USDT")
         return "\n".join(lines) if lines else "Нет открытых позиций."
 
     async def get_pnl_text(self) -> str:

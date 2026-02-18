@@ -17,7 +17,8 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
     [
         [KeyboardButton("📊 Статус"), KeyboardButton("💰 PnL")],
         [KeyboardButton("📈 Позиции"), KeyboardButton("🪙 Пары")],
-        [KeyboardButton("🛑 Стоп"), KeyboardButton("❓ Помощь")],
+        [KeyboardButton("❌ Закрыть сделки"), KeyboardButton("❓ Помощь")],
+        [KeyboardButton("🛑 Стоп")],
     ],
     resize_keyboard=True,
 )
@@ -41,7 +42,10 @@ class TelegramBot:
 
         await self.app.initialize()
         await self.app.start()
-        await self.app.updater.start_polling(drop_pending_updates=True)
+        await self.app.updater.start_polling(
+            drop_pending_updates=True,
+            allowed_updates=["message", "callback_query"],
+        )
         self._started = True
         logger.info("Telegram bot started")
 
@@ -66,8 +70,15 @@ class TelegramBot:
         # Кнопки клавиатуры (текстовые сообщения)
         self.app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self._handle_button))
 
-        # Inline-кнопки (подтверждение стопа)
+        # Inline-кнопки (подтверждение стопа, закрытие позиций)
         self.app.add_handler(CallbackQueryHandler(self._callback_handler))
+
+        # Error handler
+        self.app.add_error_handler(self._error_handler)
+
+    @staticmethod
+    async def _error_handler(update, ctx: ContextTypes.DEFAULT_TYPE):
+        logger.error("Telegram handler error: %s", ctx.error, exc_info=ctx.error)
 
     def _check_auth(self, update: Update) -> bool:
         return str(update.effective_chat.id) == self.chat_id
@@ -85,6 +96,7 @@ class TelegramBot:
             "💰 PnL": self._cmd_pnl,
             "📈 Позиции": self._cmd_positions,
             "🪙 Пары": self._cmd_pairs,
+            "❌ Закрыть сделки": self._cmd_close_all,
             "🛑 Стоп": self._cmd_stop,
             "❓ Помощь": self._cmd_help,
         }
@@ -145,6 +157,26 @@ class TelegramBot:
         text = "🪙 Торговые пары:\n" + "\n".join(f"  • {p}" for p in pairs)
         await update.message.reply_text(text, reply_markup=MAIN_KEYBOARD)
 
+    async def _cmd_close_all(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        if not self._check_auth(update):
+            return
+        # Show positions with PnL before confirming
+        text = await self.engine.get_positions_text()
+        if "Нет открытых позиций" in text:
+            await update.message.reply_text("Нет открытых позиций.", reply_markup=MAIN_KEYBOARD)
+            return
+
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("Да, закрыть всё", callback_data="confirm_close_all"),
+                InlineKeyboardButton("Отмена", callback_data="cancel"),
+            ]
+        ])
+        await update.message.reply_text(
+            f"{text}\n\n❌ Закрыть все позиции?",
+            reply_markup=keyboard,
+        )
+
     async def _cmd_help(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not self._check_auth(update):
             return
@@ -154,6 +186,7 @@ class TelegramBot:
             "💰 PnL — прибыль/убытки\n"
             "📈 Позиции — открытые сделки\n"
             "🪙 Пары — торговые пары\n"
+            "❌ Закрыть сделки — закрыть все позиции\n"
             "🛑 Стоп — остановить бота\n"
             "❓ Помощь — эта справка",
             reply_markup=MAIN_KEYBOARD,
@@ -163,6 +196,8 @@ class TelegramBot:
 
     async def _callback_handler(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
+        logger.info("Callback received: data=%s from user=%s", query.data, query.from_user.id)
+
         if str(query.from_user.id) != self.chat_id:
             await query.answer("Нет доступа")
             return
@@ -173,6 +208,22 @@ class TelegramBot:
         if data == "confirm_stop":
             await self.engine.stop()
             await query.edit_message_text("🛑 Торговля остановлена.")
+
+        elif data == "confirm_close_all":
+            logger.info("Closing all positions...")
+            await query.edit_message_text("⏳ Закрываю позиции...")
+            try:
+                result = await self.engine.close_all_positions()
+                logger.info("Close result: %s", result)
+                await self.app.bot.send_message(chat_id=self.chat_id, text=result, reply_markup=MAIN_KEYBOARD)
+            except Exception:
+                logger.exception("Error closing positions")
+                await self.app.bot.send_message(
+                    chat_id=self.chat_id,
+                    text="❌ Ошибка при закрытии позиций. Проверь логи.",
+                    reply_markup=MAIN_KEYBOARD,
+                )
+
         elif data == "cancel":
             await query.edit_message_text("Отменено.")
 
