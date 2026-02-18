@@ -214,7 +214,8 @@ class TradingEngine:
 
         # Swing mode: skip if no new candle since last check
         if self._is_swing:
-            last_ts = df.index[-1].timestamp() if hasattr(df.index[-1], 'timestamp') else 0
+            last_candle_time = df["timestamp"].iloc[-1]
+            last_ts = last_candle_time.timestamp() if hasattr(last_candle_time, 'timestamp') else float(last_candle_time)
             prev_ts = self._last_candle_ts.get(symbol, 0)
             if last_ts <= prev_ts:
                 logger.debug("Swing %s: нет новой свечи, пропуск", symbol)
@@ -783,7 +784,7 @@ class TradingEngine:
         for tf in self._extra_timeframes:
             cache_key = f"{symbol}_{tf}"
             cached = self._mtf_cache.get(cache_key)
-            cache_ttl = int(tf) * 60  # cache for one candle period
+            cache_ttl = self._timeframe_to_seconds(tf)  # cache for one candle period
             if cached and now - cached[1] < cache_ttl:
                 mtf_data[tf] = cached[0]
                 continue

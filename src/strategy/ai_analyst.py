@@ -159,14 +159,18 @@ class AIAnalyst:
         # Multi-timeframe context
         if mtf_data and config:
             mtf_sections = []
-            for tf in sorted(mtf_data, key=lambda x: int(x)):
+            tf_order = {"1": 1, "3": 3, "5": 5, "15": 15, "30": 30, "60": 60,
+                        "120": 120, "240": 240, "360": 360, "720": 720,
+                        "D": 1440, "W": 10080, "M": 43200}
+            for tf in sorted(mtf_data, key=lambda x: tf_order.get(x, 9999)):
                 tf_df = mtf_data[tf]
                 if len(tf_df) < 30:
                     continue
+                tf_label = {"D": "1D", "W": "1W", "M": "1M"}.get(tf, f"{tf}м")
                 tf_indicators = extract_indicator_values(tf_df, config)
                 tf_candles = summarize_candles(tf_df, n=10)
                 mtf_sections.append(
-                    f"=== Таймфрейм {tf}м ===\n{tf_indicators}\n\nПоследние 10 свечей:\n{tf_candles}"
+                    f"=== Таймфрейм {tf_label} ===\n{tf_indicators}\n\nПоследние 10 свечей:\n{tf_candles}"
                 )
             if mtf_sections:
                 user_prompt += "\n\n--- МУЛЬТИ-ТАЙМФРЕЙМ КОНТЕКСТ ---\n" + "\n\n".join(mtf_sections)

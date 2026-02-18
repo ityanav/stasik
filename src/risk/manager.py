@@ -14,6 +14,14 @@ class RiskManager:
         self.max_open_positions = risk["max_open_positions"]
         self.max_daily_loss_pct = risk["max_daily_loss"] / 100
 
+        # ATR clamp ranges (configurable for swing vs scalp)
+        self.atr_sl_min = risk.get("atr_sl_min", 0.3) / 100
+        self.atr_sl_max = risk.get("atr_sl_max", 3.0) / 100
+        self.atr_tp_min = risk.get("atr_tp_min", 0.5) / 100
+        self.atr_tp_max = risk.get("atr_tp_max", 5.0) / 100
+        self.atr_trail_min = risk.get("atr_trail_min", 0.2) / 100
+        self.atr_trail_max = risk.get("atr_trail_max", 2.0) / 100
+
         self._daily_pnl: float = 0.0
         self._daily_date: date = date.today()
         self._halted: bool = False
@@ -110,10 +118,8 @@ class RiskManager:
         sl_pct = sl_dist / price
         tp_pct = tp_dist / price
 
-        # Clamp SL: 0.3% - 3%
-        sl_pct = max(0.003, min(0.03, sl_pct))
-        # Clamp TP: 0.5% - 5%
-        tp_pct = max(0.005, min(0.05, tp_pct))
+        sl_pct = max(self.atr_sl_min, min(self.atr_sl_max, sl_pct))
+        tp_pct = max(self.atr_tp_min, min(self.atr_tp_max, tp_pct))
 
         if side == "Buy":
             sl = price * (1 - sl_pct)
@@ -127,7 +133,7 @@ class RiskManager:
     def calculate_trailing_distance_atr(
         self, atr: float, price: float, mult: float = 1.0,
     ) -> float:
-        """ATR-based trailing distance, clamped to 0.2%-2% of price."""
+        """ATR-based trailing distance, clamped to configurable range."""
         trail_pct = (atr * mult) / price
-        trail_pct = max(0.002, min(0.02, trail_pct))
+        trail_pct = max(self.atr_trail_min, min(self.atr_trail_max, trail_pct))
         return price * trail_pct
