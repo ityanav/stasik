@@ -384,6 +384,7 @@ class TradingEngine:
             qty_step=info["qty_step"],
             min_qty=info["min_qty"],
             sl_pct=sizing_sl,
+            leverage=self.leverage,
         )
 
         # AI position size multiplier

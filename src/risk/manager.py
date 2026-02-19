@@ -21,6 +21,7 @@ class RiskManager:
         self.atr_tp_max = risk.get("atr_tp_max", 5.0) / 100
         self.atr_trail_min = risk.get("atr_trail_min", 0.2) / 100
         self.atr_trail_max = risk.get("atr_trail_max", 2.0) / 100
+        self.max_position_margin_pct = risk.get("max_position_margin_pct", 30) / 100
 
         self._daily_pnl: float = 0.0
         self._daily_date: date = date.today()
@@ -79,12 +80,21 @@ class RiskManager:
         qty_step: float,
         min_qty: float,
         sl_pct: float | None = None,
+        leverage: int = 1,
     ) -> float:
         risk_amount = balance * self.risk_per_trade
         effective_sl = sl_pct if sl_pct is not None else self.stop_loss_pct
         if effective_sl <= 0:
             effective_sl = self.stop_loss_pct
         position_value = risk_amount / effective_sl
+        # Cap notional so margin doesn't exceed max_position_margin_pct of balance
+        max_notional = balance * leverage * self.max_position_margin_pct
+        if position_value > max_notional:
+            logger.info(
+                "Position capped: %.0f -> %.0f USDT (margin limit %.0f%%)",
+                position_value, max_notional, self.max_position_margin_pct * 100,
+            )
+            position_value = max_notional
         qty = position_value / price
         # Round down to qty_step
         qty = math.floor(qty / qty_step) * qty_step

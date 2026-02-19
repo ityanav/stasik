@@ -104,7 +104,8 @@ class StrategyUpdate:
 @dataclass
 class AIAnalyst:
     api_key: str = ""
-    model: str = "google/gemini-2.0-flash-001"
+    model: str = "gemini-2.0-flash"
+    provider: str = "gemini"  # "gemini" or "openrouter"
     min_confidence: int = 6
     timeout: int = 10
     enabled: bool = False
@@ -120,7 +121,8 @@ class AIAnalyst:
         ai_cfg = config.get("ai", {})
         return cls(
             api_key=ai_cfg.get("api_key", ""),
-            model=ai_cfg.get("model", "google/gemini-2.0-flash-001"),
+            model=ai_cfg.get("model", "gemini-2.0-flash"),
+            provider=ai_cfg.get("provider", "gemini"),
             min_confidence=ai_cfg.get("min_confidence", 6),
             timeout=ai_cfg.get("timeout", 10),
             enabled=ai_cfg.get("enabled", False),
@@ -234,9 +236,40 @@ class AIAnalyst:
 
     # ── API call ───────────────────────────────────────────
 
+    _PROVIDER_URLS = {
+        "openrouter": "https://openrouter.ai/api/v1/chat/completions",
+        "groq": "https://api.groq.com/openai/v1/chat/completions",
+    }
+
     async def _call_api(self, system: str, user: str) -> str:
+        if self.provider == "gemini":
+            return await self._call_gemini(system, user)
+        return await self._call_openai_compat(system, user)
+
+    async def _call_gemini(self, system: str, user: str) -> str:
+        url = (
+            f"https://generativelanguage.googleapis.com/v1beta/models/"
+            f"{self.model}:generateContent?key={self.api_key}"
+        )
         resp = await self._client.post(
-            "https://openrouter.ai/api/v1/chat/completions",
+            url,
+            json={
+                "system_instruction": {"parts": [{"text": system}]},
+                "contents": [{"role": "user", "parts": [{"text": user}]}],
+                "generationConfig": {
+                    "temperature": 0.3,
+                    "maxOutputTokens": 700,
+                },
+            },
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return data["candidates"][0]["content"]["parts"][0]["text"].strip()
+
+    async def _call_openai_compat(self, system: str, user: str) -> str:
+        url = self._PROVIDER_URLS.get(self.provider, self._PROVIDER_URLS["openrouter"])
+        resp = await self._client.post(
+            url,
             headers={
                 "Authorization": f"Bearer {self.api_key}",
                 "Content-Type": "application/json",
