@@ -480,12 +480,14 @@ class TradingEngine:
         pos_value = qty * price
         size_note = f" (AI: x{ai_size_mult})" if ai_size_mult else ""
         atr_note = f"\n📊 ATR: {atr:.4f}" if atr and atr > 0 else ""
+        daily_total = await self._get_daily_total_pnl()
+        day_arrow = "▲" if daily_total >= 0 else "▼"
         msg = (
             f"{'🟢' if side == 'Buy' else '🔴'} Открыл {direction} {symbol}\n"
             f"Цена: {price}\n"
             f"Объём: {qty}{size_note} (~{pos_value:,.0f} USDT)\n"
             f"SL: {sl} ({sl_source}) | TP: {tp} ({tp_source}){trailing_msg}{atr_note}\n"
-            f"Баланс: {balance:,.0f} USDT"
+            f"Баланс: {balance:,.0f} USDT ({day_arrow} сегодня: {daily_total:+,.0f})"
         )
         if ai_reasoning:
             msg += f"\n{ai_reasoning}"
@@ -646,6 +648,9 @@ class TradingEngine:
         if pnl < 0 and self._cooldown_seconds > 0:
             cooldown_note = f"\n⏳ Кулдаун {symbol}: {self._cooldown_seconds // 60} мин"
 
+        daily_total = await self._get_daily_total_pnl()
+        day_arrow = "▲" if daily_total >= 0 else "▼"
+
         msg = (
             f"{emoji} Закрыл {direction} {symbol}\n"
             f"Вход: {entry_price} → Выход: {exit_price}\n"
@@ -653,7 +658,7 @@ class TradingEngine:
             f"─────────────\n"
             f"За день: {daily_pnl:+,.2f} USDT\n"
             f"Всего: {total_pnl:+,.2f} USDT\n"
-            f"Баланс: {balance:,.0f} USDT"
+            f"Баланс: {balance:,.0f} USDT ({day_arrow} сегодня: {daily_total:+,.0f})"
         )
         logger.info(msg)
         await self._notify(msg)
@@ -964,10 +969,76 @@ class TradingEngine:
         logger.info(msg)
         await self._notify(msg)
 
+    # ── Balance helpers ──────────────────────────────────────
+
+    async def _get_all_daily_pnl(self) -> dict[str, float]:
+        """Get daily PnL for this instance and all other instances.
+        Returns dict like {"SCALP": -1748.0, "SWING": 0.0}."""
+        from datetime import date
+        from pathlib import Path
+
+        result = {}
+
+        # Own instance
+        name = self.instance_name or "BOT"
+        result[name] = await self.db.get_daily_pnl()
+
+        # Other instances
+        for inst in self.config.get("other_instances", []):
+            inst_name = inst.get("name", "???")
+            db_path = inst.get("db_path", "")
+            if db_path and Path(db_path).exists():
+                try:
+                    import aiosqlite
+                    async with aiosqlite.connect(db_path) as db:
+                        db.row_factory = aiosqlite.Row
+                        cur = await db.execute(
+                            "SELECT pnl FROM daily_pnl WHERE trade_date = ?",
+                            (date.today().isoformat(),),
+                        )
+                        row = await cur.fetchone()
+                        result[inst_name] = float(row["pnl"]) if row else 0.0
+                except Exception:
+                    logger.warning("Failed to read daily PnL for %s", inst_name)
+                    result[inst_name] = 0.0
+            else:
+                result[inst_name] = 0.0
+
+        return result
+
+    async def _format_balance_block(self) -> str:
+        """Format full balance block with initial, yesterday, today, current."""
+        initial = self.config.get("initial_balance", 0)
+        balance = self.client.get_balance()
+        daily_map = await self._get_all_daily_pnl()
+        daily_total = sum(daily_map.values())
+
+        yesterday = balance - daily_total
+        arrow = "📈" if daily_total >= 0 else "📉"
+
+        # Breakdown by bot: [SCALP]: -1,748 | [SWING]: +0
+        parts = []
+        for name, pnl in daily_map.items():
+            parts.append(f"[{name}]: {pnl:+,.0f}")
+        breakdown = " | ".join(parts)
+
+        lines = [
+            f"💰 Инвестировал: {initial:,.0f} USDT",
+            f"📊 Вчера: {yesterday:,.0f} USDT",
+            f"{arrow} Сегодня: {daily_total:+,.0f} USDT ({breakdown})",
+            f"💵 Сейчас: {balance:,.0f} USDT",
+        ]
+        return "\n".join(lines)
+
+    async def _get_daily_total_pnl(self) -> float:
+        """Get total daily PnL across all instances (for short notifications)."""
+        daily_map = await self._get_all_daily_pnl()
+        return sum(daily_map.values())
+
     # ── Status info ──────────────────────────────────────────
 
     async def get_status(self) -> str:
-        balance = self.client.get_balance()
+        balance_block = await self._format_balance_block()
         open_trades = await self.db.get_open_trades()
         daily = await self.db.get_daily_pnl()
         total = await self.db.get_total_pnl()
@@ -976,7 +1047,7 @@ class TradingEngine:
         tf_label = self.timeframe if self._is_swing else f"{self.timeframe}м"
 
         lines = [
-            f"💰 Баланс: {balance:,.2f} USDT",
+            balance_block,
             "",
             f"━━━ [{name}] ━━━",
             f"{'🟢 РАБОТАЕТ' if self._running else '🔴 ОСТАНОВЛЕН'}",
