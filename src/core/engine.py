@@ -1,12 +1,13 @@
 import asyncio
 import logging
+import math
 import time
 from datetime import datetime
 
 import httpx
 import pandas as pd
 
-from src.exchange.client import BybitClient
+from src.exchange.base import ExchangeClient
 from src.risk.manager import RiskManager
 from src.storage.database import Database
 from src.strategy.ai_analyst import AIAnalyst, extract_indicator_values, format_risk_text, summarize_candles
@@ -20,7 +21,8 @@ class TradingEngine:
     def __init__(self, config: dict, notifier=None, db_path: str | None = None):
         self.config = config
         self.instance_name = config.get("instance_name", "")
-        self.client = BybitClient(config)
+        self.exchange_type = config.get("exchange", "bybit")
+        self.client = self._create_client(config)
         self.signal_gen = SignalGenerator(config)
         self.risk = RiskManager(config)
         if db_path:
@@ -96,12 +98,22 @@ class TradingEngine:
         self._weekly_report_day: int = config.get("weekly_report_day", 0)  # 0=Monday
         self._last_weekly_report: str = ""  # ISO date of last report
 
+    @staticmethod
+    def _create_client(config: dict) -> ExchangeClient:
+        exchange = config.get("exchange", "bybit")
+        if exchange == "tbank":
+            from src.exchange.tbank_client import TBankClient
+            return TBankClient(config)
+        else:
+            from src.exchange.client import BybitClient
+            return BybitClient(config)
+
     async def start(self):
         await self.db.connect()
         self._running = True
 
-        # Set leverage for futures pairs
-        if self.market_type in ("futures", "both"):
+        # Set leverage for futures pairs (Bybit only)
+        if self.market_type in ("futures", "both") and self.exchange_type == "bybit":
             for pair in self.pairs:
                 self.client.set_leverage(pair, self.leverage, category="linear")
 
@@ -188,6 +200,8 @@ class TradingEngine:
                     logger.exception("Error processing %s (%s)", pair, category)
 
     def _get_categories(self) -> list[str]:
+        if self.exchange_type == "tbank":
+            return ["tbank"]
         mt = self.market_type
         if mt == "spot":
             return ["spot"]
@@ -239,16 +253,16 @@ class TradingEngine:
                         result.signal.value, symbol, adx, self._adx_min)
             return
 
-        # HTF trend filter: only trade in direction of higher timeframe trend
-        if htf_trend == Trend.BEARISH and result.signal == Signal.BUY:
-            logger.info("HTF фильтр: отклонён BUY %s (тренд 15м медвежий)", symbol)
+        # HTF trend filter: block counter-trend trades unless signal is strong (score >= 2)
+        if htf_trend == Trend.BEARISH and result.signal == Signal.BUY and abs(result.score) < 2:
+            logger.info("HTF фильтр: отклонён BUY %s (тренд HTF медвежий, score=%d)", symbol, result.score)
             return
-        if htf_trend == Trend.BULLISH and result.signal == Signal.SELL:
-            logger.info("HTF фильтр: отклонён SELL %s (тренд 15м бычий)", symbol)
+        if htf_trend == Trend.BULLISH and result.signal == Signal.SELL and abs(result.score) < 2:
+            logger.info("HTF фильтр: отклонён SELL %s (тренд HTF бычий, score=%d)", symbol, result.score)
             return
 
-        # Fear & Greed Index filter
-        fng_value = await self._get_fear_greed()
+        # Fear & Greed Index filter (crypto only)
+        fng_value = await self._get_fear_greed() if self.exchange_type == "bybit" else None
         if fng_value is not None:
             if fng_value > self._fng_extreme_greed and result.signal == Signal.BUY:
                 logger.info("FnG фильтр: отклонён BUY %s (FnG=%d > %d — Extreme Greed)",
@@ -259,8 +273,8 @@ class TradingEngine:
                             symbol, fng_value, self._fng_extreme_fear)
                 return
 
-        # Funding rate filter
-        funding_rate = self._get_funding_rate_cached(symbol, category)
+        # Funding rate filter (crypto only)
+        funding_rate = self._get_funding_rate_cached(symbol, category) if self.exchange_type == "bybit" else 0.0
         if abs(funding_rate) > self._funding_rate_max:
             if funding_rate > 0 and result.signal == Signal.BUY:
                 logger.info("Funding фильтр: отклонён BUY %s (funding=%.4f%% > 0 — перегрев лонгов)",
@@ -299,9 +313,13 @@ class TradingEngine:
 
         side = "Buy" if result.signal == Signal.BUY else "Sell"
 
-        # Spot: only Buy (no short selling)
-        if category == "spot" and side == "Sell":
-            return
+        # Spot / T-Bank shares: only Buy (no short selling without margin)
+        if category in ("spot", "tbank") and side == "Sell":
+            if self.exchange_type == "tbank" and self.config["trading"].get("instrument_type") == "share":
+                logger.info("T-Bank shares: short selling skipped for %s", symbol)
+                return
+            elif category == "spot":
+                return
 
         # AI analyst filter
         ai_reasoning = ""
@@ -389,8 +407,14 @@ class TradingEngine:
 
         # AI position size multiplier
         if ai_size_mult is not None and 0.1 <= ai_size_mult <= 2.0:
-            import math
             qty = math.floor((qty * ai_size_mult) / info["qty_step"]) * info["qty_step"]
+            qty = round(qty, 8)
+
+        # Cap qty by instrument max
+        max_qty = info.get("max_qty", 0)
+        if max_qty > 0 and qty > max_qty:
+            logger.info("Qty capped: %.2f -> %.2f (max_qty %s)", qty, max_qty, symbol)
+            qty = math.floor(max_qty / info["qty_step"]) * info["qty_step"]
             qty = round(qty, 8)
 
         if qty <= 0:
@@ -421,14 +445,36 @@ class TradingEngine:
         else:
             tp = self.risk.calculate_sl_tp(price, side)[1]
 
-        order = self.client.place_order(
-            symbol=symbol,
-            side=side,
-            qty=qty,
-            category=category,
-            stop_loss=sl if category == "linear" else None,
-            take_profit=tp if category == "linear" else None,
-        )
+        # Place order with retry on qty rejection
+        order = None
+        for attempt in range(3):
+            try:
+                if self.exchange_type == "tbank":
+                    order = self.client.place_order(
+                        symbol=symbol, side=side, qty=qty,
+                        stop_loss=sl, take_profit=tp,
+                    )
+                else:
+                    order = self.client.place_order(
+                        symbol=symbol, side=side, qty=qty, category=category,
+                        stop_loss=sl if category == "linear" else None,
+                        take_profit=tp if category == "linear" else None,
+                    )
+                break
+            except Exception as e:
+                err_msg = str(e).lower()
+                if "max_qty" in err_msg or "exceeds maximum" in err_msg or "too large" in err_msg:
+                    qty = math.floor(qty * 0.5 / info["qty_step"]) * info["qty_step"]
+                    qty = round(qty, 8)
+                    if qty <= 0:
+                        logger.warning("Order rejected for %s: qty too large, cannot reduce further", symbol)
+                        return
+                    logger.info("Order qty rejected for %s, retrying with qty=%.2f (attempt %d)", symbol, qty, attempt + 2)
+                else:
+                    raise
+        if order is None:
+            logger.warning("Failed to place order for %s after retries", symbol)
+            return
 
         order_id = order.get("orderId", "")
         await self.db.insert_trade(
@@ -442,9 +488,9 @@ class TradingEngine:
             order_id=order_id,
         )
 
-        # Set trailing stop for futures (ATR-based or fixed)
+        # Set trailing stop for futures / tbank (ATR-based or fixed)
         trailing_msg = ""
-        if category == "linear":
+        if category in ("linear", "tbank"):
             if atr and atr > 0:
                 trailing_distance = self.risk.calculate_trailing_distance_atr(
                     atr, price, self._atr_trail_mult
@@ -564,7 +610,7 @@ class TradingEngine:
             return
 
         for trade in open_trades:
-            if trade["category"] != "linear":
+            if trade["category"] not in ("linear", "tbank"):
                 continue
             try:
                 await self._check_breakeven(trade)
@@ -576,7 +622,11 @@ class TradingEngine:
 
     async def _check_trade_closed(self, trade: dict):
         symbol = trade["symbol"]
-        positions = self.client.get_positions(symbol=symbol, category="linear")
+        category = trade["category"]
+        if self.exchange_type == "tbank":
+            positions = self.client.get_positions(symbol=symbol)
+        else:
+            positions = self.client.get_positions(symbol=symbol, category="linear")
 
         # Check if we still have a position for this symbol+side
         still_open = False
@@ -610,7 +660,10 @@ class TradingEngine:
 
         # Fallback: calculate manually
         if exit_price is None:
-            exit_price = self.client.get_last_price(symbol, category="linear")
+            if self.exchange_type == "tbank":
+                exit_price = self.client.get_last_price(symbol)
+            else:
+                exit_price = self.client.get_last_price(symbol, category="linear")
         if pnl is None:
             if side == "Buy":
                 pnl = (exit_price - entry_price) * qty
@@ -677,7 +730,10 @@ class TradingEngine:
         entry = trade["entry_price"]
         side = trade["side"]
 
-        current_price = self.client.get_last_price(symbol, category="linear")
+        if self.exchange_type == "tbank":
+            current_price = self.client.get_last_price(symbol)
+        else:
+            current_price = self.client.get_last_price(symbol, category="linear")
 
         if side == "Buy":
             profit_pct = (current_price - entry) / entry
@@ -689,10 +745,14 @@ class TradingEngine:
 
         # Move SL to entry (breakeven)
         try:
-            self.client.session.set_trading_stop(
-                category="linear", symbol=symbol,
-                stopLoss=str(round(entry, 6)), positionIdx=0,
-            )
+            if self.exchange_type == "bybit":
+                self.client.session.set_trading_stop(
+                    category="linear", symbol=symbol,
+                    stopLoss=str(round(entry, 6)), positionIdx=0,
+                )
+            else:
+                logger.info("Breakeven SL for %s: exchange does not support SL move, skipping", symbol)
+                return
         except Exception:
             logger.warning("Failed to set breakeven SL for %s", symbol)
             return
@@ -710,8 +770,6 @@ class TradingEngine:
         if not self.config["risk"].get("partial_close_enabled", True):
             return
 
-        import math
-
         partial_pct = self.config["risk"].get("partial_close_pct", 50) / 100
         partial_trigger = self.config["risk"].get("partial_close_trigger", 50) / 100
 
@@ -721,7 +779,10 @@ class TradingEngine:
         side = trade["side"]
         qty = trade["qty"]
 
-        current_price = self.client.get_last_price(symbol, category="linear")
+        if self.exchange_type == "tbank":
+            current_price = self.client.get_last_price(symbol)
+        else:
+            current_price = self.client.get_last_price(symbol, category="linear")
 
         if side == "Buy":
             tp_distance = tp - entry
@@ -739,7 +800,8 @@ class TradingEngine:
 
         # Close partial position
         close_qty = qty * partial_pct
-        info = self._get_instrument_info(symbol, "linear")
+        category = "tbank" if self.exchange_type == "tbank" else "linear"
+        info = self._get_instrument_info(symbol, category)
         close_qty = math.floor(close_qty / info["qty_step"]) * info["qty_step"]
         close_qty = round(close_qty, 8)
 
@@ -750,19 +812,21 @@ class TradingEngine:
         close_side = "Sell" if side == "Buy" else "Buy"
 
         try:
-            self.client.place_order(
-                symbol=symbol, side=close_side, qty=close_qty, category="linear",
-            )
+            if self.exchange_type == "tbank":
+                self.client.place_order(symbol=symbol, side=close_side, qty=close_qty)
+            else:
+                self.client.place_order(symbol=symbol, side=close_side, qty=close_qty, category="linear")
         except Exception:
             logger.exception("Failed to partial close %s", symbol)
             return
 
         # Move SL to breakeven
         try:
-            self.client.session.set_trading_stop(
-                category="linear", symbol=symbol,
-                stopLoss=str(round(entry, 6)), positionIdx=0,
-            )
+            if self.exchange_type == "bybit":
+                self.client.session.set_trading_stop(
+                    category="linear", symbol=symbol,
+                    stopLoss=str(round(entry, 6)), positionIdx=0,
+                )
         except Exception:
             logger.warning("Failed to move SL to breakeven for %s", symbol)
 
@@ -1008,8 +1072,7 @@ class TradingEngine:
         return result
 
     async def _format_balance_block(self) -> str:
-        """Format full balance block with initial, yesterday, today, current."""
-        initial = self.config.get("initial_balance", 0)
+        """Format full balance block with accounts, yesterday, today, current."""
         balance = self.client.get_balance()
         daily_map = await self._get_all_daily_pnl()
         daily_total = sum(daily_map.values())
@@ -1024,12 +1087,124 @@ class TradingEngine:
         breakdown = " | ".join(parts)
 
         lines = [
-            f"💰 Инвестировал: {initial:,.0f} USDT",
+            f"💰 Счёт Bybit: {balance:,.0f} USDT",
+        ]
+
+        # T-Bank balance
+        tbank_balance = self._get_tbank_balance()
+        if tbank_balance is not None:
+            lines.append(f"🏦 Счёт TBank: {tbank_balance:,.0f} RUB")
+
+        lines.extend([
             f"📊 Вчера: {yesterday:,.0f} USDT",
             f"{arrow} Сегодня: {daily_total:+,.0f} USDT ({breakdown})",
-            f"💵 Сейчас: {balance:,.0f} USDT",
-        ]
+        ])
         return "\n".join(lines)
+
+    def _get_tbank_balance(self) -> float | None:
+        """Get T-Bank balance from tbank config (if available)."""
+        import yaml
+        from pathlib import Path
+
+        # Find a tbank config from other_instances
+        for inst in self.config.get("other_instances", []):
+            if "TBANK" not in inst.get("name", "").upper():
+                continue
+            # Try to find config path for this instance
+            service = inst.get("service", "")
+            if not service:
+                continue
+            # Read config from systemd service ExecStart
+            for cfg_name in ("config/tbank_scalp.yaml", "config/tbank_swing.yaml"):
+                cfg_path = Path("/root/stasik") / cfg_name
+                if not cfg_path.exists():
+                    continue
+                try:
+                    with open(cfg_path) as f:
+                        tbank_cfg = yaml.safe_load(f)
+                    token = tbank_cfg.get("tbank", {}).get("token", "")
+                    if not token or token == "YOUR_TOKEN_HERE":
+                        continue
+                    sandbox = tbank_cfg.get("tbank", {}).get("sandbox", True)
+                    from t_tech.invest import Client
+                    from t_tech.invest.constants import INVEST_GRPC_API, INVEST_GRPC_API_SANDBOX
+                    target = INVEST_GRPC_API_SANDBOX if sandbox else INVEST_GRPC_API
+                    with Client(token, target=target) as client:
+                        accounts = client.users.get_accounts()
+                        if not accounts.accounts:
+                            continue
+                        acc_id = accounts.accounts[0].id
+                        if sandbox:
+                            portfolio = client.sandbox.get_sandbox_portfolio(account_id=acc_id)
+                        else:
+                            portfolio = client.operations.get_portfolio(account_id=acc_id)
+                        total = portfolio.total_amount_portfolio
+                        return float(total.units) + float(total.nano) / 1e9
+                except Exception:
+                    logger.debug("Failed to get T-Bank balance", exc_info=True)
+            break  # Only try once
+        return None
+
+    def _get_other_instance_prices(self, symbols: list[str], is_tbank: bool) -> dict[str, float]:
+        """Get live prices for symbols from another instance's exchange."""
+        prices = {}
+        if not symbols:
+            return prices
+        try:
+            if is_tbank:
+                prices = self._get_tbank_prices(symbols)
+            else:
+                # Same exchange (Bybit) — use our client
+                for sym in symbols:
+                    try:
+                        prices[sym] = self.client.get_last_price(sym)
+                    except Exception:
+                        pass
+        except Exception:
+            logger.debug("Failed to get prices for other instance", exc_info=True)
+        return prices
+
+    def _get_tbank_prices(self, symbols: list[str]) -> dict[str, float]:
+        """Get live prices from T-Bank API for given tickers."""
+        import yaml
+        from pathlib import Path
+        for cfg_name in ("config/tbank_scalp.yaml", "config/tbank_swing.yaml"):
+            cfg_path = Path("/root/stasik") / cfg_name
+            if not cfg_path.exists():
+                continue
+            try:
+                with open(cfg_path) as f:
+                    tbank_cfg = yaml.safe_load(f)
+                token = tbank_cfg.get("tbank", {}).get("token", "")
+                if not token or token == "YOUR_TOKEN_HERE":
+                    continue
+                sandbox = tbank_cfg.get("tbank", {}).get("sandbox", True)
+                from t_tech.invest import Client
+                from t_tech.invest.constants import INVEST_GRPC_API, INVEST_GRPC_API_SANDBOX
+                target = INVEST_GRPC_API_SANDBOX if sandbox else INVEST_GRPC_API
+                with Client(token, target=target) as client:
+                    # Load instruments to get FIGI mapping
+                    all_shares = client.instruments.shares(instrument_status=1).instruments
+                    all_futures = client.instruments.futures(instrument_status=1).instruments
+                    figi_map = {}
+                    for inst in list(all_shares) + list(all_futures):
+                        if inst.ticker in symbols:
+                            figi_map[inst.ticker] = inst.figi
+                    if not figi_map:
+                        continue
+                    figi_list = list(figi_map.values())
+                    resp = client.market_data.get_last_prices(instrument_id=figi_list)
+                    prices = {}
+                    figi_to_ticker = {v: k for k, v in figi_map.items()}
+                    for lp in resp.last_prices:
+                        ticker = figi_to_ticker.get(lp.figi)
+                        if ticker:
+                            price = float(lp.price.units) + float(lp.price.nano) / 1e9
+                            prices[ticker] = price
+                    return prices
+            except Exception:
+                logger.debug("Failed to get T-Bank prices from %s", cfg_name, exc_info=True)
+        return {}
 
     async def _get_daily_total_pnl(self) -> float:
         """Get total daily PnL across all instances (for short notifications)."""
@@ -1045,6 +1220,7 @@ class TradingEngine:
         total = await self.db.get_total_pnl()
 
         name = self.instance_name or "BOT"
+        currency = "RUB" if self.exchange_type == "tbank" else "USDT"
         tf_label = self.timeframe if self._is_swing else f"{self.timeframe}м"
 
         lines = [
@@ -1054,8 +1230,8 @@ class TradingEngine:
             f"{'🟢 РАБОТАЕТ' if self._running else '🔴 ОСТАНОВЛЕН'}",
             f"{'⛔ СТОП — дневной лимит потерь' if self.risk.is_halted else ''}",
             f"Открытых сделок: {len(open_trades)}",
-            f"За день: {daily:+,.2f} USDT",
-            f"Всего: {total:+,.2f} USDT",
+            f"За день: {daily:+,.2f} {currency}",
+            f"Всего: {total:+,.2f} {currency}",
             f"Пары: {', '.join(self.pairs)}",
             f"Таймфрейм: {tf_label} | Плечо: {self.leverage}x",
         ]
@@ -1126,14 +1302,18 @@ class TradingEngine:
             except Exception:
                 logger.warning("Failed to read DB for instance %s", name)
 
+        currency = "RUB" if "TBANK" in name.upper() else "USDT"
+        lev_str = str(leverage)
+        if not lev_str.endswith("x"):
+            lev_str += "x"
         lines = [
             f"━━━ [{name}] ━━━",
             status_emoji,
             f"Открытых сделок: {open_count}",
-            f"За день: {daily:+,.2f} USDT",
-            f"Всего: {total:+,.2f} USDT",
+            f"За день: {daily:+,.2f} {currency}",
+            f"Всего: {total:+,.2f} {currency}",
             f"Пары: {', '.join(pairs)}",
-            f"Таймфрейм: {tf} | Плечо: {leverage}x",
+            f"Таймфрейм: {tf} | Плечо: {lev_str}",
         ]
         return lines
 
@@ -1141,18 +1321,28 @@ class TradingEngine:
         categories = self._get_categories()
         closed = []
         for cat in categories:
-            if cat != "linear":
+            if cat not in ("linear", "tbank"):
                 continue
-            positions = self.client.get_positions(category=cat)
+            if self.exchange_type == "tbank":
+                positions = self.client.get_positions()
+            else:
+                positions = self.client.get_positions(category=cat)
             for p in positions:
                 try:
                     close_side = "Sell" if p["side"] == "Buy" else "Buy"
-                    self.client.place_order(
-                        symbol=p["symbol"],
-                        side=close_side,
-                        qty=p["size"],
-                        category=cat,
-                    )
+                    if self.exchange_type == "tbank":
+                        self.client.place_order(
+                            symbol=p["symbol"],
+                            side=close_side,
+                            qty=p["size"],
+                        )
+                    else:
+                        self.client.place_order(
+                            symbol=p["symbol"],
+                            side=close_side,
+                            qty=p["size"],
+                            category=cat,
+                        )
                     closed.append(f"{p['symbol']} ({p['side']})")
                 except Exception:
                     logger.exception("Failed to close position %s", p["symbol"])
@@ -1161,7 +1351,10 @@ class TradingEngine:
         open_trades = await self.db.get_open_trades()
         for t in open_trades:
             try:
-                exit_price = self.client.get_last_price(t["symbol"], category=t["category"])
+                if self.exchange_type == "tbank":
+                    exit_price = self.client.get_last_price(t["symbol"])
+                else:
+                    exit_price = self.client.get_last_price(t["symbol"], category=t["category"])
                 if t["side"] == "Buy":
                     pnl = (exit_price - t["entry_price"]) * t["qty"]
                 else:
@@ -1182,18 +1375,31 @@ class TradingEngine:
         return msg
 
     async def get_positions_text(self) -> str:
+        import aiosqlite
+        from pathlib import Path
+
+        name = self.instance_name or "BOT"
+        currency = "RUB" if self.exchange_type == "tbank" else "USDT"
         categories = self._get_categories()
         lines = []
         total_pnl = 0.0
+        has_positions = False
+
+        # Current engine positions
         for cat in categories:
-            if cat == "linear":
-                positions = self.client.get_positions(category=cat)
+            if cat in ("linear", "tbank"):
+                if self.exchange_type == "tbank":
+                    positions = self.client.get_positions()
+                else:
+                    positions = self.client.get_positions(category=cat)
+                if positions:
+                    has_positions = True
+                    lines.append(f"━━━ [{name}] ━━━")
                 for p in positions:
                     direction = "ЛОНГ" if p["side"] == "Buy" else "ШОРТ"
                     upnl = p["unrealised_pnl"]
                     total_pnl += upnl
                     entry = p["entry_price"]
-                    # PnL в процентах от входа
                     if entry > 0 and p["size"] > 0:
                         pnl_pct = (upnl / (entry * p["size"])) * 100
                     else:
@@ -1202,18 +1408,80 @@ class TradingEngine:
                     lines.append(
                         f"{emoji} {direction} {p['symbol']}\n"
                         f"   Вход: {entry} | Объём: {p['size']}\n"
-                        f"   PnL: {upnl:+,.2f} USDT ({pnl_pct:+.2f}%)"
+                        f"   PnL: {upnl:+,.2f} {currency} ({pnl_pct:+.2f}%)"
                     )
-        if lines:
-            total_emoji = "🟢" if total_pnl >= 0 else "🔴"
-            lines.append(f"\n{total_emoji} Итого PnL: {total_pnl:+,.2f} USDT")
-        return "\n".join(lines) if lines else "Нет открытых позиций."
+
+        # Other instances — open trades from DB with live prices
+        tbank_pnl = 0.0
+        bybit_other_pnl = 0.0
+        for inst in self.config.get("other_instances", []):
+            inst_name = inst.get("name", "???")
+            db_path = inst.get("db_path", "")
+            is_tbank = "TBANK" in inst_name.upper()
+            inst_currency = "RUB" if is_tbank else "USDT"
+            if db_path and Path(db_path).exists():
+                try:
+                    async with aiosqlite.connect(db_path) as db:
+                        db.row_factory = aiosqlite.Row
+                        cur = await db.execute(
+                            "SELECT symbol, side, entry_price, qty FROM trades WHERE status = 'open'"
+                        )
+                        rows = await cur.fetchall()
+                        if rows:
+                            # Get live prices
+                            symbols = [r["symbol"] for r in rows]
+                            prices = self._get_other_instance_prices(symbols, is_tbank)
+                            has_positions = True
+                            lines.append(f"\n━━━ [{inst_name}] ━━━")
+                            for r in rows:
+                                sym = r["symbol"]
+                                direction = "ЛОНГ" if r["side"] == "Buy" else "ШОРТ"
+                                entry = r["entry_price"]
+                                qty_val = r["qty"]
+                                cur_price = prices.get(sym)
+                                if cur_price and entry > 0 and qty_val > 0:
+                                    if r["side"] == "Buy":
+                                        upnl = (cur_price - entry) * qty_val
+                                    else:
+                                        upnl = (entry - cur_price) * qty_val
+                                    pnl_pct = (cur_price / entry - 1) * 100 if r["side"] == "Buy" else (1 - cur_price / entry) * 100
+                                    if is_tbank:
+                                        tbank_pnl += upnl
+                                    else:
+                                        bybit_other_pnl += upnl
+                                    emoji = "🟢" if upnl >= 0 else "🔴"
+                                    lines.append(
+                                        f"{emoji} {direction} {sym}\n"
+                                        f"   Вход: {entry} | Сейчас: {cur_price}\n"
+                                        f"   PnL: {upnl:+,.2f} {inst_currency} ({pnl_pct:+.2f}%)"
+                                    )
+                                else:
+                                    lines.append(
+                                        f"📊 {direction} {sym}\n"
+                                        f"   Вход: {entry} | Объём: {qty_val}"
+                                    )
+                except Exception:
+                    logger.warning("Failed to read positions from %s", inst_name, exc_info=True)
+
+        if has_positions:
+            summary = []
+            bybit_total = total_pnl + bybit_other_pnl
+            if bybit_total != 0 or currency == "USDT":
+                e = "🟢" if bybit_total >= 0 else "🔴"
+                summary.append(f"{e} PnL Bybit: {bybit_total:+,.2f} USDT")
+            if tbank_pnl != 0:
+                e = "🟢" if tbank_pnl >= 0 else "🔴"
+                summary.append(f"{e} PnL TBank: {tbank_pnl:+,.2f} RUB")
+            if summary:
+                lines.append("\n" + "\n".join(summary))
+        return "\n".join(lines) if has_positions else "Нет открытых позиций."
 
     async def get_pnl_text(self) -> str:
         import aiosqlite
         from pathlib import Path
 
         name = self.instance_name or "BOT"
+        currency = "RUB" if self.exchange_type == "tbank" else "USDT"
 
         # Main instance
         daily = await self.db.get_daily_pnl()
@@ -1221,8 +1489,8 @@ class TradingEngine:
 
         lines = [
             f"━━━ [{name}] ━━━",
-            f"За день: {daily:+,.2f} USDT",
-            f"Всего: {total:+,.2f} USDT",
+            f"За день: {daily:+,.2f} {currency}",
+            f"Всего: {total:+,.2f} {currency}",
         ]
 
         # Other instances
@@ -1253,9 +1521,10 @@ class TradingEngine:
                     pass
             other_daily_sum += inst_daily
             other_total_sum += inst_total
+            inst_currency = "RUB" if "TBANK" in inst_name.upper() else "USDT"
             lines.append(f"\n━━━ [{inst_name}] ━━━")
-            lines.append(f"За день: {inst_daily:+,.2f} USDT")
-            lines.append(f"Всего: {inst_total:+,.2f} USDT")
+            lines.append(f"За день: {inst_daily:+,.2f} {inst_currency}")
+            lines.append(f"Всего: {inst_total:+,.2f} {inst_currency}")
 
         # Collect recent trades from all instances
         all_trades = []
@@ -1291,7 +1560,8 @@ class TradingEngine:
             direction = "ЛОНГ" if t["side"] == "Buy" else "ШОРТ"
             result = f"+{pnl:,.2f}" if pnl >= 0 else f"{pnl:,.2f}"
             tag = t.get("instance", "")
+            t_currency = "RUB" if "TBANK" in tag.upper() else "USDT"
             lines.append(
-                f"  [{tag}] {direction} {t['symbol']} | {result} USDT | {t['status']}"
+                f"  [{tag}] {direction} {t['symbol']} | {result} {t_currency} | {t['status']}"
             )
         return "\n".join(lines)

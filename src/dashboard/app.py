@@ -120,6 +120,8 @@ class Dashboard:
 
         total = stats["total"]
         wins = stats["wins"]
+        exchange = self.config.get("exchange", "bybit")
+        currency = "RUB" if exchange == "tbank" else "USDT"
         data = {
             "balance": balance,
             "daily_pnl": daily_pnl,
@@ -130,6 +132,7 @@ class Dashboard:
             "losses": stats["losses"],
             "win_rate": (wins / total * 100) if total > 0 else 0,
             "running": running,
+            "currency": currency,
         }
         return web.json_response(data)
 
@@ -221,9 +224,16 @@ class Dashboard:
 
     async def _api_positions(self, request: web.Request) -> web.Response:
         positions = []
+        instance_name = self.config.get("instance_name", "SCALP")
+
+        # Current engine positions
         if self.engine:
             try:
-                raw = self.engine.client.get_positions(category="linear")
+                exchange = self.config.get("exchange", "bybit")
+                if exchange == "tbank":
+                    raw = self.engine.client.get_positions()
+                else:
+                    raw = self.engine.client.get_positions(category="linear")
                 for p in raw:
                     positions.append({
                         "symbol": p["symbol"],
@@ -231,9 +241,35 @@ class Dashboard:
                         "size": p["size"],
                         "entry_price": p["entry_price"],
                         "unrealised_pnl": p["unrealised_pnl"],
+                        "instance": instance_name,
                     })
             except Exception:
                 pass
+
+        # Other instances — open trades from DB
+        for inst in self.config.get("other_instances", []):
+            inst_name = inst.get("name", "???")
+            db_path = inst.get("db_path", "")
+            if db_path and Path(db_path).exists():
+                try:
+                    async with aiosqlite.connect(db_path) as db:
+                        db.row_factory = aiosqlite.Row
+                        cur = await db.execute(
+                            "SELECT symbol, side, entry_price, qty FROM trades WHERE status = 'open'"
+                        )
+                        rows = await cur.fetchall()
+                        for r in rows:
+                            positions.append({
+                                "symbol": r["symbol"],
+                                "side": r["side"],
+                                "size": float(r["qty"]),
+                                "entry_price": float(r["entry_price"]),
+                                "unrealised_pnl": 0.0,
+                                "instance": inst_name,
+                            })
+                except Exception:
+                    logger.warning("Failed to read positions from %s", inst_name)
+
         return web.json_response(positions)
 
     async def _api_instances(self, request: web.Request) -> web.Response:
@@ -504,6 +540,7 @@ tr:hover{background:rgba(99,102,241,0.06)}
 .inst-tag{font-size:10px;padding:2px 8px;border-radius:8px;font-weight:600;letter-spacing:0.5px}
 .inst-scalp{background:rgba(99,102,241,0.15);color:#a5b4fc}
 .inst-swing{background:rgba(245,158,11,0.15);color:#fbbf24}
+.inst-tbank{background:rgba(16,185,129,0.15);color:#34d399}
 .tbl-wrap{overflow-x:auto}
 
 .pagination{display:flex;align-items:center;justify-content:center;gap:12px;margin-top:14px}
@@ -528,6 +565,7 @@ tr:hover{background:rgba(99,102,241,0.06)}
 }
 .instance-card.scalp::before{background:linear-gradient(90deg,#6366f1,#a78bfa)}
 .instance-card.swing::before{background:linear-gradient(90deg,#f59e0b,#fbbf24)}
+.instance-card.tbank::before{background:linear-gradient(90deg,#10b981,#34d399)}
 .instance-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px}
 .instance-name{font-size:18px;font-weight:700;color:#fff;display:flex;align-items:center;gap:8px}
 .instance-name .badge{
@@ -535,6 +573,7 @@ tr:hover{background:rgba(99,102,241,0.06)}
 }
 .badge-scalp{background:rgba(99,102,241,0.15);color:#a5b4fc;border:1px solid rgba(99,102,241,0.3)}
 .badge-swing{background:rgba(245,158,11,0.15);color:#fbbf24;border:1px solid rgba(245,158,11,0.3)}
+.badge-tbank{background:rgba(16,185,129,0.15);color:#34d399;border:1px solid rgba(16,185,129,0.3)}
 .instance-status{font-size:12px;font-weight:600;padding:4px 12px;border-radius:12px}
 .instance-status.on{background:rgba(0,230,118,0.12);color:var(--green)}
 .instance-status.off{background:rgba(255,82,82,0.12);color:var(--red)}
@@ -582,7 +621,7 @@ tr:hover{background:rgba(99,102,241,0.06)}
     <h2>📊 Открытые позиции</h2>
     <div class="tbl-wrap">
       <table>
-        <thead><tr><th>Пара</th><th>Сторона</th><th>Размер</th><th>Вход</th><th>Unrealized PnL</th></tr></thead>
+        <thead><tr><th>Бот</th><th>Пара</th><th>Сторона</th><th>Размер</th><th>Вход</th><th>Unrealized PnL</th></tr></thead>
         <tbody id="pos-body"></tbody>
       </table>
     </div>
@@ -619,22 +658,24 @@ async function loadInstances(){
     const el=document.getElementById('instances');
     el.innerHTML=list.map(i=>{
       const key=i.name.toLowerCase();
+      const isTbank=key.includes('tbank');
       const isScalp=key.includes('scalp');
-      const cardCls=isScalp?'scalp':'swing';
-      const badgeCls=isScalp?'badge-scalp':'badge-swing';
-      const tf=isScalp?i.timeframe+'м':i.timeframe;
+      const cardCls=isTbank?'tbank':isScalp?'scalp':'swing';
+      const badgeCls=isTbank?'badge-tbank':isScalp?'badge-scalp':'badge-swing';
+      const tf=isScalp&&!isTbank?i.timeframe+'м':i.timeframe;
+      const cur=isTbank?'RUB':'USDT';
       return`<div class="instance-card ${cardCls} fade-in">
         <div class="instance-header">
           <div class="instance-name">
-            ${isScalp?'⚡':'🌊'}
+            ${isTbank?'🏦':isScalp?'⚡':'🌊'}
             <span>${i.name}</span>
             <span class="badge ${badgeCls}">${tf} / ${i.leverage}x</span>
           </div>
           <div class="instance-status ${i.running?'on':'off'}">${i.running?'РАБОТАЕТ':'СТОП'}</div>
         </div>
         <div class="instance-stats">
-          <div class="instance-stat"><h4>За день</h4><div class="val ${cls(i.daily_pnl)}">${fmt(i.daily_pnl)}</div></div>
-          <div class="instance-stat"><h4>Всего PnL</h4><div class="val ${cls(i.total_pnl)}">${fmt(i.total_pnl)}</div></div>
+          <div class="instance-stat"><h4>За день</h4><div class="val ${cls(i.daily_pnl)}">${fmt(i.daily_pnl)} ${cur}</div></div>
+          <div class="instance-stat"><h4>Всего PnL</h4><div class="val ${cls(i.total_pnl)}">${fmt(i.total_pnl)} ${cur}</div></div>
           <div class="instance-stat"><h4>Win Rate</h4><div class="val">${i.total_trades?i.win_rate.toFixed(1)+'%':'—'}</div></div>
         </div>
         <div class="instance-meta">
@@ -653,10 +694,11 @@ async function loadStats(){
     const b=document.getElementById('status-badge');
     b.className=s.running?'on':'off';
     b.textContent=s.running?'РАБОТАЕТ':'ОСТАНОВЛЕН';
+    const cur=s.currency||'USDT';
     document.getElementById('stats').innerHTML=`
-      <div class="card fade-in"><span class="card-icon">💰</span><h3>Баланс</h3><div class="val">${s.balance.toFixed(0)} USDT</div></div>
-      <div class="card fade-in"><span class="card-icon">📅</span><h3>За день</h3><div class="val ${cls(s.daily_pnl)}">${fmt(s.daily_pnl)}</div></div>
-      <div class="card fade-in"><span class="card-icon">💎</span><h3>Всего PnL</h3><div class="val ${cls(s.total_pnl)}">${fmt(s.total_pnl)}</div></div>
+      <div class="card fade-in"><span class="card-icon">💰</span><h3>Баланс</h3><div class="val">${s.balance.toFixed(0)} ${cur}</div></div>
+      <div class="card fade-in"><span class="card-icon">📅</span><h3>За день</h3><div class="val ${cls(s.daily_pnl)}">${fmt(s.daily_pnl)} ${cur}</div></div>
+      <div class="card fade-in"><span class="card-icon">💎</span><h3>Всего PnL</h3><div class="val ${cls(s.total_pnl)}">${fmt(s.total_pnl)} ${cur}</div></div>
       <div class="card fade-in"><span class="card-icon">🎯</span><h3>Win Rate</h3><div class="val">${s.win_rate.toFixed(1)}%</div></div>
       <div class="card fade-in"><span class="card-icon">📊</span><h3>Позиции</h3><div class="val">${s.open_positions}</div></div>
       <div class="card fade-in"><span class="card-icon">🔢</span><h3>Всего сделок</h3><div class="val">${s.total_trades}</div></div>`;
@@ -696,13 +738,19 @@ async function loadPositions(){
   try{
     const pos=await(await fetch('/api/positions')).json();
     const body=document.getElementById('pos-body');
-    if(!pos.length){body.innerHTML='<tr><td colspan="5" style="text-align:center;color:#555;padding:20px">Нет открытых позиций</td></tr>';return}
+    if(!pos.length){body.innerHTML='<tr><td colspan="6" style="text-align:center;color:#555;padding:20px">Нет открытых позиций</td></tr>';return}
     body.innerHTML=pos.map(p=>{
       const pnl=parseFloat(p.unrealised_pnl)||0;
-      return`<tr class="fade-in"><td><strong>${p.symbol}</strong></td>
+      const inst=(p.instance||'').toUpperCase();
+      const isCls=inst.includes('TBANK')?'inst-tbank':inst.includes('SCALP')?'inst-scalp':'inst-swing';
+      const iLabel=inst.includes('TBANK-SCALP')?'TB-SCALP':inst.includes('TBANK-SWING')?'TB-SWING':inst.includes('SCALP')?'SCALP':'SWING';
+      const cur=inst.includes('TBANK')?'RUB':'USDT';
+      return`<tr class="fade-in">
+        <td><span class="inst-tag ${isCls}">${iLabel}</span></td>
+        <td><strong>${p.symbol}</strong></td>
         <td class="${p.side==='Buy'?'side-long':'side-short'}">${p.side==='Buy'?'ЛОНГ':'ШОРТ'}</td>
-        <td>${p.size}</td><td>${parseFloat(p.entry_price).toFixed(4)}</td>
-        <td class="${cls(pnl)}"><strong>${fmt(pnl)}</strong></td></tr>`;
+        <td>${p.size}</td><td>${parseFloat(p.entry_price).toFixed(2)}</td>
+        <td class="${cls(pnl)}"><strong>${fmt(pnl)} ${cur}</strong></td></tr>`;
     }).join('');
   }catch(e){console.error('positions',e)}
 }
@@ -717,8 +765,8 @@ async function loadTrades(page){
     document.getElementById('tbody').innerHTML=r.trades.map(t=>{
       const p=t.pnl||0;
       const inst=(t.instance||'').toUpperCase();
-      const isCls=inst.includes('SCALP')?'inst-scalp':'inst-swing';
-      const iLabel=inst.includes('SCALP')?'SCALP':'SWING';
+      const isCls=inst.includes('TBANK')?'inst-tbank':inst.includes('SCALP')?'inst-scalp':'inst-swing';
+      const iLabel=inst.includes('TBANK-SCALP')?'TB-SCALP':inst.includes('TBANK-SWING')?'TB-SWING':inst.includes('SCALP')?'SCALP':'SWING';
       return`<tr class="fade-in">
         <td><span class="inst-tag ${isCls}">${iLabel}</span></td>
         <td><strong>${t.symbol}</strong></td>

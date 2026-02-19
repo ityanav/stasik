@@ -4,10 +4,12 @@ from typing import Optional
 import pandas as pd
 from pybit.unified_trading import HTTP
 
+from src.exchange.base import ExchangeClient
+
 logger = logging.getLogger(__name__)
 
 
-class BybitClient:
+class BybitClient(ExchangeClient):
     def __init__(self, config: dict):
         self.config = config
         bybit_cfg = config["bybit"]

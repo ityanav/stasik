@@ -23,6 +23,9 @@ class RiskManager:
         self.atr_trail_max = risk.get("atr_trail_max", 2.0) / 100
         self.max_position_margin_pct = risk.get("max_position_margin_pct", 30) / 100
 
+        # Commission rate (0 for Bybit, e.g. 0.04 for T-Invest = 0.04%)
+        self.commission_rate = risk.get("commission_rate", 0.0) / 100
+
         self._daily_pnl: float = 0.0
         self._daily_date: date = date.today()
         self._halted: bool = False
@@ -139,6 +142,15 @@ class RiskManager:
             tp = price * (1 - tp_pct)
 
         return round(sl, 6), round(tp, 6), sl_pct, tp_pct
+
+    def min_profit_target_pct(self) -> float:
+        """Minimum TP% to cover round-trip commission (entry + exit)."""
+        return self.commission_rate * 2
+
+    def net_pnl(self, gross_pnl: float, position_value: float) -> float:
+        """PnL after deducting estimated commission."""
+        commission = position_value * self.commission_rate * 2
+        return gross_pnl - commission
 
     def calculate_trailing_distance_atr(
         self, atr: float, price: float, mult: float = 1.0,
