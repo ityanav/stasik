@@ -27,6 +27,7 @@ SYSTEM_PROMPT = """\
 - Последние 20 свечей (OHLCV)
 - Данные с нескольких таймфреймов (5м, 15м, 1ч) для контекста тренда и уровней
 - Текущие параметры риска (SL%, TP%)
+- Последние убыточные сделки и уроки из них (если есть)
 
 Правила:
 - Будь консервативен. Лучше пропустить сделку, чем потерять деньги.
@@ -36,6 +37,8 @@ SYSTEM_PROMPT = """\
 - Используй старшие таймфреймы для определения тренда и ключевых уровней.
 - Сигнал на 1м ПРОТИВ тренда на 15м/1ч — повод для REJECT.
 - Предлагай SL/TP исходя из волатильности и текущей ситуации.
+- ОБЯЗАТЕЛЬНО учитывай уроки из прошлых ошибок! Если похожая ситуация раньше приводила к убытку — REJECT.
+- Адаптируйся к текущему рынку: в медвежьем рынке предпочитай шорты, в бычьем — лонги.
 
 Отвечай СТРОГО в формате JSON (без markdown, без ```):
 {
@@ -58,28 +61,38 @@ REVIEW_PROMPT = """\
 Текущие параметры риска:
 {risk_text}
 
+Рыночный режим: {market_bias}
+
 Последние сделки:
 {trades_text}
+
+Предыдущие уроки:
+{lessons_text}
 
 Правила:
 - Меняй только то, что действительно нужно. Не трогай то, что работает.
 - Если мало данных (< 5 сделок) — будь осторожен с выводами.
+- ОБЯЗАТЕЛЬНО проанализируй убыточные сделки: что пошло не так, есть ли паттерн.
+- Сформулируй УРОКИ — конкретные правила из ошибок (max 5 активных).
+- Учитывай рыночный режим (bearish/bullish/neutral).
 - Допустимые параметры для изменения:
   * rsi_oversold (20-45), rsi_overbought (55-80)
   * ema_fast (5-15), ema_slow (15-50)
   * bb_period (10-30), bb_std (1.5-3.0)
-  * vol_threshold (1.0-3.0)
+  * vol_threshold (0.5-3.0)
   * min_score (1-4)
   * stop_loss (0.5-3.0%), take_profit (1.0-5.0%)
-  * risk_per_trade (1.0-10.0%)
+  * risk_per_trade (0.5-5.0%)
 - Не меняй macd — его параметры стандартные.
 
 Отвечай СТРОГО в формате JSON (без markdown, без ```):
 {{
   "changes": {{"имя_параметра": новое_значение, ...}},
-  "reasoning": "объяснение на русском, что и почему меняешь"
+  "lessons": ["урок 1", "урок 2", ...],
+  "reasoning": "объяснение на русском"
 }}
 Если менять ничего не нужно — верни пустой changes: {{}}.
+lessons — массив кратких правил из анализа ошибок (max 5).
 """
 
 
@@ -98,6 +111,7 @@ class AIVerdict:
 class StrategyUpdate:
     changes: dict = field(default_factory=dict)
     reasoning: str = ""
+    lessons: list[str] = field(default_factory=list)
     error: str | None = None
 
 
@@ -145,6 +159,9 @@ class AIAnalyst:
         risk_text: str = "",
         mtf_data: dict | None = None,
         config: dict | None = None,
+        recent_losses: list[dict] | None = None,
+        lessons: list[str] | None = None,
+        market_bias: str = "neutral",
     ) -> AIVerdict:
         if not self.enabled or not self._client:
             return AIVerdict(error="AI disabled")
@@ -177,6 +194,28 @@ class AIAnalyst:
             if mtf_sections:
                 user_prompt += "\n\n--- МУЛЬТИ-ТАЙМФРЕЙМ КОНТЕКСТ ---\n" + "\n\n".join(mtf_sections)
 
+        # Market bias context
+        if market_bias != "neutral":
+            bias_emoji = "🐻" if market_bias == "bearish" else "🐂"
+            user_prompt += f"\n\nРыночный режим: {bias_emoji} {market_bias.upper()}"
+
+        # Recent losing trades context
+        if recent_losses:
+            loss_lines = []
+            for t in recent_losses[-5:]:  # last 5 losses
+                pnl = t.get("pnl", 0)
+                direction = "ЛОНГ" if t.get("side") == "Buy" else "ШОРТ"
+                loss_lines.append(
+                    f"  ❌ {direction} {t.get('symbol', '?')} | "
+                    f"вход={t.get('entry_price', '?')} выход={t.get('exit_price', '?')} | "
+                    f"{pnl:+.2f} USDT"
+                )
+            user_prompt += "\n\n--- НЕДАВНИЕ УБЫТКИ ---\n" + "\n".join(loss_lines)
+
+        # Lessons from past reviews
+        if lessons:
+            user_prompt += "\n\n--- УРОКИ ИЗ ПРОШЛЫХ ОШИБОК ---\n" + "\n".join(f"  • {l}" for l in lessons)
+
         try:
             content = await self._call_api(SYSTEM_PROMPT, user_prompt)
             return self._parse_verdict(content)
@@ -194,12 +233,15 @@ class AIAnalyst:
         strategy_config: dict,
         risk_config: dict,
         recent_trades: list[dict],
+        market_bias: str = "neutral",
+        lessons: list[str] | None = None,
     ) -> StrategyUpdate:
         if not self.enabled or not self._client:
             return StrategyUpdate(error="AI disabled")
 
         strategy_text = "\n".join(f"  {k}: {v}" for k, v in strategy_config.items())
         risk_text = "\n".join(f"  {k}: {v}" for k, v in risk_config.items())
+        lessons_text = "\n".join(f"  - {l}" for l in (lessons or [])) or "Нет предыдущих уроков."
 
         if not recent_trades:
             trades_text = "Нет закрытых сделок за период."
@@ -208,10 +250,14 @@ class AIAnalyst:
             for t in recent_trades:
                 pnl = t.get("pnl") or 0
                 direction = "ЛОНГ" if t["side"] == "Buy" else "ШОРТ"
-                result = f"+{pnl:.2f}" if pnl >= 0 else f"{pnl:.2f}"
+                result_str = f"+{pnl:.2f}" if pnl >= 0 else f"{pnl:.2f}"
+                duration = ""
+                if t.get("opened_at") and t.get("closed_at"):
+                    duration = f" | длит: {t['opened_at'][:16]}→{t['closed_at'][:16]}"
                 lines.append(
-                    f"  {direction} {t['symbol']} | вход={t.get('entry_price', '?')} "
-                    f"выход={t.get('exit_price', '?')} | {result} USDT | {t.get('status', '?')}"
+                    f"  {'❌' if pnl < 0 else '✅'} {direction} {t['symbol']} | "
+                    f"вход={t.get('entry_price', '?')} выход={t.get('exit_price', '?')} | "
+                    f"{result_str} USDT{duration}"
                 )
             trades_text = "\n".join(lines)
 
@@ -219,6 +265,8 @@ class AIAnalyst:
             strategy_text=strategy_text,
             risk_text=risk_text,
             trades_text=trades_text,
+            market_bias=market_bias,
+            lessons_text=lessons_text,
         )
 
         try:
@@ -370,7 +418,15 @@ class AIAnalyst:
             else:
                 logger.warning("AI suggested out-of-range %s=%s (allowed %s-%s)", key, val, lo, hi)
 
-        return StrategyUpdate(changes=validated, reasoning=reasoning)
+        # Extract lessons from AI response
+        raw_lessons = parsed.get("lessons", [])
+        lessons = []
+        if isinstance(raw_lessons, list):
+            for item in raw_lessons[:5]:  # max 5 lessons
+                if isinstance(item, str) and item.strip():
+                    lessons.append(item.strip())
+
+        return StrategyUpdate(changes=validated, reasoning=reasoning, lessons=lessons)
 
 
 def extract_indicator_values(df: pd.DataFrame, config: dict) -> str:

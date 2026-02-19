@@ -128,6 +128,7 @@ class BybitClient(ExchangeClient):
                         "side": p["side"],
                         "size": size,
                         "entry_price": float(p["avgPrice"]),
+                        "mark_price": float(p.get("markPrice") or 0),
                         "unrealised_pnl": float(p["unrealisedPnl"]),
                         "leverage": p["leverage"],
                     }

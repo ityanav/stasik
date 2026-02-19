@@ -386,6 +386,7 @@ class TBankClient(ExchangeClient):
                 "side": side,
                 "size": abs(qty),
                 "entry_price": avg_price,
+                "mark_price": current_price,
                 "unrealised_pnl": float(expected_yield) if expected_yield else (current_price - avg_price) * qty,
                 "leverage": "1",
             })

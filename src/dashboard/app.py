@@ -184,19 +184,37 @@ class Dashboard:
 
     async def _api_pnl(self, request: web.Request) -> web.Response:
         days = int(request.query.get("days", "30"))
+        tf = request.query.get("tf", "1D")  # 10m, 30m, 1H, 1D, 1M
 
         instance_name = self.config.get("instance_name", "SCALP")
 
-        # Main instance PnL
-        main_data = await self.db.get_daily_pnl_history(days)
-        # Tag with instance
-        pnl_by_date: dict[str, dict] = {}
-        for d in main_data:
-            key = d["trade_date"]
-            pnl_by_date[key] = {"trade_date": key, "pnl": d["pnl"], "trades_count": d["trades_count"]}
-            pnl_by_date[key][instance_name] = d["pnl"]
+        if tf in ("1D", "1M"):
+            return await self._pnl_daily(days, tf, instance_name)
+        else:
+            return await self._pnl_intraday(tf, instance_name)
 
-        # Other instances PnL
+    async def _pnl_daily(self, days: int, tf: str, instance_name: str) -> web.Response:
+        """Daily or monthly PnL from daily_pnl table."""
+        # strftime for grouping: day or month
+        if tf == "1M":
+            group_fmt = "%Y-%m"
+        else:
+            group_fmt = "%Y-%m-%d"
+
+        pnl_by_key: dict[str, dict] = {}
+
+        # Main instance
+        main_data = await self.db.get_daily_pnl_history(days if tf == "1D" else days * 30)
+        for d in main_data:
+            raw_date = d["trade_date"]
+            key = raw_date[:7] if tf == "1M" else raw_date
+            if key not in pnl_by_key:
+                pnl_by_key[key] = {"trade_date": key, "pnl": 0, "trades_count": 0}
+            pnl_by_key[key]["pnl"] += d["pnl"]
+            pnl_by_key[key]["trades_count"] += d["trades_count"]
+            pnl_by_key[key][instance_name] = pnl_by_key[key].get(instance_name, 0) + d["pnl"]
+
+        # Other instances
         for inst in self.config.get("other_instances", []):
             db_path = inst.get("db_path", "")
             inst_name = inst.get("name", "???")
@@ -206,20 +224,74 @@ class Dashboard:
                         db.row_factory = aiosqlite.Row
                         cur = await db.execute(
                             "SELECT trade_date, pnl, trades_count FROM daily_pnl ORDER BY trade_date DESC LIMIT ?",
-                            (days,),
+                            (days if tf == "1D" else days * 30,),
                         )
                         rows = await cur.fetchall()
                         for r in rows:
-                            key = r["trade_date"]
-                            if key not in pnl_by_date:
-                                pnl_by_date[key] = {"trade_date": key, "pnl": 0, "trades_count": 0}
-                            pnl_by_date[key]["pnl"] += r["pnl"]
-                            pnl_by_date[key]["trades_count"] += r["trades_count"]
-                            pnl_by_date[key][inst_name] = r["pnl"]
+                            raw_date = r["trade_date"]
+                            key = raw_date[:7] if tf == "1M" else raw_date
+                            if key not in pnl_by_key:
+                                pnl_by_key[key] = {"trade_date": key, "pnl": 0, "trades_count": 0}
+                            pnl_by_key[key]["pnl"] += r["pnl"]
+                            pnl_by_key[key]["trades_count"] += r["trades_count"]
+                            pnl_by_key[key][inst_name] = pnl_by_key[key].get(inst_name, 0) + r["pnl"]
                 except Exception:
                     logger.warning("Failed to read PnL from %s", inst_name)
 
-        result = sorted(pnl_by_date.values(), key=lambda x: x["trade_date"])
+        result = sorted(pnl_by_key.values(), key=lambda x: x["trade_date"])
+        return web.json_response(result)
+
+    async def _pnl_intraday(self, tf: str, instance_name: str) -> web.Response:
+        """Intraday PnL from trades table (10m, 30m, 1H buckets)."""
+        from datetime import datetime, timedelta
+
+        minutes = {"10m": 10, "30m": 30, "1H": 60}.get(tf, 60)
+        # How far back to look
+        lookback_hours = {"10m": 6, "30m": 24, "1H": 72}.get(tf, 24)
+        since = (datetime.utcnow() - timedelta(hours=lookback_hours)).strftime("%Y-%m-%d %H:%M:%S")
+
+        all_dbs = [(self.db.db_path, instance_name)]
+        for inst in self.config.get("other_instances", []):
+            db_path = inst.get("db_path", "")
+            if db_path and Path(db_path).exists():
+                all_dbs.append((db_path, inst.get("name", "???")))
+
+        pnl_by_bucket: dict[str, dict] = {}
+
+        for db_path, inst_name in all_dbs:
+            try:
+                async with aiosqlite.connect(db_path) as db:
+                    db.row_factory = aiosqlite.Row
+                    cur = await db.execute(
+                        "SELECT closed_at, pnl FROM trades WHERE status='closed' AND closed_at >= ? ORDER BY closed_at",
+                        (since,),
+                    )
+                    rows = await cur.fetchall()
+                    for r in rows:
+                        ts = r["closed_at"]
+                        if not ts:
+                            continue
+                        try:
+                            dt = datetime.strptime(ts[:19], "%Y-%m-%d %H:%M:%S")
+                        except ValueError:
+                            try:
+                                dt = datetime.fromisoformat(ts)
+                            except Exception:
+                                continue
+                        # Round down to bucket
+                        bucket_min = (dt.minute // minutes) * minutes
+                        bucket_dt = dt.replace(minute=bucket_min, second=0, microsecond=0)
+                        key = bucket_dt.strftime("%Y-%m-%d %H:%M")
+
+                        if key not in pnl_by_bucket:
+                            pnl_by_bucket[key] = {"trade_date": key, "pnl": 0, "trades_count": 0}
+                        pnl_by_bucket[key]["pnl"] += r["pnl"] or 0
+                        pnl_by_bucket[key]["trades_count"] += 1
+                        pnl_by_bucket[key][inst_name] = pnl_by_bucket[key].get(inst_name, 0) + (r["pnl"] or 0)
+            except Exception:
+                logger.warning("Failed to read intraday PnL from %s", inst_name)
+
+        result = sorted(pnl_by_bucket.values(), key=lambda x: x["trade_date"])
         return web.json_response(result)
 
     async def _api_positions(self, request: web.Request) -> web.Response:
@@ -467,6 +539,7 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
 <title>Stasik Dashboard</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-datalabels@2/dist/chartjs-plugin-datalabels.min.js"></script>
 <style>
 :root{
   --bg:#0f0f23;--bg2:#1a1a3e;--bg3:#12122e;
@@ -584,6 +657,26 @@ tr:hover{background:rgba(99,102,241,0.06)}
 
 @keyframes fadeIn{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:translateY(0)}}
 .fade-in{animation:fadeIn 0.4s ease}
+.tf-buttons{display:flex;gap:4px}
+.tf-buttons button{
+  background:rgba(99,102,241,0.1);border:1px solid rgba(99,102,241,0.2);
+  color:#a5b4fc;padding:6px 14px;border-radius:8px;font-size:12px;font-weight:600;
+  cursor:pointer;transition:all 0.2s;
+}
+.tf-buttons button:hover{background:rgba(99,102,241,0.25)}
+.tf-buttons button.active{background:rgba(99,102,241,0.35);border-color:#6366f1;color:#fff}
+
+.chart-dual-wrap{display:flex;flex-direction:column;gap:16px}
+.chart-half{background:var(--bg3);border:1px solid var(--border);border-radius:12px;padding:16px;position:relative}
+.chart-half-label{font-size:12px;font-weight:600;margin-bottom:10px;display:flex;align-items:center;gap:6px}
+.dot{width:10px;height:10px;border-radius:50%;display:inline-block}
+.dot-bybit{background:#818cf8}
+.dot-tbank{background:#34d399}
+.chart-legend-custom{display:flex;gap:12px;font-size:12px;color:var(--muted)}
+.chart-legend-custom .leg-item{display:flex;align-items:center;gap:5px}
+.leg-bar{width:12px;height:10px;border-radius:2px}
+.leg-line{width:14px;height:2px;border-radius:1px}
+
 .last-update{text-align:center;color:#555;font-size:11px;padding:16px}
 
 @media(max-width:600px){
@@ -613,8 +706,23 @@ tr:hover{background:rgba(99,102,241,0.06)}
   <div class="cards" id="stats"></div>
 
   <div class="chart-section">
-    <h2>📈 PnL за 30 дней</h2>
-    <canvas id="pnlChart"></canvas>
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;flex-wrap:wrap;gap:10px">
+      <h2 style="margin:0">📈 PnL</h2>
+      <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+        <div class="chart-legend-custom" id="chart-legend"></div>
+        <div class="tf-buttons" id="tf-buttons">
+          <button onclick="setTF('10m')" data-tf="10m">10м</button>
+          <button onclick="setTF('30m')" data-tf="30m">30м</button>
+          <button onclick="setTF('1H')" data-tf="1H">1ч</button>
+          <button class="active" onclick="setTF('1D')" data-tf="1D">1д</button>
+          <button onclick="setTF('1M')" data-tf="1M">1мес</button>
+        </div>
+      </div>
+    </div>
+    <div class="chart-dual-wrap" id="chart-wrap">
+      <div class="chart-half"><div class="chart-half-label"><span class="dot dot-bybit"></span>Bybit (USDT)</div><canvas id="pnlChartBybit"></canvas></div>
+      <div class="chart-half" id="tbank-chart-half" style="display:none"><div class="chart-half-label"><span class="dot dot-tbank"></span>T-Bank (RUB)</div><canvas id="pnlChartTbank"></canvas></div>
+    </div>
   </div>
 
   <div class="section">
@@ -648,9 +756,14 @@ tr:hover{background:rgba(99,102,241,0.06)}
 </div>
 
 <script>
-let chart=null,currentPage=1,hasNext=false;
+let currentPage=1,hasNext=false,currentTF='1D';
 function fmt(v){return(v>=0?'+':'')+v.toFixed(2)}
 function cls(v){return v>=0?'g':'r'}
+function setTF(tf){
+  currentTF=tf;
+  document.querySelectorAll('.tf-buttons button').forEach(b=>b.classList.toggle('active',b.dataset.tf===tf));
+  loadChart();
+}
 
 async function loadInstances(){
   try{
@@ -705,32 +818,143 @@ async function loadStats(){
   }catch(e){console.error('stats',e)}
 }
 
+let chartBybit=null, chartTbank=null;
+
+function buildWaterfall(canvasId, labels, dailyArr, posColor, negColor, currency, sym){
+  const ctx=document.getElementById(canvasId).getContext('2d');
+
+  // Build floating bar ranges: each bar floats from cumBefore → cumAfter
+  const ranges=[];
+  let cum=0;
+  dailyArr.forEach(v=>{
+    const from=cum;
+    cum+=v;
+    ranges.push([Math.min(from,cum), Math.max(from,cum)]);
+  });
+  const colors=dailyArr.map(v=>v>=0?posColor:negColor);
+
+  // Connector lines dataset (thin lines connecting bars)
+  const connectors=[];
+  let c2=0;
+  dailyArr.forEach((v,i)=>{
+    c2+=v;
+    connectors.push(c2);
+  });
+
+  return new Chart(ctx,{type:'bar',
+    plugins:[ChartDataLabels,{
+      id:'waterfall-connectors',
+      afterDatasetsDraw(chart){
+        const meta=chart.getDatasetMeta(0);
+        const ctx2=chart.ctx;
+        ctx2.save();
+        ctx2.setLineDash([3,3]);
+        ctx2.strokeStyle='rgba(255,255,255,0.15)';
+        ctx2.lineWidth=1;
+        for(let i=0;i<meta.data.length-1;i++){
+          const bar=meta.data[i];
+          const next=meta.data[i+1];
+          // connect end of current bar to start of next
+          const endY=dailyArr[i]>=0?bar.y:bar.base;
+          ctx2.beginPath();
+          ctx2.moveTo(bar.x,endY);
+          ctx2.lineTo(next.x,endY);
+          ctx2.stroke();
+        }
+        ctx2.restore();
+      }
+    }],
+    data:{labels,datasets:[{
+      data:ranges,
+      backgroundColor:colors,
+      borderRadius:3,
+      borderSkipped:false,
+      datalabels:{
+        display:c=>dailyArr[c.dataIndex]!==0,
+        formatter:(v,c)=>{const d=dailyArr[c.dataIndex];return(d>=0?'+':'')+d.toFixed(0)},
+        color:c=>dailyArr[c.dataIndex]>=0?'#00e676':'#ff5252',
+        anchor:c=>dailyArr[c.dataIndex]>=0?'end':'start',
+        align:c=>dailyArr[c.dataIndex]>=0?'top':'bottom',
+        font:{size:10,weight:'bold'},
+      }
+    }]},
+    options:{responsive:true,maintainAspectRatio:true,
+      interaction:{intersect:false,mode:'index'},
+      plugins:{
+        legend:{display:false},
+        datalabels:{},
+        tooltip:{
+          backgroundColor:'rgba(26,26,62,0.95)',titleColor:'#fff',bodyColor:'#e0e0e0',
+          borderColor:'rgba(99,102,241,0.3)',borderWidth:1,cornerRadius:10,padding:12,
+          callbacks:{
+            label:c=>{
+              const i=c.dataIndex;
+              const d=dailyArr[i];
+              const total=connectors[i];
+              return[
+                'PnL: '+(d>=0?'+':'')+d.toFixed(2)+' '+currency,
+                'Итого: '+(total>=0?'+':'')+total.toFixed(2)+' '+currency
+              ];
+            }
+          }
+        }
+      },
+      scales:{
+        x:{ticks:{color:'#555',maxRotation:45,font:{size:11}},grid:{display:false}},
+        y:{
+          ticks:{color:'#888',callback:v=>(v>=0?'+':'')+v.toFixed(0)+' '+sym,font:{size:10}},
+          grid:{color:c=>c.tick.value===0?'rgba(255,255,255,0.35)':'rgba(255,255,255,0.04)',lineWidth:c=>c.tick.value===0?2:1},
+        }
+      }
+    }
+  });
+}
+
 async function loadChart(){
   try{
-    const pnl=await(await fetch('/api/pnl?days=30')).json();
+    const pnl=await(await fetch('/api/pnl?days=30&tf='+currentTF)).json();
     if(!pnl.length)return;
-    let cum=0;
-    const cumData=pnl.map(d=>{cum+=d.pnl;return cum});
-    const labels=pnl.map(d=>d.trade_date);
-    const pos=cum>=0;
-    if(chart)chart.destroy();
-    const ctx=document.getElementById('pnlChart').getContext('2d');
-    const grad=ctx.createLinearGradient(0,0,0,300);
-    grad.addColorStop(0,pos?'rgba(0,230,118,0.2)':'rgba(255,82,82,0.2)');
-    grad.addColorStop(1,'rgba(0,0,0,0)');
-    chart=new Chart(ctx,{type:'line',
-      data:{labels,datasets:[{label:'Cumulative PnL (USDT)',data:cumData,
-        borderColor:pos?'#00e676':'#ff5252',borderWidth:2,
-        fill:true,backgroundColor:grad,tension:0.35,pointRadius:4,pointHoverRadius:7,
-        pointBackgroundColor:pos?'#00e676':'#ff5252',pointBorderColor:'transparent'}]},
-      options:{responsive:true,interaction:{intersect:false,mode:'index'},
-        plugins:{legend:{display:false},
-          tooltip:{backgroundColor:'rgba(26,26,62,0.95)',titleColor:'#fff',bodyColor:'#e0e0e0',
-            borderColor:'rgba(99,102,241,0.3)',borderWidth:1,cornerRadius:10,padding:12,displayColors:false,
-            callbacks:{label:c=>'PnL: '+c.parsed.y.toFixed(2)+' USDT'}}},
-        scales:{x:{ticks:{color:'#555',maxRotation:45},grid:{display:false}},
-          y:{ticks:{color:'#555',callback:v=>v.toFixed(0)},grid:{color:'rgba(255,255,255,0.03)'}}}}
+    const labels=pnl.map(d=>{
+      const dt=d.trade_date;
+      if(currentTF==='1M')return dt;
+      if(currentTF==='1D')return dt.slice(5);
+      return dt.length>10?dt.slice(11,16):dt;
     });
+
+    let cumBybit=0, cumTbank=0;
+    const bybitDaily=[], tbankDaily=[];
+    let hasTbank=false;
+    pnl.forEach(d=>{
+      let bPnl=0, tPnl=0;
+      Object.keys(d).forEach(k=>{
+        if(k==='trade_date'||k==='pnl'||k==='trades_count')return;
+        if(k.toUpperCase().includes('TBANK')){tPnl+=d[k];hasTbank=true}
+        else{bPnl+=d[k]}
+      });
+      if(!Object.keys(d).some(k=>!['trade_date','pnl','trades_count'].includes(k))){bPnl=d.pnl}
+      bybitDaily.push(bPnl);tbankDaily.push(tPnl);
+    });
+
+    if(chartBybit){chartBybit.destroy();chartBybit=null}
+    if(chartTbank){chartTbank.destroy();chartTbank=null}
+
+    chartBybit=buildWaterfall('pnlChartBybit',labels,bybitDaily,
+      'rgba(129,140,248,0.75)','rgba(255,82,82,0.75)','USDT','$');
+
+    const tbHalf=document.getElementById('tbank-chart-half');
+    if(hasTbank){
+      tbHalf.style.display='';
+      chartTbank=buildWaterfall('pnlChartTbank',labels,tbankDaily,
+        'rgba(52,211,153,0.75)','rgba(255,82,82,0.75)','RUB','₽');
+    }else{
+      tbHalf.style.display='none';
+    }
+
+    // Legend
+    document.getElementById('chart-legend').innerHTML=`
+      <span class="leg-item"><span class="leg-bar" style="background:rgba(129,140,248,0.75)"></span>Профит</span>
+      <span class="leg-item"><span class="leg-bar" style="background:rgba(255,82,82,0.75)"></span>Убыток</span>
+    `;
   }catch(e){console.error('chart',e)}
 }
 

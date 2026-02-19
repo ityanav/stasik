@@ -12,7 +12,7 @@ from src.risk.manager import RiskManager
 from src.storage.database import Database
 from src.strategy.ai_analyst import AIAnalyst, extract_indicator_values, format_risk_text, summarize_candles
 from src.strategy.indicators import calculate_atr
-from src.strategy.signals import Signal, SignalGenerator, Trend
+from src.strategy.signals import Signal, SignalGenerator, SignalResult, Trend
 
 logger = logging.getLogger(__name__)
 
@@ -96,6 +96,17 @@ class TradingEngine:
         self._is_swing = candle_sec >= 3600  # 1h+ = swing-like
         self._last_candle_ts: dict[str, float] = {}  # symbol -> last candle open timestamp
 
+        # Market bias (auto-detected from BTC daily trend)
+        self._market_bias: str = "neutral"  # "bullish", "bearish", "neutral"
+        self._market_bias_ts: float = 0  # last update timestamp
+        self._market_bias_interval: int = 3600  # recheck every hour
+        self._market_bias_symbol: str = config["strategy"].get("bias_symbol", "BTCUSDT")
+        self._market_bias_enabled: bool = config["strategy"].get("market_bias", True)
+        self._bias_score_bonus: int = config["strategy"].get("bias_score_bonus", 1)
+
+        # AI lessons from strategy reviews
+        self._ai_lessons: list[str] = []
+
         # Weekly report
         self._weekly_report_day: int = config.get("weekly_report_day", 0)  # 0=Monday
         self._last_weekly_report: str = ""  # ISO date of last report
@@ -109,6 +120,57 @@ class TradingEngine:
         else:
             from src.exchange.client import BybitClient
             return BybitClient(config)
+
+    def _update_market_bias(self):
+        """Detect market regime from BTC daily chart (EMA20 vs EMA50 + price position)."""
+        import time as _time
+        now = _time.time()
+        if now - self._market_bias_ts < self._market_bias_interval:
+            return  # cached
+        self._market_bias_ts = now
+
+        if not self._market_bias_enabled or self.exchange_type != "bybit":
+            self._market_bias = "neutral"
+            return
+
+        try:
+            # Get daily candles for bias symbol (BTC)
+            df = self.client.get_klines(self._market_bias_symbol, "D", limit=60, category="linear")
+            if df is None or len(df) < 50:
+                return
+
+            close = df["close"]
+            ema20 = close.ewm(span=20, adjust=False).mean()
+            ema50 = close.ewm(span=50, adjust=False).mean()
+
+            price = close.iloc[-1]
+            e20 = ema20.iloc[-1]
+            e50 = ema50.iloc[-1]
+
+            old_bias = self._market_bias
+
+            # Strong bearish: price below both EMAs AND EMA20 < EMA50
+            if price < e20 and price < e50 and e20 < e50:
+                self._market_bias = "bearish"
+            # Strong bullish: price above both EMAs AND EMA20 > EMA50
+            elif price > e20 and price > e50 and e20 > e50:
+                self._market_bias = "bullish"
+            # Weak bearish: price below EMA50 OR EMA20 crossing below EMA50
+            elif price < e50 or e20 < e50:
+                self._market_bias = "bearish"
+            # Weak bullish
+            elif price > e50 or e20 > e50:
+                self._market_bias = "bullish"
+            else:
+                self._market_bias = "neutral"
+
+            if self._market_bias != old_bias:
+                logger.info(
+                    "Market bias changed: %s → %s (BTC price=%.0f, EMA20=%.0f, EMA50=%.0f)",
+                    old_bias, self._market_bias, price, e20, e50,
+                )
+        except Exception:
+            logger.warning("Failed to update market bias", exc_info=True)
 
     async def start(self):
         await self.db.connect()
@@ -181,6 +243,9 @@ class TradingEngine:
             logger.info("Trading halted — daily loss limit")
             return
 
+        # Update market bias (cached, ~1 call/hour)
+        self._update_market_bias()
+
         # Trading hours filter (UTC)
         current_hour = datetime.utcnow().hour
         if self._trading_hour_start < self._trading_hour_end:
@@ -242,6 +307,33 @@ class TradingEngine:
         atr = calculate_atr(df, self._atr_period)
 
         result = self.signal_gen.generate(df, symbol)
+
+        # Apply market bias: adjust score based on BTC daily trend
+        original_score = result.score
+        if self._market_bias == "bearish" and self.exchange_type == "bybit":
+            # Bearish market: boost sell signals, penalize buy signals
+            if result.score < 0:  # sell signal
+                result = SignalResult(signal=result.signal, score=result.score - self._bias_score_bonus, details=result.details)
+            elif result.score > 0:  # buy signal
+                result = SignalResult(signal=result.signal, score=result.score - self._bias_score_bonus, details=result.details)
+                # Re-check if signal flipped
+                if result.score <= -self.signal_gen.min_score:
+                    result = SignalResult(signal=Signal.SELL, score=result.score, details=result.details)
+                elif abs(result.score) < self.signal_gen.min_score:
+                    result = SignalResult(signal=Signal.HOLD, score=result.score, details=result.details)
+        elif self._market_bias == "bullish" and self.exchange_type == "bybit":
+            # Bullish market: boost buy signals, penalize sell signals
+            if result.score > 0:  # buy signal
+                result = SignalResult(signal=result.signal, score=result.score + self._bias_score_bonus, details=result.details)
+            elif result.score < 0:  # sell signal
+                result = SignalResult(signal=result.signal, score=result.score + self._bias_score_bonus, details=result.details)
+                if result.score >= self.signal_gen.min_score:
+                    result = SignalResult(signal=Signal.BUY, score=result.score, details=result.details)
+                elif abs(result.score) < self.signal_gen.min_score:
+                    result = SignalResult(signal=Signal.HOLD, score=result.score, details=result.details)
+
+        if original_score != result.score:
+            logger.info("Market bias [%s]: %s score %d → %d", self._market_bias, symbol, original_score, result.score)
 
         if result.signal == Signal.HOLD:
             return
@@ -315,13 +407,9 @@ class TradingEngine:
 
         side = "Buy" if result.signal == Signal.BUY else "Sell"
 
-        # Spot / T-Bank shares: only Buy (no short selling without margin)
-        if category in ("spot", "tbank") and side == "Sell":
-            if self.exchange_type == "tbank" and self.config["trading"].get("instrument_type") == "share":
-                logger.info("T-Bank shares: short selling skipped for %s", symbol)
-                return
-            elif category == "spot":
-                return
+        # Spot: only Buy (no short selling)
+        if category == "spot" and side == "Sell":
+            return
 
         # AI analyst filter
         ai_reasoning = ""
@@ -336,6 +424,14 @@ class TradingEngine:
             # Multi-TF context
             mtf_data = self._get_mtf_data(symbol, category)
 
+            # Recent losses for AI context
+            recent_losses = []
+            try:
+                recent = await self.db.get_recent_trades(10)
+                recent_losses = [t for t in recent if t.get("status") == "closed" and (t.get("pnl") or 0) < 0]
+            except Exception:
+                pass
+
             verdict = await self.ai_analyst.analyze(
                 signal=result.signal.value,
                 score=result.score,
@@ -345,6 +441,9 @@ class TradingEngine:
                 risk_text=risk_text,
                 mtf_data=mtf_data,
                 config=self.config,
+                recent_losses=recent_losses,
+                lessons=self._ai_lessons,
+                market_bias=self._market_bias,
             )
 
             if verdict.error:
@@ -557,14 +656,21 @@ class TradingEngine:
             strategy_config=self.config["strategy"],
             risk_config=self.config["risk"],
             recent_trades=closed,
+            market_bias=self._market_bias,
+            lessons=self._ai_lessons,
         )
 
         if update.error:
             logger.warning("AI review failed: %s", update.error)
             return
 
+        # Save lessons from AI (replace old with new, max 5)
+        if update.lessons:
+            self._ai_lessons = update.lessons[:5]
+            logger.info("AI lessons updated: %s", self._ai_lessons)
+
         if not update.changes:
-            logger.info("AI review: no changes needed")
+            logger.info("AI review: no changes needed. Lessons: %d", len(self._ai_lessons))
             return
 
         # Apply changes
@@ -601,6 +707,8 @@ class TradingEngine:
             f"Изменения:\n" + "\n".join(changes_text) + "\n"
             f"Причина: {update.reasoning}"
         )
+        if self._ai_lessons:
+            msg += "\n\nУроки:\n" + "\n".join(f"  • {l}" for l in self._ai_lessons)
         logger.info(msg)
         await self._notify(msg)
 
@@ -1371,6 +1479,9 @@ class TradingEngine:
             f"Пары: {', '.join(self.pairs)}",
             f"Таймфрейм: {tf_label} | Плечо: {self.leverage}x",
         ]
+        if self._market_bias_enabled and self.exchange_type == "bybit":
+            bias_emoji = {"bearish": "🐻", "bullish": "🐂", "neutral": "➖"}.get(self._market_bias, "➖")
+            lines.append(f"Рынок: {bias_emoji} {self._market_bias.upper()} (bias ±{self._bias_score_bonus})")
 
         # Show other instances
         for inst in self.config.get("other_instances", []):
@@ -1593,7 +1704,10 @@ class TradingEngine:
                     else:
                         self.client.place_order(symbol=symbol, side=close_side, qty=p["size"], category=cat)
                     closed = True
-        except Exception:
+        except Exception as e:
+            err_str = str(e)
+            if "30079" in err_str or "not available for trading" in err_str.lower():
+                return f"⏸ Биржа MOEX закрыта — {symbol} нельзя закрыть сейчас. Попробуй в торговую сессию (10:00-18:50 МСК)."
             # Symbol not on this exchange — check other instances
             pass
 
@@ -1613,7 +1727,10 @@ class TradingEngine:
                             closed = True
                             is_other = True
                             is_tbank = True
-                except Exception:
+                except Exception as e:
+                    err_str = str(e)
+                    if "30079" in err_str or "not available for trading" in err_str.lower():
+                        return f"⏸ Биржа MOEX закрыта — {symbol} нельзя закрыть сейчас. Попробуй в торговую сессию (10:00-18:50 МСК)."
                     logger.exception("Failed to close %s via other instance", symbol)
                     return f"❌ Ошибка при закрытии {symbol}"
 
@@ -1841,15 +1958,17 @@ class TradingEngine:
                     upnl = p["unrealised_pnl"]
                     total_pnl += upnl
                     entry = p["entry_price"]
-                    if entry > 0 and p["size"] > 0:
-                        pnl_pct = (upnl / (entry * p["size"])) * 100
+                    mark = p.get("mark_price", 0)
+                    size = p["size"]
+                    if entry > 0 and size > 0:
+                        pnl_pct = (upnl / (entry * size)) * 100
                     else:
                         pnl_pct = 0.0
                     emoji = "🟢" if upnl >= 0 else "🔴"
                     lines.append(
                         f"{emoji} {direction} {p['symbol']}\n"
-                        f"   Вход: {entry} | Объём: {p['size']}\n"
-                        f"   PnL: {upnl:+,.2f} {currency} ({pnl_pct:+.2f}%)"
+                        f"   Вход: {entry}  →  Сейчас: {mark}\n"
+                        f"   Объём: {size} | PnL: {upnl:+,.2f} {currency} ({pnl_pct:+.2f}%)"
                     )
 
         # Other instances — open trades from DB with live prices
@@ -1893,13 +2012,14 @@ class TradingEngine:
                                     emoji = "🟢" if upnl >= 0 else "🔴"
                                     lines.append(
                                         f"{emoji} {direction} {sym}\n"
-                                        f"   Вход: {entry} | Сейчас: {cur_price}\n"
-                                        f"   PnL: {upnl:+,.2f} {inst_currency} ({pnl_pct:+.2f}%)"
+                                        f"   Вход: {entry}  →  Сейчас: {cur_price}\n"
+                                        f"   Объём: {qty_val} | PnL: {upnl:+,.2f} {inst_currency} ({pnl_pct:+.2f}%)"
                                     )
                                 else:
                                     lines.append(
                                         f"📊 {direction} {sym}\n"
-                                        f"   Вход: {entry} | Объём: {qty_val}"
+                                        f"   Вход: {entry}  →  Сейчас: ?\n"
+                                        f"   Объём: {qty_val}"
                                     )
                 except Exception:
                     logger.warning("Failed to read positions from %s", inst_name, exc_info=True)
@@ -1908,10 +2028,10 @@ class TradingEngine:
             summary = []
             bybit_total = total_pnl + bybit_other_pnl
             if bybit_total != 0 or currency == "USDT":
-                e = "🟢" if bybit_total >= 0 else "🔴"
+                e = "⬆️" if bybit_total >= 0 else "⬇️"
                 summary.append(f"{e} PnL Bybit: {bybit_total:+,.2f} USDT")
             if tbank_pnl != 0:
-                e = "🟢" if tbank_pnl >= 0 else "🔴"
+                e = "⬆️" if tbank_pnl >= 0 else "⬇️"
                 summary.append(f"{e} PnL TBank: {tbank_pnl:+,.2f} RUB")
             if summary:
                 lines.append("\n" + "\n".join(summary))
