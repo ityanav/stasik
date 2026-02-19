@@ -616,6 +616,7 @@ class TradingEngine:
                 await self._check_breakeven(trade)
                 if not trade.get("partial_closed"):
                     await self._check_partial_close(trade)
+                await self._check_smart_exit(trade)
                 await self._check_trade_closed(trade)
             except Exception:
                 logger.exception("Error checking trade %s", trade["id"])
@@ -716,6 +717,84 @@ class TradingEngine:
         )
         logger.info(msg)
         await self._notify(msg)
+
+    async def _check_smart_exit(self, trade: dict):
+        """Close trade early with small profit if signal reversed.
+
+        Config (risk section):
+          smart_exit_min: 100   # min unrealized PnL (USDT/RUB) to consider
+          smart_exit_max: 500   # close if uPnL in [min, max] and signal reversed
+        """
+        risk_cfg = self.config.get("risk", {})
+        exit_min = risk_cfg.get("smart_exit_min", 0)
+        if exit_min <= 0:
+            return  # feature disabled
+
+        exit_max = risk_cfg.get("smart_exit_max", 500)
+
+        symbol = trade["symbol"]
+        side = trade["side"]
+        entry = trade["entry_price"]
+        qty = trade["qty"]
+        category = trade["category"]
+
+        # Get current price
+        try:
+            if self.exchange_type == "tbank":
+                cur_price = self.client.get_last_price(symbol)
+            else:
+                cur_price = self.client.get_last_price(symbol, category="linear")
+        except Exception:
+            return
+
+        # Calculate unrealized PnL
+        if side == "Buy":
+            upnl = (cur_price - entry) * qty
+        else:
+            upnl = (entry - cur_price) * qty
+
+        if upnl < exit_min or upnl > exit_max:
+            return
+
+        # Check if current signal is opposite to our position
+        try:
+            df = self.client.get_klines(symbol, self.timeframe, limit=100, category=category)
+            if df is None or df.empty:
+                return
+            result = self.signal_gen.generate(df, symbol)
+        except Exception:
+            return
+
+        # Signal must oppose our direction
+        opposite = False
+        if side == "Buy" and result.signal == Signal.SELL and result.score <= -2:
+            opposite = True
+        elif side == "Sell" and result.signal == Signal.BUY and result.score >= 2:
+            opposite = True
+
+        if not opposite:
+            return
+
+        # Close the position
+        close_side = "Sell" if side == "Buy" else "Buy"
+        try:
+            if self.exchange_type == "tbank":
+                self.client.place_order(symbol=symbol, side=close_side, qty=qty)
+            else:
+                self.client.place_order(symbol=symbol, side=close_side, qty=qty, category="linear")
+        except Exception:
+            logger.exception("Smart exit: failed to close %s", symbol)
+            return
+
+        direction = "ЛОНГ" if side == "Buy" else "ШОРТ"
+        logger.info(
+            "🧠 Smart exit: закрыл %s %s при PnL +%.0f (сигнал развернулся: score=%d)",
+            direction, symbol, upnl, result.score,
+        )
+        await self._notify(
+            f"🧠 Smart exit: закрыл {direction} {symbol}\n"
+            f"PnL: +{upnl:,.0f} (сигнал развернулся, score={result.score})"
+        )
 
     async def _check_breakeven(self, trade: dict):
         """Move SL to entry when profit reaches breakeven_activation threshold."""
@@ -1316,6 +1395,89 @@ class TradingEngine:
             f"Таймфрейм: {tf} | Плечо: {lev_str}",
         ]
         return lines
+
+    async def get_open_positions_list(self) -> list[dict]:
+        """Return list of open positions with unrealized PnL for Telegram buttons."""
+        categories = self._get_categories()
+        result = []
+        for cat in categories:
+            if cat not in ("linear", "tbank"):
+                continue
+            if self.exchange_type == "tbank":
+                positions = self.client.get_positions()
+            else:
+                positions = self.client.get_positions(category=cat)
+            for p in positions:
+                result.append({
+                    "symbol": p["symbol"],
+                    "side": p["side"],
+                    "size": p["size"],
+                    "entry_price": p["entry_price"],
+                    "upnl": p.get("unrealised_pnl", 0),
+                    "category": cat,
+                })
+        return result
+
+    async def close_position(self, symbol: str) -> str:
+        """Close a single position by symbol."""
+        categories = self._get_categories()
+        closed = False
+        for cat in categories:
+            if cat not in ("linear", "tbank"):
+                continue
+            if self.exchange_type == "tbank":
+                positions = self.client.get_positions(symbol=symbol)
+            else:
+                positions = self.client.get_positions(symbol=symbol, category=cat)
+            for p in positions:
+                if p["symbol"] != symbol or p["size"] <= 0:
+                    continue
+                close_side = "Sell" if p["side"] == "Buy" else "Buy"
+                try:
+                    if self.exchange_type == "tbank":
+                        self.client.place_order(symbol=symbol, side=close_side, qty=p["size"])
+                    else:
+                        self.client.place_order(symbol=symbol, side=close_side, qty=p["size"], category=cat)
+                    closed = True
+                except Exception:
+                    logger.exception("Failed to close position %s", symbol)
+                    return f"❌ Ошибка при закрытии {symbol}"
+
+        if not closed:
+            return f"Позиция {symbol} не найдена на бирже."
+
+        # Update DB
+        open_trades = await self.db.get_open_trades()
+        for t in open_trades:
+            if t["symbol"] != symbol:
+                continue
+            try:
+                if self.exchange_type == "tbank":
+                    exit_price = self.client.get_last_price(symbol)
+                else:
+                    exit_price = self.client.get_last_price(symbol, category=t["category"])
+                if t["side"] == "Buy":
+                    pnl = (exit_price - t["entry_price"]) * t["qty"]
+                else:
+                    pnl = (t["entry_price"] - exit_price) * t["qty"]
+                await self.db.close_trade(t["id"], exit_price, pnl)
+                await self.db.update_daily_pnl(pnl)
+                balance = self.client.get_balance()
+                self.risk.record_pnl(pnl, balance)
+            except Exception:
+                logger.exception("Failed to update DB for %s", symbol)
+
+        direction = "ЛОНГ" if close_side == "Sell" else "ШОРТ"
+        currency = "RUB" if self.exchange_type == "tbank" else "USDT"
+        msg = f"❌ Закрыл {direction} {symbol}"
+        try:
+            pnl_val = pnl
+            msg += f"\nPnL: {pnl_val:+,.2f} {currency}"
+        except Exception:
+            pass
+        logger.info(msg)
+        await self._notify(msg)
+        return msg
 
     async def close_all_positions(self) -> str:
         categories = self._get_categories()

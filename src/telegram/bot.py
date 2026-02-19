@@ -227,20 +227,30 @@ class TelegramBot:
     async def _cmd_close_all(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not self._check_auth(update):
             return
-        # Show positions with PnL before confirming
+        # Show positions with individual close buttons
         text = await self.engine.get_positions_text()
         if "Нет открытых позиций" in text:
             await update.message.reply_text("Нет открытых позиций.", reply_markup=MAIN_KEYBOARD)
             return
 
-        keyboard = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("Да, закрыть всё", callback_data="confirm_close_all"),
-                InlineKeyboardButton("Отмена", callback_data="cancel"),
-            ]
+        # Build buttons: one per position + close all
+        positions = await self.engine.get_open_positions_list()
+        buttons = []
+        for p in positions:
+            direction = "L" if p["side"] == "Buy" else "S"
+            upnl = p.get("upnl", 0)
+            pnl_str = f"+{upnl:,.0f}" if upnl >= 0 else f"{upnl:,.0f}"
+            label = f"❌ {p['symbol']} {direction} ({pnl_str})"
+            buttons.append([InlineKeyboardButton(label, callback_data=f"close_{p['symbol']}")])
+
+        buttons.append([
+            InlineKeyboardButton("💥 Закрыть ВСЕ", callback_data="confirm_close_all"),
+            InlineKeyboardButton("Отмена", callback_data="cancel"),
         ])
+
+        keyboard = InlineKeyboardMarkup(buttons)
         await update.message.reply_text(
-            f"{text}\n\n❌ Закрыть все позиции?",
+            f"{text}\n\nВыбери сделку для закрытия:",
             reply_markup=keyboard,
         )
 
@@ -354,6 +364,21 @@ class TelegramBot:
                 await self.app.bot.send_message(
                     chat_id=self.chat_id,
                     text="❌ Ошибка при закрытии позиций. Проверь логи.",
+                    reply_markup=MAIN_KEYBOARD,
+                )
+
+        elif data.startswith("close_"):
+            symbol = data[6:]  # "close_BTCUSDT" -> "BTCUSDT"
+            logger.info("Closing position %s...", symbol)
+            await query.edit_message_text(f"⏳ Закрываю {symbol}...")
+            try:
+                result = await self.engine.close_position(symbol)
+                await self.app.bot.send_message(chat_id=self.chat_id, text=result, reply_markup=MAIN_KEYBOARD)
+            except Exception:
+                logger.exception("Error closing position %s", symbol)
+                await self.app.bot.send_message(
+                    chat_id=self.chat_id,
+                    text=f"❌ Ошибка при закрытии {symbol}. Проверь логи.",
                     reply_markup=MAIN_KEYBOARD,
                 )
 
