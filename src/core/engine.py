@@ -1536,6 +1536,87 @@ class TradingEngine:
         await self._notify(msg)
         return msg
 
+    async def get_pairs_text(self) -> str:
+        """Show pairs with total closed PnL and open position status."""
+        import aiosqlite
+        from pathlib import Path
+
+        currency = "RUB" if self.exchange_type == "tbank" else "USDT"
+        name = self.instance_name or "BOT"
+
+        # Get closed PnL per pair from main DB
+        pair_pnl: dict[str, float] = {}
+        pair_trades: dict[str, int] = {}
+        try:
+            db_path = self.db.db_path if hasattr(self.db, 'db_path') else self.config.get("database", {}).get("path", "")
+            if db_path:
+                async with aiosqlite.connect(str(db_path)) as db:
+                    db.row_factory = aiosqlite.Row
+                    cur = await db.execute(
+                        "SELECT symbol, COALESCE(SUM(pnl), 0) as total, COUNT(*) as cnt "
+                        "FROM trades WHERE status = 'closed' GROUP BY symbol"
+                    )
+                    for r in await cur.fetchall():
+                        pair_pnl[r["symbol"]] = float(r["total"])
+                        pair_trades[r["symbol"]] = int(r["cnt"])
+        except Exception:
+            pass
+
+        # Open positions
+        open_symbols = set()
+        try:
+            open_trades = await self.db.get_open_trades()
+            for t in open_trades:
+                open_symbols.add(t["symbol"])
+        except Exception:
+            pass
+
+        lines = [f"🪙 Пары [{name}]:"]
+        for pair in self.pairs:
+            pnl = pair_pnl.get(pair, 0)
+            cnt = pair_trades.get(pair, 0)
+            emoji = "🟢" if pnl >= 0 else "🔴"
+            open_mark = " 📍" if pair in open_symbols else ""
+            if cnt > 0:
+                lines.append(f"  {emoji} {pair}: {pnl:+,.0f} {currency} ({cnt} сделок){open_mark}")
+            else:
+                lines.append(f"  ⚪ {pair}: нет сделок{open_mark}")
+
+        # Other instances
+        for inst in self.config.get("other_instances", []):
+            inst_name = inst.get("name", "???")
+            db_path = inst.get("db_path", "")
+            is_tbank = "TBANK" in inst_name.upper()
+            inst_currency = "RUB" if is_tbank else "USDT"
+            inst_pairs = inst.get("pairs", [])
+            if not db_path or not Path(db_path).exists() or not inst_pairs:
+                continue
+            try:
+                async with aiosqlite.connect(db_path) as db:
+                    db.row_factory = aiosqlite.Row
+                    cur = await db.execute(
+                        "SELECT symbol, COALESCE(SUM(pnl), 0) as total, COUNT(*) as cnt "
+                        "FROM trades WHERE status = 'closed' GROUP BY symbol"
+                    )
+                    inst_pnl = {r["symbol"]: (float(r["total"]), int(r["cnt"])) for r in await cur.fetchall()}
+                    cur2 = await db.execute("SELECT DISTINCT symbol FROM trades WHERE status = 'open'")
+                    inst_open = {r["symbol"] for r in await cur2.fetchall()}
+            except Exception:
+                inst_pnl = {}
+                inst_open = set()
+
+            lines.append(f"\n🪙 Пары [{inst_name}]:")
+            for pair in inst_pairs:
+                pnl_val, cnt = inst_pnl.get(pair, (0, 0))
+                emoji = "🟢" if pnl_val >= 0 else "🔴"
+                open_mark = " 📍" if pair in inst_open else ""
+                if cnt > 0:
+                    lines.append(f"  {emoji} {pair}: {pnl_val:+,.0f} {inst_currency} ({cnt} сделок){open_mark}")
+                else:
+                    lines.append(f"  ⚪ {pair}: нет сделок{open_mark}")
+
+        return "\n".join(lines)
+
     async def get_positions_text(self) -> str:
         import aiosqlite
         from pathlib import Path

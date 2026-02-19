@@ -220,8 +220,7 @@ class TelegramBot:
     async def _cmd_pairs(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not self._check_auth(update):
             return
-        pairs = self.engine.pairs
-        text = "🪙 Торговые пары:\n" + "\n".join(f"  • {p}" for p in pairs)
+        text = await self.engine.get_pairs_text()
         await update.message.reply_text(text, reply_markup=MAIN_KEYBOARD)
 
     async def _cmd_close_all(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
