@@ -122,12 +122,48 @@ class Dashboard:
         wins = stats["wins"]
         exchange = self.config.get("exchange", "bybit")
         currency = "RUB" if exchange == "tbank" else "USDT"
+
+        # Total trades across all instances
+        all_trades = total
+        # TBank balance from other instances
+        tbank_balance = 0.0
+        for inst in self.config.get("other_instances", []):
+            db_path = inst.get("db_path", "")
+            inst_name = inst.get("name", "")
+            if db_path and Path(db_path).exists():
+                try:
+                    async with aiosqlite.connect(db_path) as db:
+                        db.row_factory = aiosqlite.Row
+                        cur = await db.execute("SELECT COUNT(*) as cnt FROM trades WHERE status='closed'")
+                        row = await cur.fetchone()
+                        if row:
+                            all_trades += int(row["cnt"])
+                except Exception:
+                    pass
+            # Get TBank balance from engine's other_instances
+            if "TBANK" in inst_name.upper() and self.engine:
+                try:
+                    from src.exchange.tbank_client import TBankClient
+                    import yaml
+                    svc = inst.get("service", "")
+                    cfg_map = {"stasik-tbank-scalp": "config/tbank_scalp.yaml", "stasik-tbank-swing": "config/tbank_swing.yaml"}
+                    cfg_path = cfg_map.get(svc)
+                    if cfg_path and Path(cfg_path).exists() and tbank_balance == 0:
+                        with open(cfg_path) as f:
+                            tcfg = yaml.safe_load(f)
+                        tc = TBankClient(tcfg)
+                        tbank_balance = tc.get_balance()
+                except Exception:
+                    pass
+
         data = {
             "balance": balance,
+            "tbank_balance": tbank_balance,
             "daily_pnl": daily_pnl,
             "total_pnl": total_pnl,
             "open_positions": len(open_trades),
             "total_trades": total,
+            "all_trades": all_trades,
             "wins": wins,
             "losses": stats["losses"],
             "win_rate": (wins / total * 100) if total > 0 else 0,
@@ -555,10 +591,13 @@ body{font-family:'Segoe UI',-apple-system,sans-serif;background:var(--bg);color:
   padding:16px 24px;display:flex;align-items:center;justify-content:space-between;
   position:sticky;top:0;z-index:100;backdrop-filter:blur(12px);
 }
-.header-left{display:flex;align-items:center;gap:12px}
+.header-left{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
 .header .icon{font-size:32px}
-.header h1{font-size:20px;font-weight:700;color:#fff}
+.header h1{font-size:20px;font-weight:700;color:#fff;white-space:nowrap}
 .header h1 span{color:var(--purple);font-weight:400}
+.header-stats{font-size:13px;color:var(--muted);display:flex;align-items:center;gap:6px;border-left:1px solid rgba(255,255,255,0.1);padding-left:12px;white-space:nowrap}
+.header-stats .hs-val{color:#fff;font-weight:600}
+.header-stats .hs-sep{color:rgba(255,255,255,0.15);margin:0 4px}
 .header-right{display:flex;align-items:center;gap:16px}
 #status-badge{
   padding:5px 14px;border-radius:20px;font-size:12px;font-weight:600;letter-spacing:0.5px;
@@ -694,6 +733,7 @@ tr:hover{background:rgba(99,102,241,0.06)}
   <div class="header-left">
     <div class="icon">🤖</div>
     <h1>Stasik <span>Trading Bot</span></h1>
+    <div class="header-stats" id="header-stats"></div>
   </div>
   <div class="header-right">
     <div id="status-badge" class="off">...</div>
@@ -703,7 +743,6 @@ tr:hover{background:rgba(99,102,241,0.06)}
 
 <div class="container">
   <div class="instances" id="instances"></div>
-  <div class="cards" id="stats"></div>
 
   <div class="chart-section">
     <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;flex-wrap:wrap;gap:10px">
@@ -807,14 +846,11 @@ async function loadStats(){
     const b=document.getElementById('status-badge');
     b.className=s.running?'on':'off';
     b.textContent=s.running?'РАБОТАЕТ':'ОСТАНОВЛЕН';
-    const cur=s.currency||'USDT';
-    document.getElementById('stats').innerHTML=`
-      <div class="card fade-in"><span class="card-icon">💰</span><h3>Баланс</h3><div class="val">${s.balance.toFixed(0)} ${cur}</div></div>
-      <div class="card fade-in"><span class="card-icon">📅</span><h3>За день</h3><div class="val ${cls(s.daily_pnl)}">${fmt(s.daily_pnl)} ${cur}</div></div>
-      <div class="card fade-in"><span class="card-icon">💎</span><h3>Всего PnL</h3><div class="val ${cls(s.total_pnl)}">${fmt(s.total_pnl)} ${cur}</div></div>
-      <div class="card fade-in"><span class="card-icon">🎯</span><h3>Win Rate</h3><div class="val">${s.win_rate.toFixed(1)}%</div></div>
-      <div class="card fade-in"><span class="card-icon">📊</span><h3>Позиции</h3><div class="val">${s.open_positions}</div></div>
-      <div class="card fade-in"><span class="card-icon">🔢</span><h3>Всего сделок</h3><div class="val">${s.total_trades}</div></div>`;
+    const tb=s.tbank_balance||0;
+    const hs=document.getElementById('header-stats');
+    hs.innerHTML=`Баланс: <span class="hs-val">${s.balance.toLocaleString('ru-RU',{maximumFractionDigits:0})} USDT</span>`
+      +(tb?` / <span class="hs-val">${tb.toLocaleString('ru-RU',{maximumFractionDigits:0})} RUB</span>`:'')
+      +`<span class="hs-sep">|</span>сделок: <span class="hs-val">${s.all_trades||s.total_trades}</span>`;
   }catch(e){console.error('stats',e)}
 }
 
