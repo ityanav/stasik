@@ -78,6 +78,8 @@ class TradingEngine:
 
         # Breakeven
         self._breakeven_done: set[int] = set()  # trade IDs that already moved to breakeven
+        # Close-at-profit watchlist: symbols to close as soon as PnL > 0
+        self._close_at_profit: set[str] = set()
         self._breakeven_activation: float = config["risk"].get("breakeven_activation", 0.5) / 100
 
         # Trading hours filter
@@ -239,7 +241,7 @@ class TradingEngine:
         # Calculate ATR for dynamic SL/TP
         atr = calculate_atr(df, self._atr_period)
 
-        result = self.signal_gen.generate(df)
+        result = self.signal_gen.generate(df, symbol)
 
         if result.signal == Signal.HOLD:
             return
@@ -617,6 +619,7 @@ class TradingEngine:
                 if not trade.get("partial_closed"):
                     await self._check_partial_close(trade)
                 await self._check_smart_exit(trade)
+                await self._check_close_at_profit(trade)
                 await self._check_trade_closed(trade)
             except Exception:
                 logger.exception("Error checking trade %s", trade["id"])
@@ -717,6 +720,60 @@ class TradingEngine:
         )
         logger.info(msg)
         await self._notify(msg)
+
+    async def _check_close_at_profit(self, trade: dict):
+        """Close position as soon as PnL > 0 (triggered by Telegram button)."""
+        symbol = trade["symbol"]
+        if symbol not in self._close_at_profit:
+            return
+
+        side = trade["side"]
+        entry = trade["entry_price"]
+        qty = trade["qty"]
+
+        try:
+            if self.exchange_type == "tbank":
+                cur_price = self.client.get_last_price(symbol)
+            else:
+                cur_price = self.client.get_last_price(symbol, category="linear")
+        except Exception:
+            return
+
+        if side == "Buy":
+            upnl = (cur_price - entry) * qty
+        else:
+            upnl = (entry - cur_price) * qty
+
+        if upnl <= 0:
+            return
+
+        # In profit — close it
+        close_side = "Sell" if side == "Buy" else "Buy"
+        try:
+            if self.exchange_type == "tbank":
+                self.client.place_order(symbol=symbol, side=close_side, qty=qty)
+            else:
+                self.client.place_order(symbol=symbol, side=close_side, qty=qty, category="linear")
+        except Exception:
+            logger.exception("Close-at-profit: failed to close %s", symbol)
+            return
+
+        self._close_at_profit.discard(symbol)
+        currency = "RUB" if self.exchange_type == "tbank" else "USDT"
+        direction = "ЛОНГ" if side == "Buy" else "ШОРТ"
+        logger.info("✅ Close-at-profit: закрыл %s %s при PnL +%.0f %s", direction, symbol, upnl, currency)
+        await self._notify(
+            f"✅ Закрыл {direction} {symbol} в плюсе\n"
+            f"PnL: +{upnl:,.0f} {currency}"
+        )
+
+    def add_close_at_profit(self, symbol: str) -> str:
+        """Add symbol to close-at-profit watchlist. Returns status message."""
+        self._close_at_profit.add(symbol)
+        return f"⏳ {symbol}: закрою как только PnL > 0"
+
+    def remove_close_at_profit(self, symbol: str):
+        self._close_at_profit.discard(symbol)
 
     async def _check_smart_exit(self, trade: dict):
         """Close trade early with small profit if signal reversed.
@@ -1398,8 +1455,13 @@ class TradingEngine:
 
     async def get_open_positions_list(self) -> list[dict]:
         """Return list of open positions with unrealized PnL for Telegram buttons."""
+        import aiosqlite
+        from pathlib import Path
+
         categories = self._get_categories()
         result = []
+
+        # Current engine positions
         for cat in categories:
             if cat not in ("linear", "tbank"):
                 continue
@@ -1415,64 +1477,200 @@ class TradingEngine:
                     "entry_price": p["entry_price"],
                     "upnl": p.get("unrealised_pnl", 0),
                     "category": cat,
+                    "instance": self.instance_name or "BOT",
                 })
+
+        # Other instances — open trades from DB
+        for inst in self.config.get("other_instances", []):
+            inst_name = inst.get("name", "???")
+            db_path = inst.get("db_path", "")
+            is_tbank = "TBANK" in inst_name.upper()
+            if db_path and Path(db_path).exists():
+                try:
+                    async with aiosqlite.connect(db_path) as db:
+                        db.row_factory = aiosqlite.Row
+                        cur = await db.execute(
+                            "SELECT symbol, side, entry_price, qty FROM trades WHERE status = 'open'"
+                        )
+                        rows = await cur.fetchall()
+                        if rows:
+                            symbols = [r["symbol"] for r in rows]
+                            prices = self._get_other_instance_prices(symbols, is_tbank)
+                            for r in rows:
+                                sym = r["symbol"]
+                                entry = r["entry_price"]
+                                qty_val = r["qty"]
+                                cur_price = prices.get(sym)
+                                upnl = 0.0
+                                if cur_price and entry > 0 and qty_val > 0:
+                                    if r["side"] == "Buy":
+                                        upnl = (cur_price - entry) * qty_val
+                                    else:
+                                        upnl = (entry - cur_price) * qty_val
+                                result.append({
+                                    "symbol": sym,
+                                    "side": r["side"],
+                                    "size": qty_val,
+                                    "entry_price": entry,
+                                    "upnl": upnl,
+                                    "category": "tbank" if is_tbank else "linear",
+                                    "instance": inst_name,
+                                })
+                except Exception:
+                    logger.warning("Failed to read positions from %s", inst_name, exc_info=True)
+
         return result
 
-    async def close_position(self, symbol: str) -> str:
-        """Close a single position by symbol."""
-        categories = self._get_categories()
-        closed = False
-        for cat in categories:
-            if cat not in ("linear", "tbank"):
-                continue
-            if self.exchange_type == "tbank":
-                positions = self.client.get_positions(symbol=symbol)
-            else:
-                positions = self.client.get_positions(symbol=symbol, category=cat)
-            for p in positions:
-                if p["symbol"] != symbol or p["size"] <= 0:
-                    continue
-                close_side = "Sell" if p["side"] == "Buy" else "Buy"
+    def _find_instance_for_symbol(self, symbol: str) -> dict | None:
+        """Find which other_instance owns a symbol by checking its DB."""
+        import sqlite3
+        from pathlib import Path
+        for inst in self.config.get("other_instances", []):
+            db_path = inst.get("db_path", "")
+            if db_path and Path(db_path).exists():
                 try:
-                    if self.exchange_type == "tbank":
+                    conn = sqlite3.connect(db_path)
+                    conn.row_factory = sqlite3.Row
+                    row = conn.execute(
+                        "SELECT id FROM trades WHERE symbol = ? AND status = 'open' LIMIT 1",
+                        (symbol,),
+                    ).fetchone()
+                    conn.close()
+                    if row:
+                        return inst
+                except Exception:
+                    pass
+        return None
+
+    def _get_tbank_client_for_instance(self, inst: dict):
+        """Create a temporary TBankClient for an other_instance."""
+        from pathlib import Path
+        config_map = {
+            "stasik-tbank-scalp": "config/tbank_scalp.yaml",
+            "stasik-tbank-swing": "config/tbank_swing.yaml",
+        }
+        service = inst.get("service", "")
+        config_path = config_map.get(service)
+        if not config_path or not Path(config_path).exists():
+            return None
+        import yaml
+        with open(config_path) as f:
+            cfg = yaml.safe_load(f)
+        from src.exchange.tbank_client import TBankClient
+        return TBankClient(cfg)
+
+    async def close_position(self, symbol: str) -> str:
+        """Close a single position by symbol (works across all instances)."""
+        import aiosqlite
+
+        # Determine if this symbol belongs to current engine or another instance
+        is_other = False
+        other_inst = None
+        other_client = None
+        other_db_path = None
+
+        # Try current engine first
+        closed = False
+        pnl = 0.0
+        close_side = "Buy"
+        is_tbank = self.exchange_type == "tbank"
+
+        try:
+            categories = self._get_categories()
+            for cat in categories:
+                if cat not in ("linear", "tbank"):
+                    continue
+                if is_tbank:
+                    positions = self.client.get_positions(symbol=symbol)
+                else:
+                    positions = self.client.get_positions(symbol=symbol, category=cat)
+                for p in positions:
+                    if p["symbol"] != symbol or p["size"] <= 0:
+                        continue
+                    close_side = "Sell" if p["side"] == "Buy" else "Buy"
+                    if is_tbank:
                         self.client.place_order(symbol=symbol, side=close_side, qty=p["size"])
                     else:
                         self.client.place_order(symbol=symbol, side=close_side, qty=p["size"], category=cat)
                     closed = True
+        except Exception:
+            # Symbol not on this exchange — check other instances
+            pass
+
+        if not closed:
+            # Check other instances
+            other_inst = self._find_instance_for_symbol(symbol)
+            if other_inst and "TBANK" in other_inst.get("name", "").upper():
+                try:
+                    other_client = self._get_tbank_client_for_instance(other_inst)
+                    if other_client:
+                        positions = other_client.get_positions(symbol=symbol)
+                        for p in positions:
+                            if p["symbol"] != symbol or p["size"] <= 0:
+                                continue
+                            close_side = "Sell" if p["side"] == "Buy" else "Buy"
+                            other_client.place_order(symbol=symbol, side=close_side, qty=p["size"])
+                            closed = True
+                            is_other = True
+                            is_tbank = True
                 except Exception:
-                    logger.exception("Failed to close position %s", symbol)
+                    logger.exception("Failed to close %s via other instance", symbol)
                     return f"❌ Ошибка при закрытии {symbol}"
 
         if not closed:
             return f"Позиция {symbol} не найдена на бирже."
 
-        # Update DB
-        open_trades = await self.db.get_open_trades()
-        for t in open_trades:
-            if t["symbol"] != symbol:
-                continue
+        # Update DB — current engine or other instance
+        db_path = other_inst["db_path"] if is_other and other_inst else None
+        if is_other and db_path:
             try:
-                if self.exchange_type == "tbank":
-                    exit_price = self.client.get_last_price(symbol)
-                else:
-                    exit_price = self.client.get_last_price(symbol, category=t["category"])
-                if t["side"] == "Buy":
-                    pnl = (exit_price - t["entry_price"]) * t["qty"]
-                else:
-                    pnl = (t["entry_price"] - exit_price) * t["qty"]
-                await self.db.close_trade(t["id"], exit_price, pnl)
-                await self.db.update_daily_pnl(pnl)
-                balance = self.client.get_balance()
-                self.risk.record_pnl(pnl, balance)
+                async with aiosqlite.connect(db_path) as db:
+                    db.row_factory = aiosqlite.Row
+                    cur = await db.execute(
+                        "SELECT id, side, entry_price, qty FROM trades WHERE symbol = ? AND status = 'open'",
+                        (symbol,),
+                    )
+                    rows = await cur.fetchall()
+                    for t in rows:
+                        exit_price = other_client.get_last_price(symbol) if other_client else 0
+                        if t["side"] == "Buy":
+                            pnl = (exit_price - t["entry_price"]) * t["qty"]
+                        else:
+                            pnl = (t["entry_price"] - exit_price) * t["qty"]
+                        await db.execute(
+                            "UPDATE trades SET status='closed', exit_price=?, pnl=?, closed_at=datetime('now') WHERE id=?",
+                            (exit_price, pnl, t["id"]),
+                        )
+                    await db.commit()
             except Exception:
-                logger.exception("Failed to update DB for %s", symbol)
+                logger.exception("Failed to update other instance DB for %s", symbol)
+        else:
+            open_trades = await self.db.get_open_trades()
+            for t in open_trades:
+                if t["symbol"] != symbol:
+                    continue
+                try:
+                    if is_tbank:
+                        exit_price = self.client.get_last_price(symbol)
+                    else:
+                        exit_price = self.client.get_last_price(symbol, category=t["category"])
+                    if t["side"] == "Buy":
+                        pnl = (exit_price - t["entry_price"]) * t["qty"]
+                    else:
+                        pnl = (t["entry_price"] - exit_price) * t["qty"]
+                    await self.db.close_trade(t["id"], exit_price, pnl)
+                    await self.db.update_daily_pnl(pnl)
+                    balance = self.client.get_balance()
+                    self.risk.record_pnl(pnl, balance)
+                except Exception:
+                    logger.exception("Failed to update DB for %s", symbol)
 
         direction = "ЛОНГ" if close_side == "Sell" else "ШОРТ"
-        currency = "RUB" if self.exchange_type == "tbank" else "USDT"
-        msg = f"❌ Закрыл {direction} {symbol}"
+        currency = "RUB" if is_tbank else "USDT"
+        inst_tag = f"[{other_inst['name']}] " if is_other and other_inst else ""
+        msg = f"❌ {inst_tag}Закрыл {direction} {symbol}"
         try:
-            pnl_val = pnl
-            msg += f"\nPnL: {pnl_val:+,.2f} {currency}"
+            msg += f"\nPnL: {pnl:+,.2f} {currency}"
         except Exception:
             pass
         logger.info(msg)

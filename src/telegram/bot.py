@@ -18,7 +18,7 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
     [
         [KeyboardButton("📊 Статус"), KeyboardButton("💰 PnL")],
         [KeyboardButton("📈 Позиции"), KeyboardButton("🪙 Пары")],
-        [KeyboardButton("❌ Закрыть сделки"), KeyboardButton("❓ Помощь")],
+        [KeyboardButton("⏹ СТОП ПЛЮС"), KeyboardButton("❓ Помощь")],
         [KeyboardButton("▶️ Старт"), KeyboardButton("🛑 Стоп")],
     ],
     resize_keyboard=True,
@@ -135,7 +135,7 @@ class TelegramBot:
             "💰 PnL": self._cmd_pnl,
             "📈 Позиции": self._cmd_positions,
             "🪙 Пары": self._cmd_pairs,
-            "❌ Закрыть сделки": self._cmd_close_all,
+            "⏹ СТОП ПЛЮС": self._cmd_stop_plus,
             "▶️ Старт": self._cmd_run,
             "🛑 Стоп": self._cmd_stop,
             "❓ Помощь": self._cmd_help,
@@ -215,7 +215,28 @@ class TelegramBot:
         if not self._check_auth(update):
             return
         text = await self.engine.get_positions_text()
-        await update.message.reply_text(text, reply_markup=MAIN_KEYBOARD)
+        positions = await self.engine.get_open_positions_list()
+        if positions:
+            buttons = []
+            for p in positions:
+                d = "L" if p["side"] == "Buy" else "S"
+                inst = p.get("instance", "")
+                upnl = p.get("upnl", 0)
+                pnl_str = f"+{upnl:,.0f}" if upnl >= 0 else f"{upnl:,.0f}"
+                tag = f"[{inst}] " if inst else ""
+                label = f"❌ {tag}{p['symbol']} {d} ({pnl_str})"
+                buttons.append([InlineKeyboardButton(label, callback_data=f"close_{p['symbol']}")])
+            buttons.append([
+                InlineKeyboardButton("💥 Закрыть ВСЕ", callback_data="confirm_close_all"),
+                InlineKeyboardButton("Отмена", callback_data="cancel"),
+            ])
+            keyboard = InlineKeyboardMarkup(buttons)
+            await update.message.reply_text(
+                f"{text}\n\nВыбери сделку для закрытия:",
+                reply_markup=keyboard,
+            )
+        else:
+            await update.message.reply_text(text, reply_markup=MAIN_KEYBOARD)
 
     async def _cmd_pairs(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not self._check_auth(update):
@@ -223,33 +244,32 @@ class TelegramBot:
         text = await self.engine.get_pairs_text()
         await update.message.reply_text(text, reply_markup=MAIN_KEYBOARD)
 
-    async def _cmd_close_all(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    async def _cmd_stop_plus(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not self._check_auth(update):
             return
-        # Show positions with individual close buttons
-        text = await self.engine.get_positions_text()
-        if "Нет открытых позиций" in text:
+        positions = await self.engine.get_open_positions_list()
+        if not positions:
             await update.message.reply_text("Нет открытых позиций.", reply_markup=MAIN_KEYBOARD)
             return
 
-        # Build buttons: one per position + close all
-        positions = await self.engine.get_open_positions_list()
         buttons = []
         for p in positions:
-            direction = "L" if p["side"] == "Buy" else "S"
+            d = "L" if p["side"] == "Buy" else "S"
+            sym = p["symbol"]
+            inst = p.get("instance", "")
             upnl = p.get("upnl", 0)
             pnl_str = f"+{upnl:,.0f}" if upnl >= 0 else f"{upnl:,.0f}"
-            label = f"❌ {p['symbol']} {direction} ({pnl_str})"
-            buttons.append([InlineKeyboardButton(label, callback_data=f"close_{p['symbol']}")])
-
-        buttons.append([
-            InlineKeyboardButton("💥 Закрыть ВСЕ", callback_data="confirm_close_all"),
-            InlineKeyboardButton("Отмена", callback_data="cancel"),
-        ])
+            tag = f"[{inst}] " if inst else ""
+            watching = sym in self.engine._close_at_profit
+            if watching:
+                label = f"⏳ {tag}{sym} {d} ({pnl_str}) — ожидаю +"
+            else:
+                label = f"✅ {tag}{sym} {d} ({pnl_str}) → продать в +"
+            buttons.append([InlineKeyboardButton(label, callback_data=f"profitclose_{sym}")])
 
         keyboard = InlineKeyboardMarkup(buttons)
         await update.message.reply_text(
-            f"{text}\n\nВыбери сделку для закрытия:",
+            "⏹ СТОП ПЛЮС\nВыбери позицию — закрою при PnL > 0:",
             reply_markup=keyboard,
         )
 
@@ -260,9 +280,9 @@ class TelegramBot:
             "🤖 Stasik Trading Bot\n\n"
             "📊 Статус — баланс, состояние\n"
             "💰 PnL — прибыль/убытки\n"
-            "📈 Позиции — открытые сделки\n"
+            "📈 Позиции — открытые сделки + закрытие\n"
             "🪙 Пары — торговые пары\n"
-            "❌ Закрыть сделки — закрыть все позиции\n"
+            "⏹ СТОП ПЛЮС — закрыть при любом плюсе\n"
             "▶️ Старт — запустить бота\n"
             "🛑 Стоп — остановить бота\n"
             "❓ Помощь — эта справка",
@@ -380,6 +400,15 @@ class TelegramBot:
                     text=f"❌ Ошибка при закрытии {symbol}. Проверь логи.",
                     reply_markup=MAIN_KEYBOARD,
                 )
+
+        elif data.startswith("profitclose_"):
+            symbol = data[len("profitclose_"):]
+            if symbol in self.engine._close_at_profit:
+                self.engine.remove_close_at_profit(symbol)
+                await query.edit_message_text(f"❌ {symbol} — снято с ожидания плюса")
+            else:
+                self.engine.add_close_at_profit(symbol)
+                await query.edit_message_text(f"⏳ {symbol} — закрою при любом плюсе (PnL > 0)")
 
         elif data == "cancel":
             await query.edit_message_text("Отменено.")

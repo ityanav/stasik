@@ -53,7 +53,8 @@ class SignalGenerator:
         self.min_score = strat["min_score"]
         self.patterns_enabled = strat.get("patterns_enabled", True)
 
-    def generate(self, df: pd.DataFrame) -> SignalResult:
+    def generate(self, df: pd.DataFrame, symbol: str = "?") -> SignalResult:
+        df.attrs["symbol"] = symbol
         scores: dict[str, int] = {}
 
         # ── RSI ───────────────────────────────────────────

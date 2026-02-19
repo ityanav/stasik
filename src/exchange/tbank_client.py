@@ -100,6 +100,17 @@ class TBankClient(ExchangeClient):
             # ── Init account ──
             if self.sandbox:
                 if not self.account_id:
+                    # Try to reuse existing sandbox account
+                    try:
+                        accounts = client.sandbox.get_sandbox_accounts()
+                        for acc in accounts.accounts:
+                            if acc.status.name == "ACCOUNT_STATUS_OPEN":
+                                self.account_id = acc.id
+                                logger.info("Reusing sandbox account: %s", self.account_id)
+                                break
+                    except Exception:
+                        pass
+                if not self.account_id:
                     resp = client.sandbox.open_sandbox_account()
                     self.account_id = resp.account_id
                     client.sandbox.sandbox_pay_in(
