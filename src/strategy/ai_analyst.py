@@ -81,8 +81,8 @@ REVIEW_PROMPT = """\
   * bb_period (10-30), bb_std (1.5-3.0)
   * vol_threshold (0.5-3.0)
   * min_score (1-4)
-  * stop_loss (0.5-3.0%), take_profit (1.0-5.0%)
-  * risk_per_trade (0.5-5.0%)
+  * risk_per_trade (0.5-2.0%)
+- НЕ МЕНЯЙ stop_loss и take_profit — они рассчитываются динамически через ATR.
 - Не меняй macd — его параметры стандартные.
 
 Отвечай СТРОГО в формате JSON (без markdown, без ```):
@@ -315,26 +315,44 @@ class AIAnalyst:
         return data["candidates"][0]["content"]["parts"][0]["text"].strip()
 
     async def _call_openai_compat(self, system: str, user: str) -> str:
+        import asyncio as _asyncio
+
         url = self._PROVIDER_URLS.get(self.provider, self._PROVIDER_URLS["openrouter"])
-        resp = await self._client.post(
-            url,
-            headers={
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": self.model,
-                "messages": [
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user},
-                ],
-                "temperature": 0.3,
-                "max_tokens": 700,
-            },
-        )
+        retries = [0, 2, 5]  # first attempt immediately, then 2s, 5s backoff
+
+        for attempt, delay in enumerate(retries):
+            if delay > 0:
+                logger.info("Groq 429 retry: attempt %d after %ds backoff", attempt + 1, delay)
+                await _asyncio.sleep(delay)
+
+            resp = await self._client.post(
+                url,
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": self.model,
+                    "messages": [
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": user},
+                    ],
+                    "temperature": 0.3,
+                    "max_tokens": 700,
+                },
+            )
+
+            if resp.status_code == 429 and attempt < len(retries) - 1:
+                logger.warning("Groq 429 rate limit (attempt %d/%d)", attempt + 1, len(retries))
+                continue
+
+            resp.raise_for_status()
+            data = resp.json()
+            return data["choices"][0]["message"]["content"].strip()
+
+        # Should not reach here, but just in case
         resp.raise_for_status()
-        data = resp.json()
-        return data["choices"][0]["message"]["content"].strip()
+        return ""
 
     # ── Parsing ────────────────────────────────────────────
 
@@ -397,9 +415,9 @@ class AIAnalyst:
             "bb_std": (1.5, 3.0),
             "vol_threshold": (1.0, 3.0),
             "min_score": (1, 4),
-            "stop_loss": (0.5, 3.0),
-            "take_profit": (1.0, 5.0),
-            "risk_per_trade": (1.0, 10.0),
+            # stop_loss/take_profit removed: ATR-based system manages SL/TP,
+            # AI review was flip-flopping these values destabilizing RR
+            "risk_per_trade": (0.5, 2.0),
         }
 
         validated = {}

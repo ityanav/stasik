@@ -464,6 +464,14 @@ class TradingEngine:
                 ai_sl = verdict.stop_loss
                 ai_tp = verdict.take_profit
                 ai_size_mult = verdict.position_size
+                # Validate AI SL/TP: ensure minimum RR of 1.5:1
+                if ai_sl is not None and ai_tp is not None and ai_sl > 0:
+                    rr = ai_tp / ai_sl
+                    if rr < 1.5:
+                        logger.info("AI RR too low (%.2f:1, SL=%.1f%% TP=%.1f%%) — using ATR values",
+                                    rr, ai_sl, ai_tp)
+                        ai_sl = None
+                        ai_tp = None
                 logger.info("AI confirmed %s %s — confidence %d/10", side, symbol, verdict.confidence)
 
         await self._open_trade(
