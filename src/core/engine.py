@@ -646,6 +646,7 @@ class TradingEngine:
             ai_size_mult=ai_size_mult,
             atr=atr,
             is_scale_in=is_scale_in,
+            df=df,
         )
 
     async def _open_trade(
@@ -656,6 +657,7 @@ class TradingEngine:
         ai_size_mult: float | None = None,
         atr: float | None = None,
         is_scale_in: bool = False,
+        df=None,
     ):
         price = self.client.get_last_price(symbol, category=category)
         balance = self.client.get_balance()
@@ -669,8 +671,20 @@ class TradingEngine:
             )
 
         info = self._get_instrument_info(symbol, category)
-        # Use ATR SL% for adaptive position sizing
-        sizing_sl = atr_sl_pct if atr_sl_pct else None
+        # Use Kotegawa SL% or ATR SL% for adaptive position sizing
+        if isinstance(self.signal_gen, KotegawaGenerator) and df is not None and len(df) >= 10:
+            lookback = self.config.get("strategy", {}).get("kotegawa_sl_lookback", 10)
+            sl_buffer = self.config.get("strategy", {}).get("kotegawa_sl_buffer", 0.2)
+            recent = df.tail(lookback)
+            if side == "Buy":
+                swing_low = recent["low"].min()
+                pre_sl = swing_low * (1 - sl_buffer / 100)
+            else:
+                swing_high = recent["high"].max()
+                pre_sl = swing_high * (1 + sl_buffer / 100)
+            sizing_sl = abs(price - pre_sl) / price
+        else:
+            sizing_sl = atr_sl_pct if atr_sl_pct else None
         qty = self.risk.calculate_position_size(
             balance=balance,
             price=price,
@@ -701,11 +715,41 @@ class TradingEngine:
             logger.info("Position size too small for %s, skipping", symbol)
             return
 
-        # SL/TP priority: AI > ATR > fixed
+        # SL/TP priority: Kotegawa (recent low/high) > AI > ATR > fixed
         sl_source = "fixed"
         tp_source = "fixed"
 
-        if ai_sl_pct is not None and 0.3 <= ai_sl_pct <= 5.0:
+        # Kotegawa SL: behind recent low (Buy) / recent high (Sell)
+        kotegawa_sl = None
+        if isinstance(self.signal_gen, KotegawaGenerator) and df is not None and len(df) >= 10:
+            lookback = self.config.get("strategy", {}).get("kotegawa_sl_lookback", 10)
+            sl_buffer = self.config.get("strategy", {}).get("kotegawa_sl_buffer", 0.2)  # 0.2% запас
+            recent = df.tail(lookback)
+            if side == "Buy":
+                swing_low = recent["low"].min()
+                kotegawa_sl = swing_low * (1 - sl_buffer / 100)
+            else:
+                swing_high = recent["high"].max()
+                kotegawa_sl = swing_high * (1 + sl_buffer / 100)
+            kotegawa_sl = round(kotegawa_sl, 6)
+            # Clamp: SL не дальше atr_sl_max от цены
+            sl_max_pct = self.config.get("risk", {}).get("atr_sl_max", 10.0) / 100
+            if side == "Buy":
+                min_sl = price * (1 - sl_max_pct)
+                if kotegawa_sl < min_sl:
+                    logger.info("Котегава SL clamped: %.6f → %.6f (max %.1f%%)", kotegawa_sl, min_sl, sl_max_pct * 100)
+                    kotegawa_sl = round(min_sl, 6)
+            else:
+                max_sl = price * (1 + sl_max_pct)
+                if kotegawa_sl > max_sl:
+                    logger.info("Котегава SL clamped: %.6f → %.6f (max %.1f%%)", kotegawa_sl, max_sl, sl_max_pct * 100)
+                    kotegawa_sl = round(max_sl, 6)
+
+        if kotegawa_sl is not None:
+            sl = kotegawa_sl
+            sl_dist_pct = abs(price - sl) / price * 100
+            sl_source = f"Котегава:low/high({sl_dist_pct:.2f}%)"
+        elif ai_sl_pct is not None and 0.3 <= ai_sl_pct <= 5.0:
             sl = price * (1 - ai_sl_pct / 100) if side == "Buy" else price * (1 + ai_sl_pct / 100)
             sl = round(sl, 6)
             sl_source = f"AI:{ai_sl_pct:.1f}%"
@@ -2590,11 +2634,23 @@ class TradingEngine:
                     target_pnl = (entry - tp) * size
                 target_line = f"\n   Цель (TP): {tp:,.4f} ({target_pnl:+,.0f} {currency})"
 
+            # Stop-loss line
+            sl_line = ""
+            sl = t.get("stop_loss")
+            if sl and sl > 0 and mark > 0:
+                if side == "Buy":
+                    sl_pct = (sl / mark - 1) * 100
+                    sl_pnl = (sl - entry) * size
+                else:
+                    sl_pct = (1 - sl / mark) * 100
+                    sl_pnl = (entry - sl) * size
+                sl_line = f"\n   Стоп-лосс: {sl:,.4f} ({sl_pct:+.1f}%, {sl_pnl:+,.0f} {currency})"
+
             emoji = "🟢" if upnl >= 0 else "🔴"
             lines.append(
                 f"{emoji} {direction} {sym}\n"
                 f"   Вход: {entry}  →  Сейчас: {mark}\n"
-                f"   Объём: {size} | PnL: ({pnl_pct:+.2f}%, {upnl:+,.2f} {currency}){target_line}\n"
+                f"   Объём: {size} | PnL: ({pnl_pct:+.2f}%, {upnl:+,.2f} {currency}){target_line}{sl_line}\n"
             )
 
         # Other instances — open trades from DB with live prices
@@ -2610,7 +2666,7 @@ class TradingEngine:
                     async with aiosqlite.connect(db_path) as db:
                         db.row_factory = aiosqlite.Row
                         cur = await db.execute(
-                            "SELECT symbol, side, entry_price, qty FROM trades WHERE status = 'open'"
+                            "SELECT symbol, side, entry_price, qty, stop_loss FROM trades WHERE status = 'open'"
                         )
                         rows = await cur.fetchall()
                         if rows:
@@ -2660,11 +2716,23 @@ class TradingEngine:
                                                 target_line = f"\n   Цель ({ratio_pct}% SMA): {target:,.4f} ({t_pct:+.1f}%, {t_pnl:+,.0f} {inst_currency})"
                                     except Exception:
                                         pass
+                                    # Stop-loss line
+                                    sl_line = ""
+                                    sl = r["stop_loss"] if r["stop_loss"] else 0
+                                    if sl and sl > 0 and cur_price > 0:
+                                        if r["side"] == "Buy":
+                                            sl_pct = (sl / cur_price - 1) * 100
+                                            sl_pnl = (sl - entry) * qty_val
+                                        else:
+                                            sl_pct = (1 - sl / cur_price) * 100
+                                            sl_pnl = (entry - sl) * qty_val
+                                        sl_line = f"\n   Стоп-лосс: {sl:,.4f} ({sl_pct:+.1f}%, {sl_pnl:+,.0f} {inst_currency})"
+
                                     emoji = "🟢" if upnl >= 0 else "🔴"
                                     lines.append(
                                         f"{emoji} {direction} {sym}\n"
                                         f"   Вход: {entry}  →  Сейчас: {cur_price}\n"
-                                        f"   Объём: {qty_val} | PnL: ({pnl_pct:+.2f}%, {upnl:+,.2f} {inst_currency}){target_line}\n"
+                                        f"   Объём: {qty_val} | PnL: ({pnl_pct:+.2f}%, {upnl:+,.2f} {inst_currency}){target_line}{sl_line}\n"
                                     )
                                 else:
                                     lines.append(
