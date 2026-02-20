@@ -1983,24 +1983,34 @@ class TradingEngine:
         categories = self._get_categories()
         result = []
 
-        # Current engine positions
-        for cat in categories:
-            if cat not in ("linear", "tbank"):
-                continue
-            if self.exchange_type == "tbank":
-                positions = self.client.get_positions()
-            else:
-                positions = self.client.get_positions(category=cat)
-            for p in positions:
-                result.append({
-                    "symbol": p["symbol"],
-                    "side": p["side"],
-                    "size": p["size"],
-                    "entry_price": p["entry_price"],
-                    "upnl": p.get("unrealised_pnl", 0),
-                    "category": cat,
-                    "instance": self.instance_name or "BOT",
-                })
+        # Current engine positions — from own DB, enriched with live price
+        own_trades = await self.db.get_open_trades()
+        for t in own_trades:
+            sym = t["symbol"]
+            entry = t["entry_price"]
+            qty_val = t["qty"]
+            side = t["side"]
+            upnl = 0.0
+            try:
+                if self.exchange_type == "tbank":
+                    cur_price = self.client.get_last_price(sym)
+                else:
+                    cur_price = self.client.get_last_price(sym, category="linear")
+                if side == "Buy":
+                    upnl = (cur_price - entry) * qty_val
+                else:
+                    upnl = (entry - cur_price) * qty_val
+            except Exception:
+                pass
+            result.append({
+                "symbol": sym,
+                "side": side,
+                "size": qty_val,
+                "entry_price": entry,
+                "upnl": upnl,
+                "category": t["category"],
+                "instance": self.instance_name or "BOT",
+            })
 
         # Other instances — open trades from DB
         for inst in self.config.get("other_instances", []):
@@ -2503,33 +2513,41 @@ class TradingEngine:
         total_pnl = 0.0
         has_positions = False
 
-        # Current engine positions
-        for cat in categories:
-            if cat in ("linear", "tbank"):
+        # Current engine positions — from own DB, enriched with live price
+        own_trades = await self.db.get_open_trades()
+        if own_trades:
+            has_positions = True
+            lines.append(f"━━━ [{name}] ━━━")
+        for t in own_trades:
+            sym = t["symbol"]
+            entry = t["entry_price"]
+            size = t["qty"]
+            side = t["side"]
+            direction = "ЛОНГ" if side == "Buy" else "ШОРТ"
+            upnl = 0.0
+            mark = 0.0
+            try:
                 if self.exchange_type == "tbank":
-                    positions = self.client.get_positions()
+                    mark = self.client.get_last_price(sym)
                 else:
-                    positions = self.client.get_positions(category=cat)
-                if positions:
-                    has_positions = True
-                    lines.append(f"━━━ [{name}] ━━━")
-                for p in positions:
-                    direction = "ЛОНГ" if p["side"] == "Buy" else "ШОРТ"
-                    upnl = p["unrealised_pnl"]
-                    total_pnl += upnl
-                    entry = p["entry_price"]
-                    mark = p.get("mark_price", 0)
-                    size = p["size"]
-                    if entry > 0 and size > 0:
-                        pnl_pct = (upnl / (entry * size)) * 100
-                    else:
-                        pnl_pct = 0.0
-                    emoji = "🟢" if upnl >= 0 else "🔴"
-                    lines.append(
-                        f"{emoji} {direction} {p['symbol']}\n"
-                        f"   Вход: {entry}  →  Сейчас: {mark}\n"
-                        f"   Объём: {size} | PnL: {upnl:+,.2f} {currency} ({pnl_pct:+.2f}%)"
-                    )
+                    mark = self.client.get_last_price(sym, category="linear")
+                if side == "Buy":
+                    upnl = (mark - entry) * size
+                else:
+                    upnl = (entry - mark) * size
+            except Exception:
+                pass
+            total_pnl += upnl
+            if entry > 0 and size > 0:
+                pnl_pct = (upnl / (entry * size)) * 100
+            else:
+                pnl_pct = 0.0
+            emoji = "🟢" if upnl >= 0 else "🔴"
+            lines.append(
+                f"{emoji} {direction} {sym}\n"
+                f"   Вход: {entry}  →  Сейчас: {mark}\n"
+                f"   Объём: {size} | PnL: {upnl:+,.2f} {currency} ({pnl_pct:+.2f}%)"
+            )
 
         # Other instances — open trades from DB with live prices
         tbank_pnl = 0.0
