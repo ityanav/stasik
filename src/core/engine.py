@@ -1921,6 +1921,33 @@ class TradingEngine:
                 logger.debug("Failed to get T-Bank prices from %s", cfg_name, exc_info=True)
         return {}
 
+    def _get_tbank_klines(self, symbol: str, interval: str, limit: int = 100):
+        """Get klines for a T-Bank symbol by borrowing token from tbank config."""
+        import yaml
+        from pathlib import Path
+        for cfg_name in ("config/tbank_scalp.yaml", "config/tbank_swing.yaml"):
+            cfg_path = Path("/root/stasik") / cfg_name
+            if not cfg_path.exists():
+                continue
+            try:
+                with open(cfg_path) as f:
+                    tbank_cfg = yaml.safe_load(f)
+                token = tbank_cfg.get("tbank", {}).get("token", "")
+                if not token or token == "YOUR_TOKEN_HERE":
+                    continue
+                sandbox = tbank_cfg.get("tbank", {}).get("sandbox", True)
+                from src.exchange.tbank_client import TBankClient
+                # Minimal config just for klines
+                mini_cfg = {
+                    "tbank": {"token": token, "sandbox": sandbox, "account_id": "", "commission_rate": 0.0004},
+                    "trading": {"pairs": [symbol], "instrument_type": "share"},
+                }
+                tc = TBankClient(mini_cfg)
+                return tc.get_klines(symbol, interval, limit=limit)
+            except Exception:
+                logger.debug("Failed to get T-Bank klines for %s from %s", symbol, cfg_name, exc_info=True)
+        return None
+
     async def _get_daily_total_pnl(self) -> float:
         """Get total daily PnL across all instances (for short notifications)."""
         daily_map = await self._get_all_daily_pnl()
@@ -2698,8 +2725,10 @@ class TradingEngine:
                                         inst_tf = inst.get("timeframe", self.timeframe)
                                         # Normalize timeframe: "1м" -> "1", "15м" -> "15"
                                         inst_tf = inst_tf.replace("м", "").replace("m", "")
-                                        inst_cat = "tbank" if is_tbank else "linear"
-                                        df = self.client.get_klines(sym, inst_tf, limit=100, category=inst_cat)
+                                        if is_tbank:
+                                            df = self._get_tbank_klines(sym, inst_tf, limit=100)
+                                        else:
+                                            df = self.client.get_klines(sym, inst_tf, limit=100, category="linear")
                                         if df is not None and not df.empty:
                                             sma = calculate_sma(df, 25)
                                             sma_val = sma.iloc[-1]
