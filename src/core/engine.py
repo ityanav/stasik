@@ -2,7 +2,7 @@ import asyncio
 import logging
 import math
 import time
-from datetime import datetime
+from datetime import date, datetime
 
 import httpx
 import pandas as pd
@@ -12,7 +12,7 @@ from src.risk.manager import RiskManager
 from src.storage.database import Database
 from src.strategy.ai_analyst import AIAnalyst, extract_indicator_values, format_risk_text, summarize_candles
 from src.strategy.indicators import calculate_atr
-from src.strategy.signals import Signal, SignalGenerator, SignalResult, Trend
+from src.strategy.signals import KotegawaGenerator, Signal, SignalGenerator, SignalResult, Trend
 
 logger = logging.getLogger(__name__)
 
@@ -23,7 +23,7 @@ class TradingEngine:
         self.instance_name = config.get("instance_name", "")
         self.exchange_type = config.get("exchange", "bybit")
         self.client = self._create_client(config)
-        self.signal_gen = SignalGenerator(config)
+        self.signal_gen = self._create_signal_gen(config)
         self.risk = RiskManager(config)
         if db_path:
             from pathlib import Path
@@ -81,6 +81,7 @@ class TradingEngine:
         # Close-at-profit watchlist: symbols to close as soon as PnL > 0
         self._close_at_profit: set[str] = set()
         self._breakeven_activation: float = config["risk"].get("breakeven_activation", 0.5) / 100
+        self._halt_closed: bool = False  # flag: already closed positions on halt
 
         # Trading hours filter
         trading_hours = config["trading"].get("trading_hours")
@@ -120,6 +121,14 @@ class TradingEngine:
         else:
             from src.exchange.client import BybitClient
             return BybitClient(config)
+
+    @staticmethod
+    def _create_signal_gen(config: dict):
+        mode = config.get("strategy", {}).get("strategy_mode", "trend")
+        if mode == "kotegawa":
+            logger.info("Strategy mode: Kotegawa (mean reversion)")
+            return KotegawaGenerator(config)
+        return SignalGenerator(config)
 
     def _update_market_bias(self):
         """Detect market regime from BTC daily chart (EMA20 vs EMA50 + price position)."""
@@ -181,10 +190,120 @@ class TradingEngine:
             for pair in self.pairs:
                 self.client.set_leverage(pair, self.leverage, category="linear")
 
+        # Restore daily PnL from DB so loss limit isn't bypassed after restart
+        today_pnl = await self.db.get_daily_pnl()
+        self.risk._daily_pnl = today_pnl
+        if today_pnl != 0:
+            logger.info("Restored daily PnL: %.2f", today_pnl)
+
+        # Restore cooldowns from recent losing trades closed today
+        await self._restore_cooldowns()
+
+        # Reconcile exchange positions with DB
+        await self._reconcile_positions()
+
         await self._notify("🚀 Бот запущен\nПары: " + ", ".join(self.pairs))
         logger.info("Trading engine started")
 
         await self._run_loop()
+
+    async def _restore_cooldowns(self):
+        """Restore cooldowns from trades closed today with negative PnL."""
+        if self._cooldown_seconds <= 0:
+            return
+        try:
+            today_start = datetime.utcnow().replace(hour=0, minute=0, second=0).isoformat()
+            cursor = await self.db._db.execute(
+                "SELECT symbol, closed_at FROM trades "
+                "WHERE status = 'closed' AND pnl < 0 AND closed_at >= ?",
+                (today_start,),
+            )
+            rows = await cursor.fetchall()
+            now = time.time()
+            restored = 0
+            for row in rows:
+                symbol = row["symbol"]
+                closed_at = datetime.fromisoformat(row["closed_at"])
+                cooldown_until = closed_at.timestamp() + self._cooldown_seconds
+                if cooldown_until > now:
+                    self._cooldowns[symbol] = cooldown_until
+                    remaining = int(cooldown_until - now)
+                    logger.info("Restored cooldown %s: %ds remaining", symbol, remaining)
+                    restored += 1
+            if restored:
+                logger.info("Restored %d cooldowns", restored)
+        except Exception:
+            logger.warning("Failed to restore cooldowns", exc_info=True)
+
+    async def _reconcile_positions(self):
+        """Reconcile exchange positions with DB after restart."""
+        try:
+            # Get all positions from exchange
+            if self.exchange_type == "tbank":
+                exchange_positions = self.client.get_positions()
+            else:
+                exchange_positions = self.client.get_positions(category="linear")
+
+            # Get all open trades from DB
+            db_open = await self.db.get_open_trades()
+
+            # Build lookup: symbol -> exchange position
+            exch_by_symbol = {}
+            for p in exchange_positions:
+                if p["size"] > 0:
+                    key = (p["symbol"], p["side"])
+                    exch_by_symbol[key] = p
+
+            closed_count = 0
+            recovered_count = 0
+            synced_count = 0
+
+            # DB→Exchange: DB says open, exchange doesn't have it
+            for trade in db_open:
+                key = (trade["symbol"], trade["side"])
+                if key in exch_by_symbol:
+                    synced_count += 1
+                else:
+                    logger.info(
+                        "Reconciliation: closing orphan DB trade #%d %s %s (not on exchange)",
+                        trade["id"], trade["side"], trade["symbol"],
+                    )
+                    try:
+                        await self._check_trade_closed(trade)
+                        closed_count += 1
+                    except Exception:
+                        logger.exception("Failed to close orphan trade #%d", trade["id"])
+
+            # Exchange→DB: exchange has position, DB doesn't
+            # Only warn — don't auto-insert, because multiple instances
+            # share the same exchange account and the position may belong
+            # to another instance.
+            untracked_count = 0
+            db_symbols = {(t["symbol"], t["side"]) for t in db_open}
+            for key, pos in exch_by_symbol.items():
+                symbol, side = key
+                if symbol not in self.pairs:
+                    continue
+                if key not in db_symbols:
+                    untracked_count += 1
+                    logger.warning(
+                        "Reconciliation: untracked exchange position %s %s "
+                        "(size=%.4f, entry=%.4f) — may belong to another instance",
+                        side, symbol, pos["size"], pos["entry_price"],
+                    )
+
+            if untracked_count:
+                await self._notify(
+                    f"⚠️ Reconciliation: {untracked_count} позиций на бирже "
+                    f"не найдены в БД (возможно, другой инстанс)"
+                )
+
+            logger.info(
+                "Reconciliation complete: %d synced, %d closed, %d untracked",
+                synced_count, closed_count, untracked_count,
+            )
+        except Exception:
+            logger.exception("Position reconciliation failed")
 
     async def stop(self):
         """Pause trading loop. DB and AI stay open for resume()."""
@@ -225,6 +344,11 @@ class TradingEngine:
             logger.info("Swing mode: TF=%s, candle=%ds, check every %ds",
                         self.timeframe, interval_sec, check_interval)
             interval_sec = check_interval
+        # Custom tick interval (faster than candle close)
+        tick_override = self.config["trading"].get("tick_interval", 0)
+        if tick_override > 0 and tick_override < interval_sec:
+            logger.info("Fast tick: %ds (candle %ds)", tick_override, interval_sec)
+            interval_sec = tick_override
         review_every = self.ai_analyst.review_interval  # in ticks (minutes)
         while self._running:
             try:
@@ -240,8 +364,13 @@ class TradingEngine:
 
     async def _tick(self):
         if self.risk.is_halted:
-            logger.info("Trading halted — daily loss limit")
+            if not self._halt_closed:
+                self._halt_closed = True
+                logger.warning("Daily loss limit — closing all positions")
+                await self._close_all_on_halt()
             return
+        else:
+            self._halt_closed = False
 
         # Update market bias (cached, ~1 call/hour)
         self._update_market_bias()
@@ -306,7 +435,15 @@ class TradingEngine:
         # Calculate ATR for dynamic SL/TP
         atr = calculate_atr(df, self._atr_period)
 
-        result = self.signal_gen.generate(df, symbol)
+        # Fetch order book (if enabled)
+        orderbook = None
+        if self.config.get("strategy", {}).get("orderbook_enabled", False):
+            try:
+                orderbook = self.client.get_orderbook(symbol, limit=50, category=category)
+            except Exception:
+                logger.debug("Failed to fetch orderbook for %s", symbol)
+
+        result = self.signal_gen.generate(df, symbol, orderbook=orderbook)
 
         # Apply market bias: adjust score based on BTC daily trend
         original_score = result.score
@@ -348,12 +485,14 @@ class TradingEngine:
             return
 
         # HTF trend filter: block counter-trend trades unless signal is strong (score >= 2)
-        if htf_trend == Trend.BEARISH and result.signal == Signal.BUY and abs(result.score) < 2:
-            logger.info("HTF фильтр: отклонён BUY %s (тренд HTF медвежий, score=%d)", symbol, result.score)
-            return
-        if htf_trend == Trend.BULLISH and result.signal == Signal.SELL and abs(result.score) < 2:
-            logger.info("HTF фильтр: отклонён SELL %s (тренд HTF бычий, score=%d)", symbol, result.score)
-            return
+        # Skip HTF filter if disabled in config (for aggressive meme trading)
+        if self.config.get("strategy", {}).get("htf_filter", True):
+            if htf_trend == Trend.BEARISH and result.signal == Signal.BUY and abs(result.score) < 2:
+                logger.info("HTF фильтр: отклонён BUY %s (тренд HTF медвежий, score=%d)", symbol, result.score)
+                return
+            if htf_trend == Trend.BULLISH and result.signal == Signal.SELL and abs(result.score) < 2:
+                logger.info("HTF фильтр: отклонён SELL %s (тренд HTF бычий, score=%d)", symbol, result.score)
+                return
 
         # Fear & Greed Index filter (crypto only)
         fng_value = await self._get_fear_greed() if self.exchange_type == "bybit" else None
@@ -421,6 +560,18 @@ class TradingEngine:
             candles_text = summarize_candles(df)
             risk_text = format_risk_text(self.config)
 
+            # Orderbook context for AI
+            if orderbook and (orderbook.get("bids") or orderbook.get("asks")):
+                from src.strategy.indicators import analyze_orderbook
+                ob = analyze_orderbook(orderbook)
+                ob_text = (
+                    f"Bid vol: {ob['bid_vol']:,.0f} | Ask vol: {ob['ask_vol']:,.0f} | "
+                    f"Imbalance: {ob['imbalance']:+.1%} ({'покупатели' if ob['imbalance'] > 0 else 'продавцы'})"
+                )
+                if ob["walls"]:
+                    ob_text += f"\nСтенки: {ob['walls']}"
+                indicator_text += f"\n\nСтакан (orderbook):\n{ob_text}"
+
             # Multi-TF context
             mtf_data = self._get_mtf_data(symbol, category)
 
@@ -457,7 +608,9 @@ class TradingEngine:
                     f"Причина: {verdict.reasoning}"
                 )
                 logger.info(msg)
-                await self._notify(msg)
+                # Notify only if not notify_only (SCALP sends, DEGEN/SWING skip reject spam)
+                if not self.config.get("telegram", {}).get("notify_only", False):
+                    await self._notify(msg)
                 return
             else:
                 ai_reasoning = f"🤖 AI ({verdict.confidence}/10): {verdict.reasoning}"
@@ -701,7 +854,7 @@ class TradingEngine:
             return
 
         # Rebuild signal generator with new parameters
-        self.signal_gen = SignalGenerator(self.config)
+        self.signal_gen = self._create_signal_gen(self.config)
         # Update risk manager SL/TP if changed
         if "stop_loss" in update.changes:
             self.risk.stop_loss_pct = update.changes["stop_loss"] / 100
@@ -735,6 +888,8 @@ class TradingEngine:
                 if not trade.get("partial_closed"):
                     await self._check_partial_close(trade)
                 await self._check_smart_exit(trade)
+                await self._check_profit_target(trade)
+                await self._check_loss_target(trade)
                 await self._check_close_at_profit(trade)
                 await self._check_trade_closed(trade)
             except Exception:
@@ -891,6 +1046,135 @@ class TradingEngine:
     def remove_close_at_profit(self, symbol: str):
         self._close_at_profit.discard(symbol)
 
+    async def _check_profit_target(self, trade: dict):
+        """Close trade when unrealized PnL reaches profit_target_usd.
+
+        Config (risk section):
+          profit_target_usd: 50   # close when uPnL >= $50
+        """
+        risk_cfg = self.config.get("risk", {})
+        target = risk_cfg.get("profit_target_usd", 0)
+        if target <= 0:
+            return  # feature disabled
+
+        symbol = trade["symbol"]
+        side = trade["side"]
+        entry = trade["entry_price"]
+        qty = trade["qty"]
+
+        # Get current price
+        try:
+            if self.exchange_type == "tbank":
+                cur_price = self.client.get_last_price(symbol)
+            else:
+                cur_price = self.client.get_last_price(symbol, category="linear")
+        except Exception:
+            return
+
+        # Calculate unrealized PnL
+        if side == "Buy":
+            upnl = (cur_price - entry) * qty
+        else:
+            upnl = (entry - cur_price) * qty
+
+        if upnl < target:
+            return
+
+        # Close the position
+        close_side = "Sell" if side == "Buy" else "Buy"
+        try:
+            if self.exchange_type == "tbank":
+                self.client.place_order(symbol=symbol, side=close_side, qty=qty)
+            else:
+                self.client.place_order(symbol=symbol, side=close_side, qty=qty, category="linear")
+        except Exception:
+            logger.exception("Profit target: failed to close %s", symbol)
+            return
+
+        # Update DB
+        exit_price = cur_price
+        actual_pnl = upnl
+        try:
+            balance = self.client.get_balance()
+            await self.db.close_trade(trade["id"], exit_price, actual_pnl)
+            await self.db.update_daily_pnl(actual_pnl)
+            self.risk.record_pnl(actual_pnl, balance)
+        except Exception:
+            logger.exception("Profit target: DB update failed for %s", symbol)
+
+        direction = "ЛОНГ" if side == "Buy" else "ШОРТ"
+        logger.info(
+            "💰 Profit target: закрыл %s %s при PnL +%.0f (цель: %d)",
+            direction, symbol, upnl, target,
+        )
+        await self._notify(
+            f"💰 Profit target: закрыл {direction} {symbol}\n"
+            f"PnL: +{upnl:,.0f} USDT (цель: {target}$)"
+        )
+
+    async def _check_loss_target(self, trade: dict):
+        """Close trade when unrealized loss reaches loss_target_usd.
+
+        Config (risk section):
+          loss_target_usd: 50   # close when uPnL <= -$50
+        """
+        risk_cfg = self.config.get("risk", {})
+        target = risk_cfg.get("loss_target_usd", 0)
+        if target <= 0:
+            return  # feature disabled
+
+        symbol = trade["symbol"]
+        side = trade["side"]
+        entry = trade["entry_price"]
+        qty = trade["qty"]
+
+        try:
+            if self.exchange_type == "tbank":
+                cur_price = self.client.get_last_price(symbol)
+            else:
+                cur_price = self.client.get_last_price(symbol, category="linear")
+        except Exception:
+            return
+
+        if side == "Buy":
+            upnl = (cur_price - entry) * qty
+        else:
+            upnl = (entry - cur_price) * qty
+
+        if upnl > -target:
+            return  # loss not big enough yet
+
+        # Close the position
+        close_side = "Sell" if side == "Buy" else "Buy"
+        try:
+            if self.exchange_type == "tbank":
+                self.client.place_order(symbol=symbol, side=close_side, qty=qty)
+            else:
+                self.client.place_order(symbol=symbol, side=close_side, qty=qty, category="linear")
+        except Exception:
+            logger.exception("Loss target: failed to close %s", symbol)
+            return
+
+        exit_price = cur_price
+        actual_pnl = upnl
+        try:
+            balance = self.client.get_balance()
+            await self.db.close_trade(trade["id"], exit_price, actual_pnl)
+            await self.db.update_daily_pnl(actual_pnl)
+            self.risk.record_pnl(actual_pnl, balance)
+        except Exception:
+            logger.exception("Loss target: DB update failed for %s", symbol)
+
+        direction = "ЛОНГ" if side == "Buy" else "ШОРТ"
+        logger.info(
+            "🛑 Loss target: закрыл %s %s при PnL %.0f (лимит: -%d)",
+            direction, symbol, upnl, target,
+        )
+        await self._notify(
+            f"🛑 Loss target: закрыл {direction} {symbol}\n"
+            f"PnL: {upnl:,.0f} USDT (лимит: -{target}$)"
+        )
+
     async def _check_smart_exit(self, trade: dict):
         """Close trade early with small profit if signal reversed.
 
@@ -958,6 +1242,15 @@ class TradingEngine:
         except Exception:
             logger.exception("Smart exit: failed to close %s", symbol)
             return
+
+        # Update DB
+        try:
+            balance = self.client.get_balance()
+            await self.db.close_trade(trade["id"], cur_price, upnl)
+            await self.db.update_daily_pnl(upnl)
+            self.risk.record_pnl(upnl, balance)
+        except Exception:
+            logger.exception("Smart exit: DB update failed for %s", symbol)
 
         direction = "ЛОНГ" if side == "Buy" else "ШОРТ"
         logger.info(
@@ -1766,6 +2059,15 @@ class TradingEngine:
                             "UPDATE trades SET status='closed', exit_price=?, pnl=?, closed_at=datetime('now') WHERE id=?",
                             (exit_price, pnl, t["id"]),
                         )
+                        # Update daily_pnl in the other instance's DB
+                        today = date.today().isoformat()
+                        await db.execute(
+                            """INSERT INTO daily_pnl (trade_date, pnl, trades_count)
+                               VALUES (?, ?, 1)
+                               ON CONFLICT(trade_date)
+                               DO UPDATE SET pnl = pnl + ?, trades_count = trades_count + 1""",
+                            (today, pnl, pnl),
+                        )
                     await db.commit()
             except Exception:
                 logger.exception("Failed to update other instance DB for %s", symbol)
@@ -1802,9 +2104,69 @@ class TradingEngine:
         await self._notify(msg)
         return msg
 
+    async def _close_all_on_halt(self):
+        """Auto-close all positions when daily loss limit reached."""
+        try:
+            open_trades = await self.db.get_open_trades()
+            if not open_trades:
+                await self._notify(
+                    f"🛑 Дневной лимит убытков достигнут ({self.risk.daily_pnl:,.0f})\n"
+                    f"Новые сделки заблокированы до завтра."
+                )
+                return
+
+            # Close all positions on exchange
+            categories = self._get_categories()
+            closed_count = 0
+            for cat in categories:
+                if cat not in ("linear", "tbank"):
+                    continue
+                if self.exchange_type == "tbank":
+                    positions = self.client.get_positions()
+                else:
+                    positions = self.client.get_positions(category=cat)
+                for p in positions:
+                    try:
+                        close_side = "Sell" if p["side"] == "Buy" else "Buy"
+                        if self.exchange_type == "tbank":
+                            self.client.place_order(symbol=p["symbol"], side=close_side, qty=p["size"])
+                        else:
+                            self.client.place_order(symbol=p["symbol"], side=close_side, qty=p["size"], category=cat)
+                        closed_count += 1
+                    except Exception:
+                        logger.exception("Halt close failed: %s", p["symbol"])
+
+            # Update DB
+            for t in open_trades:
+                try:
+                    if self.exchange_type == "tbank":
+                        exit_price = self.client.get_last_price(t["symbol"])
+                    else:
+                        exit_price = self.client.get_last_price(t["symbol"], category="linear")
+                    if t["side"] == "Buy":
+                        pnl = (exit_price - t["entry_price"]) * t["qty"]
+                    else:
+                        pnl = (t["entry_price"] - exit_price) * t["qty"]
+                    await self.db.close_trade(t["id"], exit_price, pnl)
+                    await self.db.update_daily_pnl(pnl)
+                except Exception:
+                    logger.exception("Halt DB update failed: %s", t["symbol"])
+
+            await self._notify(
+                f"🛑 СТОП! Дневной лимит убытков ({self.risk.daily_pnl:,.0f})\n"
+                f"Закрыто {closed_count} позиций. Торговля остановлена до завтра."
+            )
+        except Exception:
+            logger.exception("_close_all_on_halt error")
+
     async def close_all_positions(self) -> str:
+        import aiosqlite
+        from pathlib import Path
+
         categories = self._get_categories()
         closed = []
+
+        # 1. Close current engine positions
         for cat in categories:
             if cat not in ("linear", "tbank"):
                 continue
@@ -1832,7 +2194,7 @@ class TradingEngine:
                 except Exception:
                     logger.exception("Failed to close position %s", p["symbol"])
 
-        # Mark DB trades as closed
+        # Mark current engine DB trades as closed
         open_trades = await self.db.get_open_trades()
         for t in open_trades:
             try:
@@ -1851,12 +2213,92 @@ class TradingEngine:
             except Exception:
                 logger.exception("Failed to update DB for %s", t["symbol"])
 
+        # 2. Close other instances positions (cross-instance)
+        for inst in self.config.get("other_instances", []):
+            db_path = inst.get("db_path", "")
+            inst_name = inst.get("name", "???")
+            if not db_path or not Path(db_path).exists():
+                continue
+            try:
+                import sqlite3 as sqlite3_sync
+                conn = sqlite3_sync.connect(db_path)
+                conn.row_factory = sqlite3_sync.Row
+                rows = conn.execute(
+                    "SELECT id, symbol, side FROM trades WHERE status = 'open'"
+                ).fetchall()
+                conn.close()
+                if not rows:
+                    continue
+            except Exception:
+                continue
+
+            is_tbank = "TBANK" in inst_name.upper()
+            other_client = None
+            if is_tbank:
+                try:
+                    other_client = self._get_tbank_client_for_instance(inst)
+                except Exception:
+                    logger.warning("Cannot create client for %s", inst_name)
+                    continue
+
+            if not other_client:
+                continue
+
+            for row in rows:
+                symbol = row["symbol"]
+                try:
+                    positions = other_client.get_positions(symbol=symbol)
+                    for p in positions:
+                        if p["symbol"] != symbol or p["size"] <= 0:
+                            continue
+                        close_side = "Sell" if p["side"] == "Buy" else "Buy"
+                        other_client.place_order(symbol=symbol, side=close_side, qty=p["size"])
+                        closed.append(f"{symbol} ({p['side']}) [{inst_name}]")
+                except Exception as e:
+                    err_str = str(e)
+                    if "30079" in err_str or "not available for trading" in err_str.lower():
+                        closed.append(f"{symbol} ⏸ MOEX закрыта [{inst_name}]")
+                    else:
+                        logger.exception("Failed to close %s on %s", symbol, inst_name)
+
+            # Update other instance DB
+            try:
+                async with aiosqlite.connect(db_path) as db:
+                    db.row_factory = aiosqlite.Row
+                    cur = await db.execute(
+                        "SELECT id, symbol, side, entry_price, qty FROM trades WHERE status = 'open'"
+                    )
+                    open_rows = await cur.fetchall()
+                    for t in open_rows:
+                        try:
+                            exit_price = other_client.get_last_price(t["symbol"])
+                            if t["side"] == "Buy":
+                                pnl = (exit_price - t["entry_price"]) * t["qty"]
+                            else:
+                                pnl = (t["entry_price"] - exit_price) * t["qty"]
+                            await db.execute(
+                                "UPDATE trades SET status='closed', exit_price=?, pnl=?, closed_at=datetime('now') WHERE id=?",
+                                (exit_price, pnl, t["id"]),
+                            )
+                            today = date.today().isoformat()
+                            await db.execute(
+                                """INSERT INTO daily_pnl (trade_date, pnl, trades_count)
+                                   VALUES (?, ?, 1)
+                                   ON CONFLICT(trade_date)
+                                   DO UPDATE SET pnl = pnl + ?, trades_count = trades_count + 1""",
+                                (today, pnl, pnl),
+                            )
+                        except Exception:
+                            logger.exception("Failed to update DB for %s [%s]", t["symbol"], inst_name)
+                    await db.commit()
+            except Exception:
+                logger.exception("Failed to update %s DB", inst_name)
+
         if closed:
             msg = f"❌ Закрыто {len(closed)} позиций:\n" + "\n".join(f"  • {c}" for c in closed)
         else:
             msg = "Нет позиций для закрытия."
         logger.info(msg)
-        await self._notify(msg)
         return msg
 
     async def get_pairs_text(self) -> str:
