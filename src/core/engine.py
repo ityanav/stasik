@@ -83,6 +83,9 @@ class TradingEngine:
         self._breakeven_activation: float = config["risk"].get("breakeven_activation", 0.5) / 100
         self._halt_closed: bool = False  # flag: already closed positions on halt
 
+        # Kotegawa scaling in: track symbols where we already added to position
+        self._scaled_in: set[str] = set()
+
         # Trading hours filter
         trading_hours = config["trading"].get("trading_hours")
         if trading_hours and len(trading_hours) == 2:
@@ -516,12 +519,27 @@ class TradingEngine:
         open_trades = await self.db.get_open_trades()
         symbol_open = [t for t in open_trades if t["symbol"] == symbol and t["category"] == category]
 
-        if symbol_open:
+        # Kotegawa scaling in: allow adding to position on extreme deviation
+        is_scale_in = False
+        if symbol_open and isinstance(self.signal_gen, KotegawaGenerator):
+            sma_dev_score = abs(result.details.get("sma_dev", 0))
+            existing_side = symbol_open[0]["side"]
+            # Scale in only if: extreme deviation, same direction, not yet scaled
+            if sma_dev_score >= 2 and side == existing_side and symbol not in self._scaled_in:
+                is_scale_in = True
+                logger.info(
+                    "Котегава scale-in: %s %s — extreme deviation, добавляем к позиции",
+                    side, symbol,
+                )
+            else:
+                logger.debug("Already have open trade for %s (%s), skipping", symbol, category)
+                return
+        elif symbol_open:
             logger.debug("Already have open trade for %s (%s), skipping", symbol, category)
             return
 
         open_count = len(open_trades)
-        if not self.risk.can_open_position(open_count):
+        if not is_scale_in and not self.risk.can_open_position(open_count):
             return
 
         # Correlation group limit
@@ -628,6 +646,7 @@ class TradingEngine:
             ai_tp_pct=ai_tp,
             ai_size_mult=ai_size_mult,
             atr=atr,
+            is_scale_in=is_scale_in,
         )
 
     async def _open_trade(
@@ -637,6 +656,7 @@ class TradingEngine:
         ai_tp_pct: float | None = None,
         ai_size_mult: float | None = None,
         atr: float | None = None,
+        is_scale_in: bool = False,
     ):
         price = self.client.get_last_price(symbol, category=category)
         balance = self.client.get_balance()
@@ -660,6 +680,11 @@ class TradingEngine:
             sl_pct=sizing_sl,
             leverage=self.leverage,
         )
+
+        # Kotegawa scaling: scale-in adds 50% of normal size
+        if is_scale_in:
+            qty = math.floor((qty * 0.5) / info["qty_step"]) * info["qty_step"]
+            qty = round(qty, 8)
 
         # AI position size multiplier
         if ai_size_mult is not None and 0.1 <= ai_size_mult <= 2.0:
@@ -741,8 +766,12 @@ class TradingEngine:
             entry_price=price,
             stop_loss=sl,
             take_profit=tp,
-            order_id=order_id,
+            order_id="scale_in" if is_scale_in else order_id,
         )
+
+        # Track Kotegawa scale-in
+        if is_scale_in:
+            self._scaled_in.add(symbol)
 
         # Set trailing stop for futures / tbank (ATR-based or fixed)
         trailing_msg = ""
@@ -955,6 +984,7 @@ class TradingEngine:
 
         # Clean up breakeven tracking
         self._breakeven_done.discard(trade["id"])
+        self._scaled_in.discard(symbol)
 
         # Send notification
         if pnl >= 0:
@@ -1240,6 +1270,8 @@ class TradingEngine:
 
         if upnl < 0 and self._cooldown_seconds > 0:
             self._cooldowns[symbol] = time.time() + self._cooldown_seconds
+
+        self._scaled_in.discard(symbol)
 
         direction = "ЛОНГ" if side == "Buy" else "ШОРТ"
         emoji = "🎯" if upnl >= 0 else "📉"
