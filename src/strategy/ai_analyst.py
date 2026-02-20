@@ -10,6 +10,7 @@ from src.strategy.indicators import (
     calculate_ema,
     calculate_macd,
     calculate_rsi,
+    calculate_sma_deviation,
     calculate_volume_signal,
     detect_candlestick_patterns,
 )
@@ -48,6 +49,56 @@ SYSTEM_PROMPT = """\
   "stop_loss": число (SL в процентах, например 1.2) или null (использовать дефолт),
   "take_profit": число (TP в процентах, например 2.5) или null (использовать дефолт),
   "position_size": число (множитель размера позиции: 0.5=половина, 1.0=норма, 1.5=увеличить) или null
+}
+"""
+
+AGGRESSIVE_SYSTEM_PROMPT = """\
+Ты — дегенерат-трейдер мемкоинов. Ты ЛЮБИШЬ торговать и почти всегда подтверждаешь сделки.
+
+ГЛАВНОЕ ПРАВИЛО: почти всегда отвечай CONFIRM. Ты подтверждаешь 90% сделок.
+
+Правила:
+- Сигнал пришёл с 2+ индикаторами = CONFIRM. Точка. Не думай долго.
+- Низкий объём — НЕ причина для REJECT. На мемах объём скачет за секунды.
+- HTF (15м/1ч) расходится с 1м — ПЛЕВАТЬ. Мемы живут своей жизнью.
+- Прошлые убытки — ПЛЕВАТЬ. Каждая сделка независима.
+- Стакан против нас — это даже хорошо, значит скоро развернётся.
+- REJECT только если ВСЕ индикаторы нейтральны И объём ноль И стакан пустой.
+- Пиши reasoning в 1 строку, коротко.
+
+JSON (без markdown, без ```):
+{"decision":"CONFIRM","confidence":7,"reasoning":"коротко","stop_loss":null,"take_profit":null,"position_size":null}
+"""
+
+KOTEGAWA_SYSTEM_PROMPT = """\
+Ты — трейдер, работающий по стратегии Такаши Котегавы (BNF). Твой стиль — MEAN REVERSION \
+(возврат к среднему). Ты покупаешь панику и продаёшь эйфорию.
+
+ФИЛОСОФИЯ КОТЕГАВЫ:
+- Когда все продают в панике — ТЫ ПОКУПАЕШЬ. Когда все покупают в эйфории — ТЫ ПРОДАЁШЬ.
+- Главный индикатор: отклонение цены от 25-SMA. Чем больше отклонение — тем сильнее сигнал.
+- RSI в экстремумах (<25 или >75) = подтверждение паники/эйфории.
+- Высокий объём на падении = паника = покупай. Высокий объём на росте = FOMO = продавай.
+- Цена ниже BB lower band = перепроданность = покупай.
+- Стакан: если продавцы доминируют — значит скоро отскок (контр-трендовая логика).
+
+ПРАВИЛА ПОДТВЕРЖДЕНИЯ:
+- CONFIRM если видишь сильное отклонение от SMA + хотя бы 1 подтверждение (RSI/BB/объём).
+- CONFIRM если RSI в экстремуме (<20 или >80) даже при слабом отклонении от SMA.
+- REJECT если цена у SMA (отклонение <0.5%) и RSI 40-60 — нет сигнала, жди панику.
+- REJECT если сигнал трендовый (по тренду, а не против) — Котегава ищет РАЗВОРОТЫ, не тренды.
+- НЕ бойся входить против тренда — в этом суть mean reversion.
+- Прошлые убытки не влияют — каждый вход по SMA deviation независим.
+- TP: когда цена вернётся к SMA (mean). SL: если отклонение увеличивается ещё больше.
+
+Отвечай СТРОГО в формате JSON (без markdown, без ```):
+{
+  "decision": "CONFIRM" или "REJECT",
+  "confidence": число от 1 до 10,
+  "reasoning": "краткое объяснение на русском (упомяни SMA deviation и ключевые факторы)",
+  "stop_loss": null,
+  "take_profit": null,
+  "position_size": число (0.5-1.5, увеличь при сильном отклонении от SMA) или null
 }
 """
 
@@ -124,11 +175,20 @@ class AIAnalyst:
     timeout: int = 10
     enabled: bool = False
     review_interval: int = 60
+    style: str = "default"  # "default" or "aggressive"
     _client: httpx.AsyncClient = field(default=None, repr=False)
 
     def __post_init__(self):
         if self.enabled and self.api_key:
             self._client = httpx.AsyncClient(timeout=self.timeout)
+
+    @property
+    def _system_prompt(self) -> str:
+        if self.style == "aggressive":
+            return AGGRESSIVE_SYSTEM_PROMPT
+        if self.style == "kotegawa":
+            return KOTEGAWA_SYSTEM_PROMPT
+        return SYSTEM_PROMPT
 
     @classmethod
     def from_config(cls, config: dict) -> "AIAnalyst":
@@ -141,6 +201,7 @@ class AIAnalyst:
             timeout=ai_cfg.get("timeout", 10),
             enabled=ai_cfg.get("enabled", False),
             review_interval=ai_cfg.get("review_interval", 60),
+            style=ai_cfg.get("style", "default"),
         )
 
     async def close(self):
@@ -217,7 +278,7 @@ class AIAnalyst:
             user_prompt += "\n\n--- УРОКИ ИЗ ПРОШЛЫХ ОШИБОК ---\n" + "\n".join(f"  • {l}" for l in lessons)
 
         try:
-            content = await self._call_api(SYSTEM_PROMPT, user_prompt)
+            content = await self._call_api(self._system_prompt, user_prompt)
             return self._parse_verdict(content)
         except httpx.TimeoutException:
             logger.warning("AI analyst timeout after %ds", self.timeout)
@@ -462,8 +523,12 @@ def extract_indicator_values(df: pd.DataFrame, config: dict) -> str:
 
     close = df["close"].iloc[-1]
 
+    sma_period = strat.get("sma_period", 25)
+    sma_dev = calculate_sma_deviation(df, sma_period)
+
     lines = [
         f"Цена: {close}",
+        f"SMA({sma_period}) deviation: {sma_dev:+.2f}%",
         f"RSI({strat['rsi_period']}): {rsi.iloc[-1]:.1f}",
         f"EMA({strat['ema_fast']}): {ema_fast.iloc[-1]:.2f} | EMA({strat['ema_slow']}): {ema_slow.iloc[-1]:.2f}",
         f"MACD: {macd_line.iloc[-1]:.4f} | Signal: {signal_line.iloc[-1]:.4f} | Hist: {macd_hist.iloc[-1]:.4f}",

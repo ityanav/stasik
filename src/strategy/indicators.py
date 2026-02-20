@@ -38,6 +38,22 @@ def calculate_bollinger(
     return bb.bollinger_hband(), bb.bollinger_mavg(), bb.bollinger_lband()
 
 
+def calculate_sma(df: pd.DataFrame, period: int = 25) -> pd.Series:
+    """Returns Simple Moving Average."""
+    return df["close"].rolling(window=period).mean()
+
+
+def calculate_sma_deviation(df: pd.DataFrame, period: int = 25) -> float:
+    """Returns % deviation of current price from SMA.
+    Negative = price below SMA (oversold), Positive = above (overbought)."""
+    sma = calculate_sma(df, period)
+    sma_val = sma.iloc[-1]
+    if pd.isna(sma_val) or sma_val == 0:
+        return 0.0
+    price = df["close"].iloc[-1]
+    return ((price - sma_val) / sma_val) * 100
+
+
 def calculate_atr(df: pd.DataFrame, period: int = 14) -> float:
     """Returns current ATR value (Average True Range)."""
     atr = ta.volatility.AverageTrueRange(
@@ -62,6 +78,63 @@ def calculate_volume_signal(df: pd.DataFrame, period: int = 20) -> tuple[pd.Seri
     avg_vol = vol_sma.iloc[-1]
     ratio = current_vol / avg_vol if avg_vol > 0 else 1.0
     return vol_sma, ratio
+
+
+def analyze_orderbook(orderbook: dict, depth_pct: float = 0.5) -> dict:
+    """Analyze order book imbalance and walls.
+
+    Args:
+        orderbook: {"bids": [[price, qty], ...], "asks": [[price, qty], ...]}
+        depth_pct: how deep to look (% from mid price)
+
+    Returns:
+        {"score": -1/0/+1, "bid_vol": float, "ask_vol": float,
+         "imbalance": float (-1..+1), "walls": str}
+    """
+    bids = orderbook.get("bids", [])
+    asks = orderbook.get("asks", [])
+    if not bids or not asks:
+        return {"score": 0, "bid_vol": 0, "ask_vol": 0, "imbalance": 0, "walls": ""}
+
+    mid_price = (bids[0][0] + asks[0][0]) / 2
+    depth_range = mid_price * depth_pct / 100
+
+    # Sum volume within depth range
+    bid_vol = sum(q for p, q in bids if p >= mid_price - depth_range)
+    ask_vol = sum(q for p, q in asks if p <= mid_price + depth_range)
+
+    total = bid_vol + ask_vol
+    if total == 0:
+        return {"score": 0, "bid_vol": 0, "ask_vol": 0, "imbalance": 0, "walls": ""}
+
+    # Imbalance: +1 = all bids (bullish), -1 = all asks (bearish)
+    imbalance = (bid_vol - ask_vol) / total
+
+    # Detect walls (single level with > 20% of total volume in range)
+    walls = []
+    wall_threshold = total * 0.20
+    for p, q in bids[:10]:
+        if q >= wall_threshold:
+            walls.append(f"BID wall {p:.4g} ({q:.0f})")
+    for p, q in asks[:10]:
+        if q >= wall_threshold:
+            walls.append(f"ASK wall {p:.4g} ({q:.0f})")
+
+    # Score: strong imbalance → signal
+    if imbalance > 0.3:
+        score = 1   # buyers dominate
+    elif imbalance < -0.3:
+        score = -1  # sellers dominate
+    else:
+        score = 0
+
+    return {
+        "score": score,
+        "bid_vol": round(bid_vol, 2),
+        "ask_vol": round(ask_vol, 2),
+        "imbalance": round(imbalance, 3),
+        "walls": "; ".join(walls) if walls else "",
+    }
 
 
 def detect_candlestick_patterns(df: pd.DataFrame) -> dict:

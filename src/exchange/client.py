@@ -215,6 +215,13 @@ class BybitClient(ExchangeClient):
 
     # ── Instrument info (min qty, tick size) ─────────────────
 
+    def get_orderbook(self, symbol: str, limit: int = 50, category: str = "linear") -> dict:
+        resp = self.session.get_orderbook(category=category, symbol=symbol, limit=limit)
+        data = resp["result"]
+        bids = [[float(p), float(q)] for p, q in data.get("b", [])]
+        asks = [[float(p), float(q)] for p, q in data.get("a", [])]
+        return {"bids": bids, "asks": asks}
+
     def get_instrument_info(self, symbol: str, category: str = "linear") -> dict:
         resp = self.session.get_instruments_info(category=category, symbol=symbol)
         info = resp["result"]["list"][0]

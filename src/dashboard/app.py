@@ -12,6 +12,26 @@ from src.storage.database import Database
 logger = logging.getLogger(__name__)
 
 
+_ARCHIVE_MAP = {
+    "trades.db": "archive_scalp_pre_kotegawa.db",
+    "degen.db": "archive_degen_pre_kotegawa.db",
+    "swing.db": "archive_swing_pre_kotegawa.db",
+    "tbank_scalp.db": "archive_tbank_scalp_pre_kotegawa.db",
+    "tbank_swing.db": "archive_tbank_swing_pre_kotegawa.db",
+}
+
+
+def _get_db_path(live_path: str, source: str) -> str:
+    """Return archive DB path if source='archive', else the live path."""
+    if source != "archive":
+        return live_path
+    p = Path(live_path)
+    archive_name = _ARCHIVE_MAP.get(p.name)
+    if archive_name:
+        return str(p.parent / archive_name)
+    return live_path
+
+
 class Dashboard:
     def __init__(self, config: dict, db: Database, engine=None):
         self.config = config
@@ -104,31 +124,69 @@ class Dashboard:
         return web.Response(text=_DASHBOARD_HTML, content_type="text/html")
 
     async def _api_stats(self, request: web.Request) -> web.Response:
-        daily_pnl = await self.db.get_daily_pnl()
-        total_pnl = await self.db.get_total_pnl()
-        open_trades = await self.db.get_open_trades()
-        stats = await self.db.get_trade_stats()
+        source = request.query.get("source", "live")
+        is_archive = source == "archive"
+
+        if is_archive:
+            archive_path = _get_db_path(str(self.db.db_path), source)
+            daily_pnl = 0.0
+            total_pnl = 0.0
+            open_count = 0
+            total = 0
+            wins = 0
+            losses = 0
+            if Path(archive_path).exists():
+                try:
+                    async with aiosqlite.connect(archive_path) as db:
+                        db.row_factory = aiosqlite.Row
+                        cur = await db.execute("SELECT COALESCE(SUM(pnl), 0) as total FROM daily_pnl")
+                        row = await cur.fetchone()
+                        if row:
+                            total_pnl = float(row["total"])
+                        cur = await db.execute("SELECT COUNT(*) as cnt FROM trades WHERE status = 'open'")
+                        row = await cur.fetchone()
+                        if row:
+                            open_count = int(row["cnt"])
+                        cur = await db.execute(
+                            "SELECT COUNT(*) as total, "
+                            "COALESCE(SUM(CASE WHEN pnl >= 0 THEN 1 ELSE 0 END), 0) as wins, "
+                            "COALESCE(SUM(CASE WHEN pnl < 0 THEN 1 ELSE 0 END), 0) as losses "
+                            "FROM trades WHERE status = 'closed'"
+                        )
+                        row = await cur.fetchone()
+                        if row:
+                            total = int(row["total"])
+                            wins = int(row["wins"])
+                            losses = int(row["losses"])
+                except Exception:
+                    logger.warning("Failed to read archive stats from %s", archive_path)
+        else:
+            daily_pnl = await self.db.get_daily_pnl()
+            total_pnl = await self.db.get_total_pnl()
+            open_trades = await self.db.get_open_trades()
+            stats = await self.db.get_trade_stats()
+            total = stats["total"]
+            wins = stats["wins"]
+            losses = stats["losses"]
+            open_count = len(open_trades)
 
         balance = 0.0
         running = False
-        if self.engine:
+        tbank_balance = 0.0
+        if not is_archive and self.engine:
             try:
                 balance = self.engine.client.get_balance()
             except Exception:
                 pass
             running = self.engine._running
 
-        total = stats["total"]
-        wins = stats["wins"]
         exchange = self.config.get("exchange", "bybit")
         currency = "RUB" if exchange == "tbank" else "USDT"
 
         # Total trades across all instances
         all_trades = total
-        # TBank balance from other instances
-        tbank_balance = 0.0
         for inst in self.config.get("other_instances", []):
-            db_path = inst.get("db_path", "")
+            db_path = _get_db_path(inst.get("db_path", ""), source)
             inst_name = inst.get("name", "")
             if db_path and Path(db_path).exists():
                 try:
@@ -140,8 +198,8 @@ class Dashboard:
                             all_trades += int(row["cnt"])
                 except Exception:
                     pass
-            # Get TBank balance from engine's other_instances
-            if "TBANK" in inst_name.upper() and self.engine:
+            # Get TBank balance (only for live mode)
+            if not is_archive and "TBANK" in inst_name.upper() and self.engine:
                 try:
                     from src.exchange.tbank_client import TBankClient
                     import yaml
@@ -161,20 +219,22 @@ class Dashboard:
             "tbank_balance": tbank_balance,
             "daily_pnl": daily_pnl,
             "total_pnl": total_pnl,
-            "open_positions": len(open_trades),
+            "open_positions": open_count,
             "total_trades": total,
             "all_trades": all_trades,
             "wins": wins,
-            "losses": stats["losses"],
+            "losses": losses,
             "win_rate": (wins / total * 100) if total > 0 else 0,
             "running": running,
             "currency": currency,
+            "source": source,
         }
         return web.json_response(data)
 
     async def _api_trades(self, request: web.Request) -> web.Response:
         page = int(request.query.get("page", "1"))
         per_page = int(request.query.get("per_page", "20"))
+        source = request.query.get("source", "live")
 
         instance_name = self.config.get("instance_name", "SCALP")
 
@@ -182,14 +242,29 @@ class Dashboard:
         all_trades = []
 
         # Main instance trades
-        main_trades = await self.db.get_recent_trades(1000)
-        for t in main_trades:
-            t["instance"] = t.get("instance") or instance_name
-            all_trades.append(t)
+        main_db_path = _get_db_path(str(self.db.db_path), source)
+        if source == "archive":
+            if Path(main_db_path).exists():
+                try:
+                    async with aiosqlite.connect(main_db_path) as db:
+                        db.row_factory = aiosqlite.Row
+                        cur = await db.execute("SELECT * FROM trades ORDER BY id DESC LIMIT 1000")
+                        rows = await cur.fetchall()
+                        for r in rows:
+                            t = dict(r)
+                            t["instance"] = t.get("instance") or instance_name
+                            all_trades.append(t)
+                except Exception:
+                    logger.warning("Failed to read archive trades from %s", main_db_path)
+        else:
+            main_trades = await self.db.get_recent_trades(1000)
+            for t in main_trades:
+                t["instance"] = t.get("instance") or instance_name
+                all_trades.append(t)
 
         # Other instances trades
         for inst in self.config.get("other_instances", []):
-            db_path = inst.get("db_path", "")
+            db_path = _get_db_path(inst.get("db_path", ""), source)
             inst_name = inst.get("name", "???")
             if db_path and Path(db_path).exists():
                 try:
@@ -221,38 +296,57 @@ class Dashboard:
     async def _api_pnl(self, request: web.Request) -> web.Response:
         days = int(request.query.get("days", "30"))
         tf = request.query.get("tf", "1D")  # 10m, 30m, 1H, 1D, 1M
+        source = request.query.get("source", "live")
 
         instance_name = self.config.get("instance_name", "SCALP")
 
         if tf in ("1D", "1M"):
-            return await self._pnl_daily(days, tf, instance_name)
+            return await self._pnl_daily(days, tf, instance_name, source)
         else:
-            return await self._pnl_intraday(tf, instance_name)
+            return await self._pnl_intraday(tf, instance_name, source)
 
-    async def _pnl_daily(self, days: int, tf: str, instance_name: str) -> web.Response:
+    async def _pnl_daily(self, days: int, tf: str, instance_name: str, source: str = "live") -> web.Response:
         """Daily or monthly PnL from daily_pnl table."""
-        # strftime for grouping: day or month
-        if tf == "1M":
-            group_fmt = "%Y-%m"
-        else:
-            group_fmt = "%Y-%m-%d"
+        limit = days if tf == "1D" else days * 30
 
         pnl_by_key: dict[str, dict] = {}
 
         # Main instance
-        main_data = await self.db.get_daily_pnl_history(days if tf == "1D" else days * 30)
-        for d in main_data:
-            raw_date = d["trade_date"]
-            key = raw_date[:7] if tf == "1M" else raw_date
-            if key not in pnl_by_key:
-                pnl_by_key[key] = {"trade_date": key, "pnl": 0, "trades_count": 0}
-            pnl_by_key[key]["pnl"] += d["pnl"]
-            pnl_by_key[key]["trades_count"] += d["trades_count"]
-            pnl_by_key[key][instance_name] = pnl_by_key[key].get(instance_name, 0) + d["pnl"]
+        main_db_path = _get_db_path(str(self.db.db_path), source)
+        if source == "archive":
+            if Path(main_db_path).exists():
+                try:
+                    async with aiosqlite.connect(main_db_path) as db:
+                        db.row_factory = aiosqlite.Row
+                        cur = await db.execute(
+                            "SELECT trade_date, pnl, trades_count FROM daily_pnl ORDER BY trade_date DESC LIMIT ?",
+                            (limit,),
+                        )
+                        rows = await cur.fetchall()
+                        for r in rows:
+                            raw_date = r["trade_date"]
+                            key = raw_date[:7] if tf == "1M" else raw_date
+                            if key not in pnl_by_key:
+                                pnl_by_key[key] = {"trade_date": key, "pnl": 0, "trades_count": 0}
+                            pnl_by_key[key]["pnl"] += r["pnl"]
+                            pnl_by_key[key]["trades_count"] += r["trades_count"]
+                            pnl_by_key[key][instance_name] = pnl_by_key[key].get(instance_name, 0) + r["pnl"]
+                except Exception:
+                    logger.warning("Failed to read archive PnL from %s", main_db_path)
+        else:
+            main_data = await self.db.get_daily_pnl_history(limit)
+            for d in main_data:
+                raw_date = d["trade_date"]
+                key = raw_date[:7] if tf == "1M" else raw_date
+                if key not in pnl_by_key:
+                    pnl_by_key[key] = {"trade_date": key, "pnl": 0, "trades_count": 0}
+                pnl_by_key[key]["pnl"] += d["pnl"]
+                pnl_by_key[key]["trades_count"] += d["trades_count"]
+                pnl_by_key[key][instance_name] = pnl_by_key[key].get(instance_name, 0) + d["pnl"]
 
         # Other instances
         for inst in self.config.get("other_instances", []):
-            db_path = inst.get("db_path", "")
+            db_path = _get_db_path(inst.get("db_path", ""), source)
             inst_name = inst.get("name", "???")
             if db_path and Path(db_path).exists():
                 try:
@@ -260,7 +354,7 @@ class Dashboard:
                         db.row_factory = aiosqlite.Row
                         cur = await db.execute(
                             "SELECT trade_date, pnl, trades_count FROM daily_pnl ORDER BY trade_date DESC LIMIT ?",
-                            (days if tf == "1D" else days * 30,),
+                            (limit,),
                         )
                         rows = await cur.fetchall()
                         for r in rows:
@@ -277,18 +371,22 @@ class Dashboard:
         result = sorted(pnl_by_key.values(), key=lambda x: x["trade_date"])
         return web.json_response(result)
 
-    async def _pnl_intraday(self, tf: str, instance_name: str) -> web.Response:
+    async def _pnl_intraday(self, tf: str, instance_name: str, source: str = "live") -> web.Response:
         """Intraday PnL from trades table (10m, 30m, 1H buckets)."""
         from datetime import datetime, timedelta
 
-        minutes = {"10m": 10, "30m": 30, "1H": 60}.get(tf, 60)
-        # How far back to look
-        lookback_hours = {"10m": 6, "30m": 24, "1H": 72}.get(tf, 24)
+        minutes = {"1m": 1, "5m": 5, "10m": 10, "30m": 30, "1H": 60}.get(tf, 60)
+        # How far back to look — for archive use much larger window
+        if source == "archive":
+            lookback_hours = {"1m": 24, "5m": 72, "10m": 168, "30m": 720, "1H": 2160}.get(tf, 720)
+        else:
+            lookback_hours = {"1m": 2, "5m": 4, "10m": 6, "30m": 24, "1H": 72}.get(tf, 24)
         since = (datetime.utcnow() - timedelta(hours=lookback_hours)).strftime("%Y-%m-%d %H:%M:%S")
 
-        all_dbs = [(self.db.db_path, instance_name)]
+        main_db_path = _get_db_path(str(self.db.db_path), source)
+        all_dbs = [(main_db_path, instance_name)]
         for inst in self.config.get("other_instances", []):
-            db_path = inst.get("db_path", "")
+            db_path = _get_db_path(inst.get("db_path", ""), source)
             if db_path and Path(db_path).exists():
                 all_dbs.append((db_path, inst.get("name", "???")))
 
@@ -333,31 +431,56 @@ class Dashboard:
     async def _api_positions(self, request: web.Request) -> web.Response:
         positions = []
         instance_name = self.config.get("instance_name", "SCALP")
+        source = request.query.get("source", "live")
+        is_archive = source == "archive"
 
-        # Current engine positions
-        if self.engine:
-            try:
-                exchange = self.config.get("exchange", "bybit")
-                if exchange == "tbank":
-                    raw = self.engine.client.get_positions()
-                else:
-                    raw = self.engine.client.get_positions(category="linear")
-                for p in raw:
-                    positions.append({
-                        "symbol": p["symbol"],
-                        "side": p["side"],
-                        "size": p["size"],
-                        "entry_price": p["entry_price"],
-                        "unrealised_pnl": p["unrealised_pnl"],
-                        "instance": instance_name,
-                    })
-            except Exception:
-                pass
+        if is_archive:
+            # Archive: show open trades from archive DB for main instance
+            main_archive = _get_db_path(str(self.db.db_path), source)
+            if Path(main_archive).exists():
+                try:
+                    async with aiosqlite.connect(main_archive) as db:
+                        db.row_factory = aiosqlite.Row
+                        cur = await db.execute(
+                            "SELECT symbol, side, entry_price, qty FROM trades WHERE status = 'open'"
+                        )
+                        rows = await cur.fetchall()
+                        for r in rows:
+                            positions.append({
+                                "symbol": r["symbol"],
+                                "side": r["side"],
+                                "size": float(r["qty"]),
+                                "entry_price": float(r["entry_price"]),
+                                "unrealised_pnl": 0.0,
+                                "instance": instance_name,
+                            })
+                except Exception:
+                    logger.warning("Failed to read archive positions from %s", main_archive)
+        else:
+            # Live: current engine positions
+            if self.engine:
+                try:
+                    exchange = self.config.get("exchange", "bybit")
+                    if exchange == "tbank":
+                        raw = self.engine.client.get_positions()
+                    else:
+                        raw = self.engine.client.get_positions(category="linear")
+                    for p in raw:
+                        positions.append({
+                            "symbol": p["symbol"],
+                            "side": p["side"],
+                            "size": p["size"],
+                            "entry_price": p["entry_price"],
+                            "unrealised_pnl": p["unrealised_pnl"],
+                            "instance": instance_name,
+                        })
+                except Exception:
+                    pass
 
         # Other instances — open trades from DB
         for inst in self.config.get("other_instances", []):
             inst_name = inst.get("name", "???")
-            db_path = inst.get("db_path", "")
+            db_path = _get_db_path(inst.get("db_path", ""), source)
             if db_path and Path(db_path).exists():
                 try:
                     async with aiosqlite.connect(db_path) as db:
@@ -381,45 +504,96 @@ class Dashboard:
         return web.json_response(positions)
 
     async def _api_instances(self, request: web.Request) -> web.Response:
+        source = request.query.get("source", "live")
+        is_archive = source == "archive"
         instances = []
 
         # Current instance (scalper)
-        scalp_daily = await self.db.get_daily_pnl()
-        scalp_total = await self.db.get_total_pnl()
-        scalp_stats = await self.db.get_trade_stats()
-        scalp_open = await self.db.get_open_trades()
-        running = self.engine._running if self.engine else False
+        if is_archive:
+            archive_path = _get_db_path(str(self.db.db_path), source)
+            scalp_daily = 0.0
+            scalp_total = 0.0
+            scalp_open_count = 0
+            scalp_total_trades = 0
+            scalp_wins = 0
+            scalp_losses = 0
+            if Path(archive_path).exists():
+                try:
+                    async with aiosqlite.connect(archive_path) as db:
+                        db.row_factory = aiosqlite.Row
+                        cur = await db.execute("SELECT COALESCE(SUM(pnl), 0) as total FROM daily_pnl")
+                        row = await cur.fetchone()
+                        if row:
+                            scalp_total = float(row["total"])
+                        cur = await db.execute("SELECT COUNT(*) as cnt FROM trades WHERE status = 'open'")
+                        row = await cur.fetchone()
+                        if row:
+                            scalp_open_count = int(row["cnt"])
+                        cur = await db.execute(
+                            "SELECT COUNT(*) as total, "
+                            "COALESCE(SUM(CASE WHEN pnl >= 0 THEN 1 ELSE 0 END), 0) as wins, "
+                            "COALESCE(SUM(CASE WHEN pnl < 0 THEN 1 ELSE 0 END), 0) as losses "
+                            "FROM trades WHERE status = 'closed'"
+                        )
+                        row = await cur.fetchone()
+                        if row:
+                            scalp_total_trades = int(row["total"])
+                            scalp_wins = int(row["wins"])
+                            scalp_losses = int(row["losses"])
+                except Exception:
+                    logger.warning("Failed to read archive instances from %s", archive_path)
 
-        instances.append({
-            "name": self.config.get("instance_name", "SCALP"),
-            "running": running,
-            "daily_pnl": scalp_daily,
-            "total_pnl": scalp_total,
-            "open_positions": len(scalp_open),
-            "total_trades": scalp_stats["total"],
-            "wins": scalp_stats["wins"],
-            "losses": scalp_stats["losses"],
-            "win_rate": (scalp_stats["wins"] / scalp_stats["total"] * 100) if scalp_stats["total"] > 0 else 0,
-            "timeframe": str(self.config["trading"]["timeframe"]),
-            "leverage": self.config["trading"].get("leverage", 1),
-            "pairs": self.config["trading"]["pairs"],
-        })
+            instances.append({
+                "name": self.config.get("instance_name", "SCALP"),
+                "running": False,
+                "daily_pnl": scalp_daily,
+                "total_pnl": scalp_total,
+                "open_positions": scalp_open_count,
+                "total_trades": scalp_total_trades,
+                "wins": scalp_wins,
+                "losses": scalp_losses,
+                "win_rate": (scalp_wins / scalp_total_trades * 100) if scalp_total_trades > 0 else 0,
+                "timeframe": str(self.config["trading"]["timeframe"]),
+                "leverage": self.config["trading"].get("leverage", 1),
+                "pairs": self.config["trading"]["pairs"],
+            })
+        else:
+            scalp_daily = await self.db.get_daily_pnl()
+            scalp_total = await self.db.get_total_pnl()
+            scalp_stats = await self.db.get_trade_stats()
+            scalp_open = await self.db.get_open_trades()
+            running = self.engine._running if self.engine else False
+
+            instances.append({
+                "name": self.config.get("instance_name", "SCALP"),
+                "running": running,
+                "daily_pnl": scalp_daily,
+                "total_pnl": scalp_total,
+                "open_positions": len(scalp_open),
+                "total_trades": scalp_stats["total"],
+                "wins": scalp_stats["wins"],
+                "losses": scalp_stats["losses"],
+                "win_rate": (scalp_stats["wins"] / scalp_stats["total"] * 100) if scalp_stats["total"] > 0 else 0,
+                "timeframe": str(self.config["trading"]["timeframe"]),
+                "leverage": self.config["trading"].get("leverage", 1),
+                "pairs": self.config["trading"]["pairs"],
+            })
 
         # Other instances
         for inst in self.config.get("other_instances", []):
-            data = await self._read_instance_data(inst)
+            data = await self._read_instance_data(inst, source)
             instances.append(data)
 
         return web.json_response(instances)
 
-    async def _read_instance_data(self, inst: dict) -> dict:
+    async def _read_instance_data(self, inst: dict, source: str = "live") -> dict:
         name = inst.get("name", "???")
-        db_path = inst.get("db_path", "")
+        db_path = _get_db_path(inst.get("db_path", ""), source)
         service = inst.get("service", "")
 
-        # Check service status
+        # Check service status (only for live)
         running = False
-        if service:
+        if service and source != "archive":
             try:
                 result = subprocess.run(
                     ["systemctl", "is-active", service],
@@ -652,6 +826,7 @@ tr:hover{background:rgba(99,102,241,0.06)}
 .inst-tag{font-size:10px;padding:2px 8px;border-radius:8px;font-weight:600;letter-spacing:0.5px}
 .inst-scalp{background:rgba(99,102,241,0.15);color:#a5b4fc}
 .inst-swing{background:rgba(245,158,11,0.15);color:#fbbf24}
+.inst-degen{background:rgba(236,72,153,0.15);color:#f472b6}
 .inst-tbank{background:rgba(16,185,129,0.15);color:#34d399}
 .tbl-wrap{overflow-x:auto}
 
@@ -677,6 +852,7 @@ tr:hover{background:rgba(99,102,241,0.06)}
 }
 .instance-card.scalp::before{background:linear-gradient(90deg,#6366f1,#a78bfa)}
 .instance-card.swing::before{background:linear-gradient(90deg,#f59e0b,#fbbf24)}
+.instance-card.degen::before{background:linear-gradient(90deg,#ec4899,#f472b6)}
 .instance-card.tbank::before{background:linear-gradient(90deg,#10b981,#34d399)}
 .instance-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px}
 .instance-name{font-size:18px;font-weight:700;color:#fff;display:flex;align-items:center;gap:8px}
@@ -685,6 +861,7 @@ tr:hover{background:rgba(99,102,241,0.06)}
 }
 .badge-scalp{background:rgba(99,102,241,0.15);color:#a5b4fc;border:1px solid rgba(99,102,241,0.3)}
 .badge-swing{background:rgba(245,158,11,0.15);color:#fbbf24;border:1px solid rgba(245,158,11,0.3)}
+.badge-degen{background:rgba(236,72,153,0.15);color:#f472b6;border:1px solid rgba(236,72,153,0.3)}
 .badge-tbank{background:rgba(16,185,129,0.15);color:#34d399;border:1px solid rgba(16,185,129,0.3)}
 .instance-status{font-size:12px;font-weight:600;padding:4px 12px;border-radius:12px}
 .instance-status.on{background:rgba(0,230,118,0.12);color:var(--green)}
@@ -710,11 +887,29 @@ tr:hover{background:rgba(99,102,241,0.06)}
 .chart-half-label{font-size:12px;font-weight:600;margin-bottom:10px;display:flex;align-items:center;gap:6px}
 .dot{width:10px;height:10px;border-radius:50%;display:inline-block}
 .dot-bybit{background:#818cf8}
+.dot-degen{background:#f472b6}
 .dot-tbank{background:#34d399}
 .chart-legend-custom{display:flex;gap:12px;font-size:12px;color:var(--muted)}
 .chart-legend-custom .leg-item{display:flex;align-items:center;gap:5px}
 .leg-bar{width:12px;height:10px;border-radius:2px}
 .leg-line{width:14px;height:2px;border-radius:1px}
+
+.source-toggle{display:flex;gap:0;border-radius:10px;overflow:hidden;border:1px solid rgba(99,102,241,0.2)}
+.source-toggle button{
+  background:rgba(99,102,241,0.08);border:none;color:#a5b4fc;padding:6px 16px;
+  font-size:12px;font-weight:600;cursor:pointer;transition:all 0.2s;
+}
+.source-toggle button:hover{background:rgba(99,102,241,0.2)}
+.source-toggle button.active{background:rgba(99,102,241,0.35);color:#fff}
+.source-toggle button.archive-active{background:rgba(245,158,11,0.35);color:#fbbf24}
+.archive-banner{
+  background:linear-gradient(90deg,rgba(245,158,11,0.15),rgba(245,158,11,0.05));
+  border:1px solid rgba(245,158,11,0.3);border-radius:10px;
+  padding:10px 20px;margin-bottom:16px;text-align:center;
+  color:#fbbf24;font-size:14px;font-weight:600;
+}
+body.archive-mode{background:linear-gradient(135deg,#1a1508 0%,#1a1a3e 50%,#1a1508 100%)}
+body.archive-mode .header{background:linear-gradient(90deg,var(--bg2),rgba(245,158,11,0.15))}
 
 .last-update{text-align:center;color:#555;font-size:11px;padding:16px}
 
@@ -736,12 +931,17 @@ tr:hover{background:rgba(99,102,241,0.06)}
     <div class="header-stats" id="header-stats"></div>
   </div>
   <div class="header-right">
+    <div class="source-toggle" id="source-toggle">
+      <button class="active" onclick="setSource('live')" data-source="live">Live</button>
+      <button onclick="setSource('archive')" data-source="archive">Архив</button>
+    </div>
     <div id="status-badge" class="off">...</div>
     <a href="/logout" class="logout-btn">Выход</a>
   </div>
 </div>
 
 <div class="container">
+  <div class="archive-banner" id="archive-banner" style="display:none">АРХИВ — данные до перехода на стратегию Котегавы</div>
   <div class="instances" id="instances"></div>
 
   <div class="chart-section">
@@ -750,16 +950,19 @@ tr:hover{background:rgba(99,102,241,0.06)}
       <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
         <div class="chart-legend-custom" id="chart-legend"></div>
         <div class="tf-buttons" id="tf-buttons">
+          <button class="active" onclick="setTF('1m')" data-tf="1m">1м</button>
+          <button onclick="setTF('5m')" data-tf="5m">5м</button>
           <button onclick="setTF('10m')" data-tf="10m">10м</button>
           <button onclick="setTF('30m')" data-tf="30m">30м</button>
           <button onclick="setTF('1H')" data-tf="1H">1ч</button>
-          <button class="active" onclick="setTF('1D')" data-tf="1D">1д</button>
+          <button onclick="setTF('1D')" data-tf="1D">1д</button>
           <button onclick="setTF('1M')" data-tf="1M">1мес</button>
         </div>
       </div>
     </div>
     <div class="chart-dual-wrap" id="chart-wrap">
       <div class="chart-half"><div class="chart-half-label"><span class="dot dot-bybit"></span>Bybit (USDT)</div><canvas id="pnlChartBybit"></canvas></div>
+      <div class="chart-half" id="degen-chart-half" style="display:none"><div class="chart-half-label"><span class="dot dot-degen"></span>DEGEN Memes (USDT)</div><canvas id="pnlChartDegen"></canvas></div>
       <div class="chart-half" id="tbank-chart-half" style="display:none"><div class="chart-half-label"><span class="dot dot-tbank"></span>T-Bank (RUB)</div><canvas id="pnlChartTbank"></canvas></div>
     </div>
   </div>
@@ -795,7 +998,7 @@ tr:hover{background:rgba(99,102,241,0.06)}
 </div>
 
 <script>
-let currentPage=1,hasNext=false,currentTF='1D';
+let currentPage=1,hasNext=false,currentTF='1m',currentSource='live';
 function fmt(v){return(v>=0?'+':'')+v.toFixed(2)}
 function cls(v){return v>=0?'g':'r'}
 function setTF(tf){
@@ -803,23 +1006,48 @@ function setTF(tf){
   document.querySelectorAll('.tf-buttons button').forEach(b=>b.classList.toggle('active',b.dataset.tf===tf));
   loadChart();
 }
+function setSource(src){
+  currentSource=src;
+  currentPage=1;
+  document.querySelectorAll('.source-toggle button').forEach(b=>{
+    b.classList.remove('active','archive-active');
+    if(b.dataset.source===src){b.classList.add(src==='archive'?'archive-active':'active')}
+  });
+  const banner=document.getElementById('archive-banner');
+  const badge=document.getElementById('status-badge');
+  if(src==='archive'){
+    banner.style.display='';
+    badge.style.display='none';
+    document.body.classList.add('archive-mode');
+  }else{
+    banner.style.display='none';
+    badge.style.display='';
+    document.body.classList.remove('archive-mode');
+  }
+  loadAll();
+}
 
 async function loadInstances(){
   try{
-    const list=await(await fetch('/api/instances')).json();
+    const list=await(await fetch('/api/instances?source='+currentSource)).json();
+    _hasTbankInst=list.some(i=>i.name.toLowerCase().includes('tbank'));
+    _hasDegenInst=list.some(i=>i.name.toLowerCase().includes('degen'));
     const el=document.getElementById('instances');
     el.innerHTML=list.map(i=>{
       const key=i.name.toLowerCase();
       const isTbank=key.includes('tbank');
-      const isScalp=key.includes('scalp');
-      const cardCls=isTbank?'tbank':isScalp?'scalp':'swing';
-      const badgeCls=isTbank?'badge-tbank':isScalp?'badge-scalp':'badge-swing';
-      const tf=isScalp&&!isTbank?i.timeframe+'м':i.timeframe;
+      const isDegen=key.includes('degen');
+      const isScalp=key.includes('scalp')&&!isTbank;
+      const isSwing=key.includes('swing')&&!isTbank;
+      const cardCls=isTbank?'tbank':isDegen?'degen':isScalp?'scalp':'swing';
+      const badgeCls=isTbank?'badge-tbank':isDegen?'badge-degen':isScalp?'badge-scalp':'badge-swing';
+      const tf=(isScalp||isDegen)?i.timeframe+'м':i.timeframe;
       const cur=isTbank?'RUB':'USDT';
+      const icon=isTbank?'🏦':isDegen?'🎰':isScalp?'⚡':'🌊';
       return`<div class="instance-card ${cardCls} fade-in">
         <div class="instance-header">
           <div class="instance-name">
-            ${isTbank?'🏦':isScalp?'⚡':'🌊'}
+            ${icon}
             <span>${i.name}</span>
             <span class="badge ${badgeCls}">${tf} / ${i.leverage}x</span>
           </div>
@@ -842,7 +1070,7 @@ async function loadInstances(){
 
 async function loadStats(){
   try{
-    const s=await(await fetch('/api/stats')).json();
+    const s=await(await fetch('/api/stats?source='+currentSource)).json();
     const b=document.getElementById('status-badge');
     b.className=s.running?'on':'off';
     b.textContent=s.running?'РАБОТАЕТ':'ОСТАНОВЛЕН';
@@ -854,7 +1082,7 @@ async function loadStats(){
   }catch(e){console.error('stats',e)}
 }
 
-let chartBybit=null, chartTbank=null;
+let chartBybit=null, chartDegen=null, chartTbank=null, _hasTbankInst=false, _hasDegenInst=false;
 
 function buildWaterfall(canvasId, labels, dailyArr, posColor, negColor, currency, sym){
   const ctx=document.getElementById(canvasId).getContext('2d');
@@ -946,10 +1174,102 @@ function buildWaterfall(canvasId, labels, dailyArr, posColor, negColor, currency
   });
 }
 
+function buildLineChart(canvasId, labels, dailyArr, lineColor, fillColor, currency, sym){
+  const ctx=document.getElementById(canvasId).getContext('2d');
+  // Build cumulative PnL
+  const cumulative=[];
+  let cum=0;
+  dailyArr.forEach(v=>{cum+=v;cumulative.push(cum)});
+
+  // Gradient fill
+  const gradient=ctx.createLinearGradient(0,0,0,300);
+  gradient.addColorStop(0,fillColor);
+  gradient.addColorStop(1,'rgba(0,0,0,0)');
+
+  return new Chart(ctx,{type:'line',
+    plugins:[ChartDataLabels],
+    data:{labels,datasets:[{
+      data:cumulative,
+      borderColor:lineColor,
+      backgroundColor:gradient,
+      fill:true,
+      tension:0.3,
+      borderWidth:2.5,
+      pointRadius:dailyArr.length>20?0:4,
+      pointHoverRadius:6,
+      pointBackgroundColor:lineColor,
+      pointBorderColor:'#1a1a3e',
+      pointBorderWidth:2,
+      datalabels:{
+        display:c=>{
+          const len=cumulative.length;
+          if(len<=10)return true;
+          if(len<=20)return c.dataIndex%2===0||c.dataIndex===len-1;
+          return c.dataIndex===0||c.dataIndex===len-1||c.dataIndex%Math.ceil(len/8)===0;
+        },
+        formatter:v=>(v>=0?'+':'')+v.toFixed(0),
+        color:c=>cumulative[c.dataIndex]>=0?'#00e676':'#ff5252',
+        anchor:'end',align:'top',
+        font:{size:10,weight:'bold'},
+        offset:4,
+      }
+    },{
+      // Daily PnL as thin bars behind the line
+      type:'bar',
+      data:dailyArr,
+      backgroundColor:dailyArr.map(v=>v>=0?'rgba(244,114,182,0.3)':'rgba(255,82,82,0.3)'),
+      borderRadius:2,
+      datalabels:{display:false},
+    }]},
+    options:{responsive:true,maintainAspectRatio:true,
+      interaction:{intersect:false,mode:'index'},
+      plugins:{
+        legend:{display:false},
+        datalabels:{},
+        tooltip:{
+          backgroundColor:'rgba(26,26,62,0.95)',titleColor:'#fff',bodyColor:'#e0e0e0',
+          borderColor:'rgba(236,72,153,0.3)',borderWidth:1,cornerRadius:10,padding:12,
+          callbacks:{
+            label:c=>{
+              if(c.datasetIndex===0){
+                return 'Кумулятивный: '+(c.raw>=0?'+':'')+c.raw.toFixed(2)+' '+currency;
+              }
+              const d=dailyArr[c.dataIndex];
+              return 'За период: '+(d>=0?'+':'')+d.toFixed(2)+' '+currency;
+            }
+          }
+        }
+      },
+      scales:{
+        x:{ticks:{color:'#555',maxRotation:45,font:{size:11}},grid:{display:false}},
+        y:{
+          ticks:{color:'#888',callback:v=>(v>=0?'+':'')+v.toFixed(0)+' '+sym,font:{size:10}},
+          grid:{color:c=>c.tick.value===0?'rgba(255,255,255,0.35)':'rgba(255,255,255,0.04)',lineWidth:c=>c.tick.value===0?2:1},
+        }
+      }
+    }
+  });
+}
+
 async function loadChart(){
   try{
-    const pnl=await(await fetch('/api/pnl?days=30&tf='+currentTF)).json();
-    if(!pnl.length)return;
+    const pnl=await(await fetch('/api/pnl?days=30&tf='+currentTF+'&source='+currentSource)).json();
+    // Always destroy old charts first
+    if(chartBybit){chartBybit.destroy();chartBybit=null}
+    if(chartDegen){chartDegen.destroy();chartDegen=null}
+    if(chartTbank){chartTbank.destroy();chartTbank=null}
+    if(!pnl.length){
+      // No data — show placeholder text on canvases
+      ['pnlChartBybit','pnlChartDegen','pnlChartTbank'].forEach(id=>{
+        const c=document.getElementById(id);
+        const cx=c.getContext('2d');cx.clearRect(0,0,c.width,c.height);
+        cx.fillStyle='#555';cx.font='14px sans-serif';cx.textAlign='center';
+        cx.fillText('Нет данных за выбранный период',c.width/2,c.height/2);
+      });
+      document.getElementById('degen-chart-half').style.display=_hasDegenInst?'':'none';
+      document.getElementById('tbank-chart-half').style.display=_hasTbankInst?'':'none';
+      return;
+    }
     const labels=pnl.map(d=>{
       const dt=d.trade_date;
       if(currentTF==='1M')return dt;
@@ -957,31 +1277,50 @@ async function loadChart(){
       return dt.length>10?dt.slice(11,16):dt;
     });
 
-    let cumBybit=0, cumTbank=0;
-    const bybitDaily=[], tbankDaily=[];
-    let hasTbank=false;
+    const bybitDaily=[], degenDaily=[], tbankDaily=[];
+    let hasTbank=false, hasDegen=false;
     pnl.forEach(d=>{
-      let bPnl=0, tPnl=0;
+      let bPnl=0, dPnl=0, tPnl=0;
       Object.keys(d).forEach(k=>{
         if(k==='trade_date'||k==='pnl'||k==='trades_count')return;
-        if(k.toUpperCase().includes('TBANK')){tPnl+=d[k];hasTbank=true}
+        const ku=k.toUpperCase();
+        if(ku.includes('TBANK')){tPnl+=d[k];hasTbank=true}
+        else if(ku.includes('DEGEN')){dPnl+=d[k];hasDegen=true}
         else{bPnl+=d[k]}
       });
       if(!Object.keys(d).some(k=>!['trade_date','pnl','trades_count'].includes(k))){bPnl=d.pnl}
-      bybitDaily.push(bPnl);tbankDaily.push(tPnl);
+      bybitDaily.push(bPnl);degenDaily.push(dPnl);tbankDaily.push(tPnl);
     });
-
-    if(chartBybit){chartBybit.destroy();chartBybit=null}
-    if(chartTbank){chartTbank.destroy();chartTbank=null}
 
     chartBybit=buildWaterfall('pnlChartBybit',labels,bybitDaily,
       'rgba(129,140,248,0.75)','rgba(255,82,82,0.75)','USDT','$');
 
+    const dgHalf=document.getElementById('degen-chart-half');
+    if(hasDegen||_hasDegenInst){
+      dgHalf.style.display='';
+      if(hasDegen){
+        chartDegen=buildLineChart('pnlChartDegen',labels,degenDaily,
+          '#f472b6','rgba(244,114,182,0.15)','USDT','$');
+      }else{
+        const c=document.getElementById('pnlChartDegen');
+        const cx=c.getContext('2d');cx.clearRect(0,0,c.width,c.height);
+        cx.fillStyle='#555';cx.font='14px sans-serif';cx.textAlign='center';
+        cx.fillText('DEGEN ещё не торговал',c.width/2,c.height/2);
+      }
+    }else{dgHalf.style.display='none'}
+
     const tbHalf=document.getElementById('tbank-chart-half');
-    if(hasTbank){
+    if(hasTbank||_hasTbankInst){
       tbHalf.style.display='';
-      chartTbank=buildWaterfall('pnlChartTbank',labels,tbankDaily,
-        'rgba(52,211,153,0.75)','rgba(255,82,82,0.75)','RUB','₽');
+      if(hasTbank){
+        chartTbank=buildWaterfall('pnlChartTbank',labels,tbankDaily,
+          'rgba(52,211,153,0.75)','rgba(255,82,82,0.75)','RUB','₽');
+      }else{
+        const c=document.getElementById('pnlChartTbank');
+        const cx=c.getContext('2d');cx.clearRect(0,0,c.width,c.height);
+        cx.fillStyle='#555';cx.font='14px sans-serif';cx.textAlign='center';
+        cx.fillText('Нет данных TBank за выбранный период',c.width/2,c.height/2);
+      }
     }else{
       tbHalf.style.display='none';
     }
@@ -990,20 +1329,21 @@ async function loadChart(){
     document.getElementById('chart-legend').innerHTML=`
       <span class="leg-item"><span class="leg-bar" style="background:rgba(129,140,248,0.75)"></span>Профит</span>
       <span class="leg-item"><span class="leg-bar" style="background:rgba(255,82,82,0.75)"></span>Убыток</span>
+      <span class="leg-item"><span class="leg-line" style="background:#f472b6"></span>DEGEN кумулятив</span>
     `;
   }catch(e){console.error('chart',e)}
 }
 
 async function loadPositions(){
   try{
-    const pos=await(await fetch('/api/positions')).json();
+    const pos=await(await fetch('/api/positions?source='+currentSource)).json();
     const body=document.getElementById('pos-body');
     if(!pos.length){body.innerHTML='<tr><td colspan="6" style="text-align:center;color:#555;padding:20px">Нет открытых позиций</td></tr>';return}
     body.innerHTML=pos.map(p=>{
       const pnl=parseFloat(p.unrealised_pnl)||0;
       const inst=(p.instance||'').toUpperCase();
-      const isCls=inst.includes('TBANK')?'inst-tbank':inst.includes('SCALP')?'inst-scalp':'inst-swing';
-      const iLabel=inst.includes('TBANK-SCALP')?'TB-SCALP':inst.includes('TBANK-SWING')?'TB-SWING':inst.includes('SCALP')?'SCALP':'SWING';
+      const isCls=inst.includes('TBANK')?'inst-tbank':inst.includes('DEGEN')?'inst-degen':inst.includes('SCALP')?'inst-scalp':'inst-swing';
+      const iLabel=inst.includes('TBANK-SCALP')?'TB-SCALP':inst.includes('TBANK-SWING')?'TB-SWING':inst.includes('DEGEN')?'DEGEN':inst.includes('SCALP')?'SCALP':'SWING';
       const cur=inst.includes('TBANK')?'RUB':'USDT';
       return`<tr class="fade-in">
         <td><span class="inst-tag ${isCls}">${iLabel}</span></td>
@@ -1017,7 +1357,7 @@ async function loadPositions(){
 
 async function loadTrades(page){
   try{
-    const r=await(await fetch('/api/trades?page='+page+'&per_page=20')).json();
+    const r=await(await fetch('/api/trades?page='+page+'&per_page=20&source='+currentSource)).json();
     currentPage=r.page;hasNext=r.has_next;
     document.getElementById('prev-btn').disabled=currentPage<=1;
     document.getElementById('next-btn').disabled=!hasNext;
@@ -1025,8 +1365,8 @@ async function loadTrades(page){
     document.getElementById('tbody').innerHTML=r.trades.map(t=>{
       const p=t.pnl||0;
       const inst=(t.instance||'').toUpperCase();
-      const isCls=inst.includes('TBANK')?'inst-tbank':inst.includes('SCALP')?'inst-scalp':'inst-swing';
-      const iLabel=inst.includes('TBANK-SCALP')?'TB-SCALP':inst.includes('TBANK-SWING')?'TB-SWING':inst.includes('SCALP')?'SCALP':'SWING';
+      const isCls=inst.includes('TBANK')?'inst-tbank':inst.includes('DEGEN')?'inst-degen':inst.includes('SCALP')?'inst-scalp':'inst-swing';
+      const iLabel=inst.includes('TBANK-SCALP')?'TB-SCALP':inst.includes('TBANK-SWING')?'TB-SWING':inst.includes('DEGEN')?'DEGEN':inst.includes('SCALP')?'SCALP':'SWING';
       return`<tr class="fade-in">
         <td><span class="inst-tag ${isCls}">${iLabel}</span></td>
         <td><strong>${t.symbol}</strong></td>
@@ -1041,11 +1381,12 @@ async function loadTrades(page){
 function changePage(d){loadTrades(currentPage+d)}
 
 async function loadAll(){
-  await Promise.all([loadInstances(),loadStats(),loadChart(),loadPositions(),loadTrades(currentPage)]);
+  await loadInstances();
+  await Promise.all([loadStats(),loadChart(),loadPositions(),loadTrades(currentPage)]);
   document.getElementById('last-update').textContent=
     'Обновлено: '+new Date().toLocaleTimeString('ru-RU')+' (автообновление каждые 30 сек)';
 }
 loadAll();
-setInterval(()=>{loadInstances();loadStats();loadChart();loadPositions()},30000);
+setInterval(async()=>{await loadInstances();loadStats();loadChart();loadPositions()},30000);
 </script>
 </body></html>"""

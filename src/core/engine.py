@@ -518,6 +518,7 @@ class TradingEngine:
         # Check existing positions
         open_trades = await self.db.get_open_trades()
         symbol_open = [t for t in open_trades if t["symbol"] == symbol and t["category"] == category]
+        side = "Buy" if result.signal == Signal.BUY else "Sell"
 
         # Kotegawa scaling in: allow adding to position on extreme deviation
         is_scale_in = False
@@ -555,8 +556,6 @@ class TradingEngine:
                     symbol, group_open, self._max_per_group, group,
                 )
                 return
-
-        side = "Buy" if result.signal == Signal.BUY else "Sell"
 
         # Spot: only Buy (no short selling)
         if category == "spot" and side == "Sell":
@@ -1201,13 +1200,13 @@ class TradingEngine:
         )
 
     async def _check_kotegawa_exit(self, trade: dict):
-        """Close position when price reverts back to SMA (Kotegawa mean-reversion exit).
+        """Close position when price reverts toward SMA (Kotegawa mean-reversion exit).
 
-        Buy was opened when price was far below SMA → close when deviation >= exit threshold.
-        Sell was opened when price was far above SMA → close when deviation <= -exit threshold.
+        Closes at kotegawa_exit_ratio (default 0.8 = 80%) of the way from entry to SMA.
+        Smaller target = higher probability of hitting it.
 
         Config (strategy section):
-          kotegawa_exit_dev: 0.3  # close when |deviation| drops to this % (default 0.3%)
+          kotegawa_exit_ratio: 0.8  # close at 80% of distance from entry to SMA
         """
         if not isinstance(self.signal_gen, KotegawaGenerator):
             return
@@ -1218,7 +1217,7 @@ class TradingEngine:
         qty = trade["qty"]
         category = trade["category"]
 
-        exit_dev = self.config.get("strategy", {}).get("kotegawa_exit_dev", 0.3)
+        exit_ratio = self.config.get("strategy", {}).get("kotegawa_exit_ratio", 0.8)
 
         try:
             df = self.client.get_klines(symbol, self.timeframe, limit=100, category=category)
@@ -1227,16 +1226,31 @@ class TradingEngine:
         except Exception:
             return
 
-        dev = calculate_sma_deviation(df, self.signal_gen.sma_period)
-
-        # Buy: opened below SMA (dev was negative), close when price returns to SMA
-        if side == "Buy" and dev < exit_dev:
-            return
-        # Sell: opened above SMA (dev was positive), close when price returns to SMA
-        if side == "Sell" and dev > -exit_dev:
+        from src.strategy.indicators import calculate_sma
+        sma = calculate_sma(df, self.signal_gen.sma_period)
+        sma_val = sma.iloc[-1]
+        if not sma_val or sma_val <= 0:
             return
 
-        # Price has reverted to SMA — close position
+        # Target = entry + ratio * (sma - entry)
+        target_price = entry + exit_ratio * (sma_val - entry)
+
+        try:
+            if self.exchange_type == "tbank":
+                cur_price = self.client.get_last_price(symbol)
+            else:
+                cur_price = self.client.get_last_price(symbol, category="linear")
+        except Exception:
+            return
+
+        # Buy: close when price >= target (price rose toward SMA)
+        if side == "Buy" and cur_price < target_price:
+            return
+        # Sell: close when price <= target (price fell toward SMA)
+        if side == "Sell" and cur_price > target_price:
+            return
+
+        # Price reached target — close position
         try:
             if self.exchange_type == "tbank":
                 cur_price = self.client.get_last_price(symbol)
@@ -1273,15 +1287,17 @@ class TradingEngine:
 
         self._scaled_in.discard(symbol)
 
+        dev = calculate_sma_deviation(df, self.signal_gen.sma_period)
         direction = "ЛОНГ" if side == "Buy" else "ШОРТ"
         emoji = "🎯" if upnl >= 0 else "📉"
+        ratio_pct = int(exit_ratio * 100)
         logger.info(
-            "%s Котегава выход: %s %s — цена вернулась к SMA (dev=%.1f%%, PnL=%.2f)",
-            emoji, direction, symbol, dev, upnl,
+            "%s Котегава выход: %s %s — цель %d%% к SMA (dev=%.1f%%, PnL=%.2f)",
+            emoji, direction, symbol, ratio_pct, dev, upnl,
         )
         await self._notify(
             f"{emoji} Котегава выход: {direction} {symbol}\n"
-            f"Цена вернулась к SMA (откл: {dev:+.1f}%)\n"
+            f"Цель {ratio_pct}% к SMA достигнута (откл: {dev:+.1f}%)\n"
             f"PnL: {upnl:+,.2f}"
         )
 
@@ -2523,6 +2539,7 @@ class TradingEngine:
             entry = t["entry_price"]
             size = t["qty"]
             side = t["side"]
+            cat = t["category"]
             direction = "ЛОНГ" if side == "Buy" else "ШОРТ"
             upnl = 0.0
             mark = 0.0
@@ -2542,11 +2559,42 @@ class TradingEngine:
                 pnl_pct = (upnl / (entry * size)) * 100
             else:
                 pnl_pct = 0.0
+
+            # Target exit price: SMA for Kotegawa, TP for others
+            target_line = ""
+            if isinstance(self.signal_gen, KotegawaGenerator):
+                try:
+                    from src.strategy.indicators import calculate_sma
+                    df = self.client.get_klines(sym, self.timeframe, limit=100, category=cat)
+                    if df is not None and not df.empty:
+                        sma = calculate_sma(df, self.signal_gen.sma_period)
+                        sma_val = sma.iloc[-1]
+                        if sma_val and sma_val > 0 and mark > 0:
+                            exit_ratio = self.config.get("strategy", {}).get("kotegawa_exit_ratio", 0.8)
+                            target = entry + exit_ratio * (sma_val - entry)
+                            if side == "Buy":
+                                target_pnl = (target - entry) * size
+                                target_pct = (target / mark - 1) * 100
+                            else:
+                                target_pnl = (entry - target) * size
+                                target_pct = (1 - target / mark) * 100
+                            ratio_pct = int(exit_ratio * 100)
+                            target_line = f"\n   Цель ({ratio_pct}% SMA): {target:,.4f} ({target_pct:+.1f}%, {target_pnl:+,.0f} {currency})"
+                except Exception:
+                    pass
+            elif t.get("take_profit") and t["take_profit"] > 0:
+                tp = t["take_profit"]
+                if side == "Buy":
+                    target_pnl = (tp - entry) * size
+                else:
+                    target_pnl = (entry - tp) * size
+                target_line = f"\n   Цель (TP): {tp:,.4f} ({target_pnl:+,.0f} {currency})"
+
             emoji = "🟢" if upnl >= 0 else "🔴"
             lines.append(
                 f"{emoji} {direction} {sym}\n"
                 f"   Вход: {entry}  →  Сейчас: {mark}\n"
-                f"   Объём: {size} | PnL: {upnl:+,.2f} {currency} ({pnl_pct:+.2f}%)"
+                f"   Объём: {size} | PnL: ({pnl_pct:+.2f}%, {upnl:+,.2f} {currency}){target_line}\n"
             )
 
         # Other instances — open trades from DB with live prices
@@ -2587,17 +2635,42 @@ class TradingEngine:
                                         tbank_pnl += upnl
                                     else:
                                         bybit_other_pnl += upnl
+                                    # SMA target for other Kotegawa instances
+                                    target_line = ""
+                                    try:
+                                        from src.strategy.indicators import calculate_sma
+                                        inst_tf = inst.get("timeframe", self.timeframe)
+                                        # Normalize timeframe: "1м" -> "1", "15м" -> "15"
+                                        inst_tf = inst_tf.replace("м", "").replace("m", "")
+                                        inst_cat = "tbank" if is_tbank else "linear"
+                                        df = self.client.get_klines(sym, inst_tf, limit=100, category=inst_cat)
+                                        if df is not None and not df.empty:
+                                            sma = calculate_sma(df, 25)
+                                            sma_val = sma.iloc[-1]
+                                            if sma_val and sma_val > 0 and cur_price and cur_price > 0:
+                                                exit_ratio = self.config.get("strategy", {}).get("kotegawa_exit_ratio", 0.8)
+                                                target = entry + exit_ratio * (sma_val - entry)
+                                                if r["side"] == "Buy":
+                                                    t_pnl = (target - entry) * qty_val
+                                                    t_pct = (target / cur_price - 1) * 100
+                                                else:
+                                                    t_pnl = (entry - target) * qty_val
+                                                    t_pct = (1 - target / cur_price) * 100
+                                                ratio_pct = int(exit_ratio * 100)
+                                                target_line = f"\n   Цель ({ratio_pct}% SMA): {target:,.4f} ({t_pct:+.1f}%, {t_pnl:+,.0f} {inst_currency})"
+                                    except Exception:
+                                        pass
                                     emoji = "🟢" if upnl >= 0 else "🔴"
                                     lines.append(
                                         f"{emoji} {direction} {sym}\n"
                                         f"   Вход: {entry}  →  Сейчас: {cur_price}\n"
-                                        f"   Объём: {qty_val} | PnL: {upnl:+,.2f} {inst_currency} ({pnl_pct:+.2f}%)"
+                                        f"   Объём: {qty_val} | PnL: ({pnl_pct:+.2f}%, {upnl:+,.2f} {inst_currency}){target_line}\n"
                                     )
                                 else:
                                     lines.append(
                                         f"📊 {direction} {sym}\n"
                                         f"   Вход: {entry}  →  Сейчас: ?\n"
-                                        f"   Объём: {qty_val}"
+                                        f"   Объём: {qty_val}\n"
                                     )
                 except Exception:
                     logger.warning("Failed to read positions from %s", inst_name, exc_info=True)

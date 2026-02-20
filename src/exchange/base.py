@@ -66,3 +66,7 @@ class ExchangeClient(ABC):
 
     def get_funding_rate(self, symbol: str) -> float:
         return 0.0
+
+    def get_orderbook(self, symbol: str, limit: int = 50) -> dict:
+        """Return {"bids": [[price, qty], ...], "asks": [[price, qty], ...]}."""
+        return {"bids": [], "asks": []}
