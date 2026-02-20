@@ -11,7 +11,7 @@ from src.exchange.base import ExchangeClient
 from src.risk.manager import RiskManager
 from src.storage.database import Database
 from src.strategy.ai_analyst import AIAnalyst, extract_indicator_values, format_risk_text, summarize_candles
-from src.strategy.indicators import calculate_atr
+from src.strategy.indicators import calculate_atr, calculate_sma_deviation
 from src.strategy.signals import KotegawaGenerator, Signal, SignalGenerator, SignalResult, Trend
 
 logger = logging.getLogger(__name__)
@@ -291,12 +291,6 @@ class TradingEngine:
                         "(size=%.4f, entry=%.4f) — may belong to another instance",
                         side, symbol, pos["size"], pos["entry_price"],
                     )
-
-            if untracked_count:
-                await self._notify(
-                    f"⚠️ Reconciliation: {untracked_count} позиций на бирже "
-                    f"не найдены в БД (возможно, другой инстанс)"
-                )
 
             logger.info(
                 "Reconciliation complete: %d synced, %d closed, %d untracked",
@@ -888,6 +882,7 @@ class TradingEngine:
                 if not trade.get("partial_closed"):
                     await self._check_partial_close(trade)
                 await self._check_smart_exit(trade)
+                await self._check_kotegawa_exit(trade)
                 await self._check_profit_target(trade)
                 await self._check_loss_target(trade)
                 await self._check_close_at_profit(trade)
@@ -1173,6 +1168,89 @@ class TradingEngine:
         await self._notify(
             f"🛑 Loss target: закрыл {direction} {symbol}\n"
             f"PnL: {upnl:,.0f} USDT (лимит: -{target}$)"
+        )
+
+    async def _check_kotegawa_exit(self, trade: dict):
+        """Close position when price reverts back to SMA (Kotegawa mean-reversion exit).
+
+        Buy was opened when price was far below SMA → close when deviation >= exit threshold.
+        Sell was opened when price was far above SMA → close when deviation <= -exit threshold.
+
+        Config (strategy section):
+          kotegawa_exit_dev: 0.3  # close when |deviation| drops to this % (default 0.3%)
+        """
+        if not isinstance(self.signal_gen, KotegawaGenerator):
+            return
+
+        symbol = trade["symbol"]
+        side = trade["side"]
+        entry = trade["entry_price"]
+        qty = trade["qty"]
+        category = trade["category"]
+
+        exit_dev = self.config.get("strategy", {}).get("kotegawa_exit_dev", 0.3)
+
+        try:
+            df = self.client.get_klines(symbol, self.timeframe, limit=100, category=category)
+            if df is None or df.empty:
+                return
+        except Exception:
+            return
+
+        dev = calculate_sma_deviation(df, self.signal_gen.sma_period)
+
+        # Buy: opened below SMA (dev was negative), close when price returns to SMA
+        if side == "Buy" and dev < exit_dev:
+            return
+        # Sell: opened above SMA (dev was positive), close when price returns to SMA
+        if side == "Sell" and dev > -exit_dev:
+            return
+
+        # Price has reverted to SMA — close position
+        try:
+            if self.exchange_type == "tbank":
+                cur_price = self.client.get_last_price(symbol)
+            else:
+                cur_price = self.client.get_last_price(symbol, category="linear")
+        except Exception:
+            return
+
+        if side == "Buy":
+            upnl = (cur_price - entry) * qty
+        else:
+            upnl = (entry - cur_price) * qty
+
+        close_side = "Sell" if side == "Buy" else "Buy"
+        try:
+            if self.exchange_type == "tbank":
+                self.client.place_order(symbol=symbol, side=close_side, qty=qty)
+            else:
+                self.client.place_order(symbol=symbol, side=close_side, qty=qty, category=category)
+        except Exception:
+            logger.exception("Kotegawa exit: failed to close %s", symbol)
+            return
+
+        try:
+            balance = self.client.get_balance()
+            await self.db.close_trade(trade["id"], cur_price, upnl)
+            await self.db.update_daily_pnl(upnl)
+            self.risk.record_pnl(upnl, balance)
+        except Exception:
+            logger.exception("Kotegawa exit: DB update failed for %s", symbol)
+
+        if upnl < 0 and self._cooldown_seconds > 0:
+            self._cooldowns[symbol] = time.time() + self._cooldown_seconds
+
+        direction = "ЛОНГ" if side == "Buy" else "ШОРТ"
+        emoji = "🎯" if upnl >= 0 else "📉"
+        logger.info(
+            "%s Котегава выход: %s %s — цена вернулась к SMA (dev=%.1f%%, PnL=%.2f)",
+            emoji, direction, symbol, dev, upnl,
+        )
+        await self._notify(
+            f"{emoji} Котегава выход: {direction} {symbol}\n"
+            f"Цена вернулась к SMA (откл: {dev:+.1f}%)\n"
+            f"PnL: {upnl:+,.2f}"
         )
 
     async def _check_smart_exit(self, trade: dict):
