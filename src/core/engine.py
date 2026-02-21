@@ -468,6 +468,12 @@ class TradingEngine:
                         break
                     sl = trade.get("stop_loss") or 0
                     tp = trade.get("take_profit") or 0
+                    # Dynamic SL tighten: when loss approaches TP amount, cap SL to TP
+                    if sl > 0 and tp > 0:
+                        try:
+                            await self._dynamic_sl_tighten(trade)
+                        except Exception:
+                            logger.exception("Dynamic SL error %s", trade.get("symbol"))
                     if sl > 0:
                         try:
                             await self._check_db_stop_loss(trade)
@@ -1000,19 +1006,6 @@ class TradingEngine:
             tp_source += f"→{tp_take_pct*100:.0f}%"
             logger.info("TP reduced: %s $%.0f → $%.0f (%.0f%% of target)", symbol, full_tp_profit, actual_tp_profit, tp_take_pct * 100)
 
-        # Clamp SL: dollar loss must not exceed dollar TP
-        if qty > 0:
-            tp_usd = abs(tp - price) * qty
-            sl_usd = abs(sl - price) * qty
-            if sl_usd > tp_usd and tp_usd > 0:
-                sl_dist = abs(tp - price)  # same distance as TP
-                if side == "Buy":
-                    sl = round(price - sl_dist, 6)
-                else:
-                    sl = round(price + sl_dist, 6)
-                sl_source += f"→cap≤TP"
-                logger.info("SL capped to TP: %s $%.0f → $%.0f", symbol, sl_usd, tp_usd)
-
         # Place order with retry on qty rejection
         order = None
         for attempt in range(3):
@@ -1502,6 +1495,50 @@ class TradingEngine:
         except Exception:
             return
         await self._check_db_stop_loss_with_price(trade, cur_price)
+
+    async def _dynamic_sl_tighten(self, trade: dict):
+        """Tighten SL to TP amount when unrealized loss approaches TP threshold (80%)."""
+        sl = trade.get("stop_loss") or 0
+        tp = trade.get("take_profit") or 0
+        entry = trade.get("entry_price") or 0
+        qty = trade.get("qty") or 0
+        side = trade.get("side", "")
+        symbol = trade.get("symbol", "")
+        if not all([sl, tp, entry, qty, side]):
+            return
+
+        tp_usd = abs(tp - entry) * qty
+        sl_usd = abs(sl - entry) * qty
+        if tp_usd <= 0 or sl_usd <= tp_usd:
+            return  # SL already ≤ TP, nothing to do
+
+        # Get current price
+        try:
+            if self.exchange_type == "tbank":
+                cur_price = self.client.get_last_price(symbol)
+            else:
+                cur_price = self.client.get_last_price(symbol, category="linear")
+        except Exception:
+            return
+        if not cur_price:
+            return
+
+        # Calculate unrealized loss
+        if side == "Buy":
+            unrealized_pnl = (cur_price - entry) * qty
+        else:
+            unrealized_pnl = (entry - cur_price) * qty
+
+        # When loss reaches 80% of TP amount → tighten SL to TP amount
+        if unrealized_pnl < 0 and abs(unrealized_pnl) >= tp_usd * 0.8:
+            new_sl_dist = abs(tp - entry)
+            if side == "Buy":
+                new_sl = round(entry - new_sl_dist, 6)
+            else:
+                new_sl = round(entry + new_sl_dist, 6)
+            logger.info("Dynamic SL tighten: %s loss $%.0f approaching TP $%.0f → SL $%.0f→$%.0f",
+                        symbol, abs(unrealized_pnl), tp_usd, sl_usd, tp_usd)
+            await self.db.update_trade(trade["id"], stop_loss=new_sl)
 
     async def _check_db_stop_loss_with_price(self, trade: dict, cur_price: float):
         """Close position when price hits stop_loss stored in DB."""
