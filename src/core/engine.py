@@ -862,10 +862,10 @@ class TradingEngine:
         day_arrow = "▲" if daily_total >= 0 else "▼"
         msg = (
             f"{'🟢' if side == 'Buy' else '🔴'} Открыл {direction} {symbol}\n"
-            f"Цена: {price}\n"
-            f"Объём: {qty}{size_note} (~{pos_value:,.0f} USDT)\n"
-            f"SL: {sl} ({sl_source}) | TP: {tp} ({tp_source}){trailing_msg}{atr_note}\n"
-            f"Баланс: {balance:,.0f} USDT ({day_arrow} сегодня: {daily_total:+,.0f})"
+            f"Цена: {price:.2f}\n"
+            f"SL: {sl:.2f} ({sl_source}) | TP: {tp:.2f} ({tp_source}){trailing_msg}{atr_note}\n"
+            f"Баланс: {balance:,.0f} USDT ({day_arrow} сегодня: {daily_total:+,.0f})\n"
+            f"Объём: {qty}{size_note} (~{pos_value:,.0f} USDT)"
         )
         if ai_reasoning:
             msg += f"\n{ai_reasoning}"
@@ -1344,7 +1344,7 @@ class TradingEngine:
         )
         await self._notify(
             f"{emoji} Котегава выход: {direction} {symbol}\n"
-            f"Цель {ratio_pct}% к SMA достигнута (откл: {dev:+.1f}%)\n"
+            f"Цель достигнута (откл: {dev:+.1f}%)\n"
             f"PnL: {upnl:+,.2f}"
         )
 
@@ -2661,8 +2661,7 @@ class TradingEngine:
                             else:
                                 target_pnl = (entry - target) * size
                                 target_pct = (1 - target / mark) * 100
-                            ratio_pct = int(exit_ratio * 100)
-                            target_line = f"\n   Цель ({ratio_pct}% SMA): {target:,.4f} ({target_pct:+.1f}%, {target_pnl:+,.0f} {currency})"
+                            target_line = f"\n   Цель: {target:,.2f} ({target_pct:+.1f}%, {target_pnl:+,.0f} {currency})"
                 except Exception:
                     pass
             elif t.get("take_profit") and t["take_profit"] > 0:
@@ -2671,7 +2670,7 @@ class TradingEngine:
                     target_pnl = (tp - entry) * size
                 else:
                     target_pnl = (entry - tp) * size
-                target_line = f"\n   Цель (TP): {tp:,.4f} ({target_pnl:+,.0f} {currency})"
+                target_line = f"\n   Цель: {tp:,.2f} ({target_pnl:+,.0f} {currency})"
 
             # Stop-loss line
             sl_line = ""
@@ -2683,13 +2682,15 @@ class TradingEngine:
                 else:
                     sl_pct = (1 - sl / mark) * 100
                     sl_pnl = (entry - sl) * size
-                sl_line = f"\n   Стоп-лосс: {sl:,.4f} ({sl_pct:+.1f}%, {sl_pnl:+,.0f} {currency})"
+                sl_line = f"\n   Стоп-лосс: {sl:,.2f} ({sl_pct:+.1f}%, {sl_pnl:+,.0f} {currency})"
 
+            pos_value = entry * size
             emoji = "🟢" if upnl >= 0 else "🔴"
             lines.append(
                 f"{emoji} {direction} {sym}\n"
-                f"   Вход: {entry}  →  Сейчас: {mark}\n"
-                f"   Объём: {size} | PnL: ({pnl_pct:+.2f}%, {upnl:+,.2f} {currency}){target_line}{sl_line}\n"
+                f"   Вход: {entry:.2f}  →  Сейчас: {mark:.2f}\n"
+                f"   PnL: {pnl_pct:+.2f}%, {upnl:+,.2f} {currency}{target_line}{sl_line}\n"
+                f"   Объём: {size} (~{pos_value:,.0f} {currency})\n"
             )
 
         # Other instances — open trades from DB with live prices
@@ -2753,8 +2754,7 @@ class TradingEngine:
                                                 else:
                                                     t_pnl = (entry - target) * qty_val
                                                     t_pct = (1 - target / cur_price) * 100
-                                                ratio_pct = int(exit_ratio * 100)
-                                                target_line = f"\n   Цель ({ratio_pct}% SMA): {target:,.4f} ({t_pct:+.1f}%, {t_pnl:+,.0f} {inst_currency})"
+                                                target_line = f"\n   Цель: {target:,.2f} ({t_pct:+.1f}%, {t_pnl:+,.0f} {inst_currency})"
                                     except Exception:
                                         pass
                                     # Stop-loss line
@@ -2767,18 +2767,20 @@ class TradingEngine:
                                         else:
                                             sl_pct = (1 - sl / cur_price) * 100
                                             sl_pnl = (entry - sl) * qty_val
-                                        sl_line = f"\n   Стоп-лосс: {sl:,.4f} ({sl_pct:+.1f}%, {sl_pnl:+,.0f} {inst_currency})"
+                                        sl_line = f"\n   Стоп-лосс: {sl:,.2f} ({sl_pct:+.1f}%, {sl_pnl:+,.0f} {inst_currency})"
 
+                                    inst_pos_value = entry * qty_val
                                     emoji = "🟢" if upnl >= 0 else "🔴"
                                     lines.append(
                                         f"{emoji} {direction} {sym}\n"
-                                        f"   Вход: {entry}  →  Сейчас: {cur_price}\n"
-                                        f"   Объём: {qty_val} | PnL: ({pnl_pct:+.2f}%, {upnl:+,.2f} {inst_currency}){target_line}{sl_line}\n"
+                                        f"   Вход: {entry:.2f}  →  Сейчас: {cur_price:.2f}\n"
+                                        f"   PnL: {pnl_pct:+.2f}%, {upnl:+,.2f} {inst_currency}{target_line}{sl_line}\n"
+                                        f"   Объём: {qty_val} (~{inst_pos_value:,.0f} {inst_currency})\n"
                                     )
                                 else:
                                     lines.append(
                                         f"📊 {direction} {sym}\n"
-                                        f"   Вход: {entry}  →  Сейчас: ?\n"
+                                        f"   Вход: {entry:.2f}  →  Сейчас: ?\n"
                                         f"   Объём: {qty_val}\n"
                                     )
                 except Exception:
