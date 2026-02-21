@@ -2447,6 +2447,9 @@ class TradingEngine:
                 except Exception:
                     logger.warning("Cannot create client for %s", inst_name)
                     continue
+            else:
+                # Bybit instances share the same account — use own client
+                other_client = self.client
 
             if not other_client:
                 continue
@@ -2454,12 +2457,18 @@ class TradingEngine:
             for row in rows:
                 symbol = row["symbol"]
                 try:
-                    positions = other_client.get_positions(symbol=symbol)
+                    if is_tbank:
+                        positions = other_client.get_positions(symbol=symbol)
+                    else:
+                        positions = other_client.get_positions(symbol=symbol, category="linear")
                     for p in positions:
                         if p["symbol"] != symbol or p["size"] <= 0:
                             continue
                         close_side = "Sell" if p["side"] == "Buy" else "Buy"
-                        other_client.place_order(symbol=symbol, side=close_side, qty=p["size"])
+                        if is_tbank:
+                            other_client.place_order(symbol=symbol, side=close_side, qty=p["size"])
+                        else:
+                            other_client.place_order(symbol=symbol, side=close_side, qty=p["size"], category="linear")
                         closed.append(f"{symbol} ({p['side']}) [{inst_name}]")
                 except Exception as e:
                     err_str = str(e)
@@ -2478,7 +2487,7 @@ class TradingEngine:
                     open_rows = await cur.fetchall()
                     for t in open_rows:
                         try:
-                            exit_price = other_client.get_last_price(t["symbol"])
+                            exit_price = other_client.get_last_price(t["symbol"]) if is_tbank else other_client.get_last_price(t["symbol"], category="linear")
                             if t["side"] == "Buy":
                                 pnl = (exit_price - t["entry_price"]) * t["qty"]
                             else:

@@ -107,6 +107,7 @@ class Database:
         await self._db.commit()
 
     async def get_open_trades(self) -> list[dict]:
+        await self._db.commit()  # flush WAL — ensure fresh read
         cursor = await self._db.execute(
             "SELECT * FROM trades WHERE status = 'open'"
         )
