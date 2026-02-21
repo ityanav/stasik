@@ -373,6 +373,7 @@ class AIAnalyst:
     _PROVIDER_URLS = {
         "openrouter": "https://openrouter.ai/api/v1/chat/completions",
         "groq": "https://api.groq.com/openai/v1/chat/completions",
+        "deepseek": "https://api.deepseek.com/chat/completions",
     }
 
     async def _call_api(self, system: str, user: str) -> str:

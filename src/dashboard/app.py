@@ -496,7 +496,7 @@ class Dashboard:
                 except Exception:
                     logger.warning("Failed to read positions from %s", inst_name)
 
-        # Enrich Bybit positions with live unrealised PnL
+        # Enrich positions with live unrealised PnL (calculated per-instance)
         if not is_archive and self.engine and positions:
             try:
                 exchange = self.config.get("exchange", "bybit")
@@ -504,10 +504,16 @@ class Dashboard:
                     raw = self.engine.client.get_positions()
                 else:
                     raw = self.engine.client.get_positions(category="linear")
-                live_pnl = {p["symbol"]: p["unrealised_pnl"] for p in raw}
+                # Use mark_price to calculate PnL per position (not Bybit total)
+                live_mark = {p["symbol"]: p.get("mark_price", 0) for p in raw}
                 for pos in positions:
-                    if pos["symbol"] in live_pnl:
-                        pos["unrealised_pnl"] = live_pnl[pos["symbol"]]
+                    sym = pos["symbol"]
+                    if sym in live_mark and live_mark[sym]:
+                        mark = float(live_mark[sym])
+                        entry = float(pos["entry_price"])
+                        qty = float(pos["size"])
+                        direction = 1 if pos["side"] == "Buy" else -1
+                        pos["unrealised_pnl"] = round((mark - entry) * qty * direction, 2)
             except Exception:
                 pass
 
