@@ -1497,7 +1497,7 @@ class TradingEngine:
         await self._check_db_stop_loss_with_price(trade, cur_price)
 
     async def _dynamic_sl_tighten(self, trade: dict):
-        """Tighten SL to TP amount when unrealized loss approaches TP threshold (80%)."""
+        """Tighten SL: max SL = 83% of TP (TP=$120 → SL≤$100). Triggers at 80% of limit."""
         sl = trade.get("stop_loss") or 0
         tp = trade.get("take_profit") or 0
         entry = trade.get("entry_price") or 0
@@ -1508,9 +1508,10 @@ class TradingEngine:
             return
 
         tp_usd = abs(tp - entry) * qty
+        max_sl_usd = tp_usd * 0.83  # SL не больше 83% от TP ($120 TP → $100 SL)
         sl_usd = abs(sl - entry) * qty
-        if tp_usd <= 0 or sl_usd <= tp_usd:
-            return  # SL already ≤ TP, nothing to do
+        if tp_usd <= 0 or sl_usd <= max_sl_usd:
+            return  # SL already ≤ 83% of TP, nothing to do
 
         # Get current price
         try:
@@ -1529,15 +1530,15 @@ class TradingEngine:
         else:
             unrealized_pnl = (entry - cur_price) * qty
 
-        # When loss reaches 80% of TP amount → tighten SL to TP amount
-        if unrealized_pnl < 0 and abs(unrealized_pnl) >= tp_usd * 0.8:
-            new_sl_dist = abs(tp - entry)
+        # When loss reaches 80% of max_sl → tighten SL to 83% of TP
+        if unrealized_pnl < 0 and abs(unrealized_pnl) >= max_sl_usd * 0.8:
+            new_sl_dist = abs(tp - entry) * 0.83
             if side == "Buy":
                 new_sl = round(entry - new_sl_dist, 6)
             else:
                 new_sl = round(entry + new_sl_dist, 6)
-            logger.info("Dynamic SL tighten: %s loss $%.0f approaching TP $%.0f → SL $%.0f→$%.0f",
-                        symbol, abs(unrealized_pnl), tp_usd, sl_usd, tp_usd)
+            logger.info("Dynamic SL tighten: %s loss $%.0f → SL $%.0f→$%.0f (83%% of TP $%.0f)",
+                        symbol, abs(unrealized_pnl), sl_usd, max_sl_usd, tp_usd)
             await self.db.update_trade(trade["id"], stop_loss=new_sl)
 
     async def _check_db_stop_loss_with_price(self, trade: dict, cur_price: float):
