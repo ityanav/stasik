@@ -108,6 +108,14 @@ class TradingEngine:
         self._market_bias_enabled: bool = config["strategy"].get("market_bias", True)
         self._bias_score_bonus: int = config["strategy"].get("bias_score_bonus", 1)
 
+        # Liquidity filter
+        strat = config.get("strategy", {})
+        self._min_turnover_24h: float = strat.get("min_24h_turnover", 0)
+        self._max_spread_pct: float = strat.get("max_spread_pct", 0)
+        self._tickers_cache: dict = {}
+        self._tickers_cache_ts: float = 0
+        self._liquidity_log_ts: dict[str, float] = {}  # symbol -> last log timestamp
+
         # AI lessons from strategy reviews
         self._ai_lessons: list[str] = []
 
@@ -406,6 +414,54 @@ class TradingEngine:
         else:
             return ["spot", "linear"]
 
+    def _get_tickers_cached(self) -> dict:
+        """Return all tickers, cached for 5 minutes."""
+        now = time.time()
+        if now - self._tickers_cache_ts > 300:
+            try:
+                self._tickers_cache = self.client.get_all_tickers()
+                self._tickers_cache_ts = now
+            except Exception:
+                logger.warning("Failed to fetch tickers for liquidity filter", exc_info=True)
+        return self._tickers_cache
+
+    def _check_liquidity(self, symbol: str) -> bool:
+        """Pre-trade liquidity filter. Returns True if symbol passes."""
+        if self._min_turnover_24h == 0 and self._max_spread_pct == 0:
+            return True
+
+        tickers = self._get_tickers_cached()
+        ticker = tickers.get(symbol)
+        if not ticker:
+            return True  # no data — allow trade (conservative)
+
+        turnover = ticker["turnover24h"]
+        last_price = ticker["last_price"]
+        bid = ticker["bid1"]
+        ask = ticker["ask1"]
+
+        passed = True
+        reasons = []
+
+        if self._min_turnover_24h > 0 and turnover < self._min_turnover_24h:
+            passed = False
+            reasons.append(f"turnover=${turnover/1e6:.1f}M<${self._min_turnover_24h/1e6:.0f}M")
+
+        if self._max_spread_pct > 0 and last_price > 0 and bid > 0 and ask > 0:
+            spread_pct = (ask - bid) / last_price * 100
+            if spread_pct > self._max_spread_pct:
+                passed = False
+                reasons.append(f"spread={spread_pct:.3f}%>{self._max_spread_pct}%")
+
+        if not passed:
+            now = time.time()
+            last_log = self._liquidity_log_ts.get(symbol, 0)
+            if now - last_log > 1800:  # log once per 30 min per symbol
+                self._liquidity_log_ts[symbol] = now
+                logger.info("Liquidity filter: skip %s (%s)", symbol, ", ".join(reasons))
+
+        return passed
+
     async def _process_pair(self, symbol: str, category: str):
         # Cooldown check (before API calls to save quota)
         now = time.time()
@@ -413,6 +469,10 @@ class TradingEngine:
         if now < cooldown_until:
             remaining = int(cooldown_until - now)
             logger.debug("Кулдаун %s: ещё %d сек", symbol, remaining)
+            return
+
+        # Liquidity filter (before candle fetch to save API calls)
+        if not self._check_liquidity(symbol):
             return
 
         df = self.client.get_klines(

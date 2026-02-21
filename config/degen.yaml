@@ -1,0 +1,142 @@
+instance_name: "DEGEN"
+initial_balance: 164235
+
+bybit:
+  testnet: false
+  demo: true
+  api_key: "Ct24OvPFimR3vLSlcW"
+  api_secret: "CNzK2w9eQ41j4A4dszBLvvOkAH61Z5BQG9oq"
+
+database:
+  path: "/root/stasik/data/degen.db"
+
+trading:
+  pairs: ["DOGEUSDT", "TRUMPUSDT", "WIFUSDT", "1000PEPEUSDT", "SHIB1000USDT", "1000BONKUSDT", "1000FLOKIUSDT", "FARTCOINUSDT", "PNUTUSDT", "ACTUSDT", "POPCATUSDT", "MEMEUSDT", "PENGUUSDT", "BRETTUSDT", "NOTUSDT", "GOATUSDT", "MOODENGUSDT", "VINEUSDT", "MELANIAUSDT", "VIRTUALUSDT"]
+  market_type: "futures"
+  timeframe: "5"                    # 5 мин — меньше шума для momentum
+  tick_interval: 10                 # проверка каждые 10 сек
+  htf_timeframe: "60"               # 1H HTF фильтр
+  leverage: 10                      # 10x
+  trading_hours: [0, 24]            # 24/7 — мемы торгуются круглосуточно
+
+strategy:
+  strategy_mode: "momentum"           # Momentum/breakout — ловим пампы мемов (long-only)
+  # Breakout
+  breakout_period: 20                # окно для поиска макс цены
+  rsi_momentum_min: 55               # RSI зона моментума: от
+  rsi_momentum_max: 75               # RSI зона моментума: до
+  # SMA (для совместимости / AI контекста)
+  sma_period: 25
+  sma_deviation_mild: 3.0
+  sma_deviation_extreme: 8.0
+  # RSI — ловим экстремальные значения
+  rsi_period: 14
+  rsi_overbought: 75                 # продаём при перегреве
+  rsi_oversold: 25                   # покупаем при панике
+  rsi_extreme_low: 15                # экстремальная паника → +2
+  rsi_extreme_high: 85               # экстремальная эйфория → -2
+  # EMA для HTF
+  ema_fast: 12
+  ema_slow: 26
+  # MACD (для AI аналитика)
+  macd_fast: 8
+  macd_slow: 17
+  macd_signal: 9
+  # Bollinger Bands
+  bb_period: 20
+  bb_std: 2.0                        # стандартные BB
+  # Volume — подтверждение паники
+  vol_period: 14
+  vol_threshold: 1.2                  # объём выше среднего = паника/FOMO
+  # Scoring
+  min_score: 4                        # 4 из 7 — требуем breakout или объём (было 3 — входил без пробоя)
+  adx_period: 14
+  adx_min: 8
+  fng_extreme_greed: 80               # не входить в лонг при extreme greed (памп уже был)
+  fng_extreme_fear: 20               # не входить при панике (momentum не работает)
+  funding_rate_max: 0.0005           # высокий funding = перегрет, не входить
+  patterns_enabled: true
+  orderbook_enabled: true             # стакан (контр-трендовый — продавцы = покупай)
+  market_bias: true                   # не входить в лонг когда BTC падает
+  kotegawa_exit_ratio: 0.7
+  htf_filter: true                   # не входить против часового тренда
+  # Liquidity filter — пропускать неликвидные мемы
+  min_24h_turnover: 2000000          # минимум $2M 24h оборот
+  max_spread_pct: 0.05               # макс спред 0.05%
+  # Anti-pump filter — блокировать изолированные спайки (pump-and-dump)
+  pump_filter: true
+  pump_candle_pct: 5.0               # свеча > 5% без предшествующих шагов = pump
+  pump_vol_spike: 3.0                # объём > 3x среднего без нарастания = pump
+  pump_min_steps: 2                  # минимум 2 зелёные свечи перед breakout
+
+risk:
+  risk_per_trade: 0.3               # 0.3% — консервативнее пока тестируем (было 0.5%)
+  stop_loss: 1.5                    # фолбэк SL 1.5% (было 0.5%)
+  take_profit: 3.0                  # фолбэк TP 3% (было 1%)
+  max_open_positions: 10            # 10 позиций (было 20 — слишком много)
+  max_daily_loss: 5.0               # 5% дневной лимит (было 8%)
+  trailing_stop: 0.8                # фолбэк trailing 0.8% (было 0.3%)
+  trailing_activation: 1.0          # активация после 1% прибыли (было 0.5%)
+  partial_close_enabled: false
+  # ATR-based dynamic SL/TP
+  atr_period: 14
+  atr_sl_multiplier: 2.0            # SL = 2.0 * ATR (было 1.0 — слишком тесно для мемов)
+  atr_tp_multiplier: 3.0            # TP = 3.0 * ATR (R:R = 1.5:1)
+  atr_trailing_multiplier: 1.5      # trailing = 1.5 * ATR (было 1.0)
+  # ATR clamp — шире для мемов на 5м
+  atr_sl_min: 0.8                   # мин SL 0.8% (было 0.35% — шум выбивал)
+  atr_sl_max: 2.5                   # макс SL 2.5% (было 0.5%)
+  atr_tp_min: 1.5                   # мин TP 1.5% (было 0.5%)
+  atr_tp_max: 5.0                   # макс TP 5% (было 2%)
+  atr_trail_min: 0.6                # мин trailing 0.6% (было 0.3%)
+  atr_trail_max: 2.0                # макс trailing 2% (было 1%)
+  # Cooldown
+  cooldown_after_loss: 15           # 15 мин кулдаун после стопа (было 5)
+  breakeven_activation: 0            # отключён — Котегава даёт позиции развиться
+  # Profit target — отключен (Котегава ждёт возврата к SMA)
+  profit_target_usd: 0
+  # Loss target — отключен (ATR SL управляет)
+  loss_target_usd: 0
+  smart_exit_min: 0                   # отключён — Котегава ждёт SMA
+  # Correlation: все мемы в одной группе, max 2
+  max_per_group: 4                  # 4 мема из одной группы
+  correlation_groups:
+    dog_memes: ["DOGEUSDT", "SHIB1000USDT", "1000FLOKIUSDT", "1000BONKUSDT"]
+    political: ["TRUMPUSDT", "ACTUSDT", "MELANIAUSDT", "VINEUSDT"]
+    sol_memes: ["WIFUSDT", "POPCATUSDT", "BRETTUSDT", "MOODENGUSDT", "GOATUSDT"]
+    degen: ["1000PEPEUSDT", "FARTCOINUSDT", "PNUTUSDT", "MEMEUSDT"]
+    tg_gaming: ["NOTUSDT", "PENGUUSDT"]
+    ai_agents: ["VIRTUALUSDT"]
+
+ai:
+  enabled: true
+  provider: "deepseek"
+  api_key: "sk-2dec36c8752d48b6b2cfdedd21337126"
+  model: "deepseek-chat"
+  style: "momentum"                   # AI по стратегии momentum (breakout, long-only)
+  min_confidence: 5                   # умеренный фильтр (было 3 — пропускал слабые сигналы)
+  timeout: 5                          # 5 сек таймаут (было 10) — быстрее fallback
+  review_interval: 60                 # ревью каждые 60 тиков (=60 мин)
+  extra_timeframes: ["5", "15", "60"] # multi-TF для AI
+
+other_instances:
+  - name: "SCALP"
+    db_path: "/root/stasik/data/trades.db"
+    service: "stasik"
+    timeframe: "5м"
+    leverage: "10x"
+    pairs: ["BTCUSDT", "ETHUSDT", "XRPUSDT", "ADAUSDT", "AVAXUSDT", "LINKUSDT", "NEARUSDT", "SUIUSDT", "APTUSDT", "TRUMPUSDT", "WIFUSDT", "1000PEPEUSDT", "SHIB1000USDT"]
+  - name: "SWING"
+    db_path: "/root/stasik/data/swing.db"
+    service: "stasik-swing"
+    timeframe: "D"
+    leverage: "2x"
+    pairs: ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "ADAUSDT", "AVAXUSDT", "LINKUSDT", "NEARUSDT", "SUIUSDT", "APTUSDT"]
+
+telegram:
+  token: "7852966698:AAFA_L6ovqXtTmMO05DBZg3UYbx4DklIY7k"
+  chat_id: "885025581"
+  notify_only: true                  # только уведомления (SCALP обрабатывает команды)
+
+dashboard:
+  enabled: false

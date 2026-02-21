@@ -374,6 +374,12 @@ class MomentumGenerator:
         self.min_score = strat.get("min_score", 3)
         self.patterns_enabled = strat.get("patterns_enabled", True)
 
+        # Anti-pump filter
+        self.pump_filter = strat.get("pump_filter", False)
+        self.pump_candle_pct = strat.get("pump_candle_pct", 5.0)
+        self.pump_vol_spike = strat.get("pump_vol_spike", 3.0)
+        self.pump_min_steps = strat.get("pump_min_steps", 2)
+
     def generate(self, df: pd.DataFrame, symbol: str = "?", orderbook: dict | None = None) -> SignalResult:
         df.attrs["symbol"] = symbol
         scores: dict[str, int] = {}
@@ -429,7 +435,16 @@ class MomentumGenerator:
         total = sum(scores.values())
 
         if total >= self.min_score:
-            signal = Signal.BUY
+            # Anti-pump filter: block isolated spikes without prior momentum
+            is_pump, pump_reason = self._is_pump(df)
+            if is_pump:
+                signal = Signal.HOLD
+                logger.info(
+                    "Anti-pump filter: blocked %s BUY (score=%d, reason=%s)",
+                    symbol, total, pump_reason,
+                )
+            else:
+                signal = Signal.BUY
         else:
             signal = Signal.HOLD  # never SELL
 
@@ -438,6 +453,53 @@ class MomentumGenerator:
             symbol, signal.value, total, rsi_val, vol_ratio, scores,
         )
         return SignalResult(signal=signal, score=total, details=scores)
+
+    def _is_pump(self, df: pd.DataFrame) -> tuple[bool, str]:
+        """Detect pump-and-dump: isolated spike without prior step-like momentum.
+
+        Returns (True, reason) if pump detected, (False, "") otherwise.
+
+        Checks:
+        1. Single-candle spike > pump_candle_pct% without step structure before it
+        2. Volume concentrated in 1 candle (>pump_vol_spike * avg) while prior
+           candles had below-average volume (no gradual buildup)
+        """
+        if not self.pump_filter or len(df) < 10:
+            return False, ""
+
+        close = df["close"].iloc[-1]
+        open_ = df["open"].iloc[-1]
+        candle_pct = (close - open_) / open_ * 100 if open_ > 0 else 0
+
+        # ── Check 1: single-candle spike without prior steps ────────
+        if candle_pct > self.pump_candle_pct:
+            # Count green "step" candles in the 5 candles before current
+            steps = 0
+            for i in range(-6, -1):
+                if len(df) + i >= 0:
+                    c = df["close"].iloc[i]
+                    o = df["open"].iloc[i]
+                    if c > o:
+                        steps += 1
+
+            if steps < self.pump_min_steps:
+                return True, f"spike {candle_pct:.1f}% (steps={steps}<{self.pump_min_steps})"
+
+        # ── Check 2: volume spike without buildup ───────────────────
+        vol = df["volume"]
+        avg_vol = vol.iloc[-self.vol_period - 1:-1].mean()
+        curr_vol = vol.iloc[-1]
+
+        if avg_vol > 0 and curr_vol > self.pump_vol_spike * avg_vol:
+            # Check if prior 3 candles all had at-or-below-average volume (no buildup)
+            prior_low = all(
+                vol.iloc[i] <= avg_vol for i in range(-4, -1)
+            )
+            # And current candle is a big green move (>3%)
+            if prior_low and candle_pct > 3.0:
+                return True, f"vol spike {curr_vol / avg_vol:.1f}x (no buildup, +{candle_pct:.1f}%)"
+
+        return False, ""
 
     def get_htf_trend(self, df: pd.DataFrame) -> Trend:
         """HTF trend for Momentum — same EMA logic."""

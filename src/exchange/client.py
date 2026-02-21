@@ -213,6 +213,22 @@ class BybitClient(ExchangeClient):
             logger.warning("Failed to get funding rate for %s: %s", symbol, e)
             return 0.0
 
+    # ── All tickers (bulk) ─────────────────────────────────
+
+    def get_all_tickers(self, category: str = "linear") -> dict:
+        """Return dict symbol → {turnover24h, bid1Price, ask1Price, lastPrice, openInterest}."""
+        resp = self.session.get_tickers(category=category)
+        result = {}
+        for t in resp["result"]["list"]:
+            result[t["symbol"]] = {
+                "turnover24h": float(t.get("turnover24h", 0)),
+                "last_price": float(t.get("lastPrice", 0)),
+                "bid1": float(t.get("bid1Price", 0)),
+                "ask1": float(t.get("ask1Price", 0)),
+                "open_interest": float(t.get("openInterest", 0)),
+            }
+        return result
+
     # ── Instrument info (min qty, tick size) ─────────────────
 
     def get_orderbook(self, symbol: str, limit: int = 50, category: str = "linear") -> dict:
