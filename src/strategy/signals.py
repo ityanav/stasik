@@ -342,3 +342,123 @@ class KotegawaGenerator:
             symbol, trend.value, self.ema_fast, fast_val, self.ema_slow, slow_val, price,
         )
         return trend
+
+
+class MomentumGenerator:
+    """Momentum/breakout strategy for meme coins (long-only).
+
+    Core idea: catch the beginning of a pump via breakout + volume + momentum,
+    ride it with trailing stop. Never short.
+
+    Signals (each 0 or +1/+2, never negative):
+      breakout      — price > max of last N candles (+1, +2 if on high volume)
+      rsi_momentum  — RSI in 55-75 zone (rising momentum, not overheated)
+      volume        — volume spike on green candle
+      ema_trend     — EMA fast > EMA slow (short-term uptrend)
+      bb_breakout   — price > upper BB (volatility breakout)
+      pattern       — bullish candlestick pattern (positive score only)
+    """
+
+    def __init__(self, config: dict):
+        strat = config["strategy"]
+        self.breakout_period = strat.get("breakout_period", 20)
+        self.rsi_period = strat.get("rsi_period", 14)
+        self.rsi_momentum_min = strat.get("rsi_momentum_min", 55)
+        self.rsi_momentum_max = strat.get("rsi_momentum_max", 75)
+        self.ema_fast = strat.get("ema_fast", 9)
+        self.ema_slow = strat.get("ema_slow", 21)
+        self.bb_period = strat.get("bb_period", 20)
+        self.bb_std = strat.get("bb_std", 2.0)
+        self.vol_period = strat.get("vol_period", 20)
+        self.vol_threshold = strat.get("vol_threshold", 1.5)
+        self.min_score = strat.get("min_score", 3)
+        self.patterns_enabled = strat.get("patterns_enabled", True)
+
+    def generate(self, df: pd.DataFrame, symbol: str = "?", orderbook: dict | None = None) -> SignalResult:
+        df.attrs["symbol"] = symbol
+        scores: dict[str, int] = {}
+
+        close = df["close"].iloc[-1]
+
+        # ── Breakout: price > max of last N candles ────────────
+        lookback = df["high"].iloc[-(self.breakout_period + 1):-1]
+        prev_max = lookback.max()
+        if close > prev_max:
+            _, vol_ratio = calculate_volume_signal(df, self.vol_period)
+            scores["breakout"] = 2 if vol_ratio >= self.vol_threshold else 1
+        else:
+            scores["breakout"] = 0
+
+        # ── RSI momentum (55-75 zone) ─────────────────────────
+        rsi = calculate_rsi(df, self.rsi_period)
+        rsi_val = rsi.iloc[-1]
+        if self.rsi_momentum_min <= rsi_val <= self.rsi_momentum_max:
+            scores["rsi_momentum"] = 1
+        else:
+            scores["rsi_momentum"] = 0
+
+        # ── Volume spike on green candle ──────────────────────
+        _, vol_ratio = calculate_volume_signal(df, self.vol_period)
+        candle_green = close > df["open"].iloc[-1]
+        if vol_ratio >= self.vol_threshold and candle_green:
+            scores["volume"] = 1
+        else:
+            scores["volume"] = 0
+
+        # ── EMA trend: fast > slow ────────────────────────────
+        ema_fast, ema_slow = calculate_ema(df, self.ema_fast, self.ema_slow)
+        if ema_fast.iloc[-1] > ema_slow.iloc[-1]:
+            scores["ema_trend"] = 1
+        else:
+            scores["ema_trend"] = 0
+
+        # ── BB breakout: price > upper band ───────────────────
+        upper, _, _ = calculate_bollinger(df, self.bb_period, self.bb_std)
+        if close > upper.iloc[-1]:
+            scores["bb_breakout"] = 1
+        else:
+            scores["bb_breakout"] = 0
+
+        # ── Bullish candlestick pattern ───────────────────────
+        if self.patterns_enabled:
+            pat_result = detect_candlestick_patterns(df)
+            scores["pattern"] = max(pat_result["score"], 0)  # only positive
+        else:
+            scores["pattern"] = 0
+
+        total = sum(scores.values())
+
+        if total >= self.min_score:
+            signal = Signal.BUY
+        else:
+            signal = Signal.HOLD  # never SELL
+
+        logger.info(
+            "Momentum %s: %s (score=%d, rsi=%.1f, vol=%.1fx, details=%s)",
+            symbol, signal.value, total, rsi_val, vol_ratio, scores,
+        )
+        return SignalResult(signal=signal, score=total, details=scores)
+
+    def get_htf_trend(self, df: pd.DataFrame) -> Trend:
+        """HTF trend for Momentum — same EMA logic."""
+        if len(df) < self.ema_slow + 2:
+            return Trend.NEUTRAL
+
+        ema_fast, ema_slow = calculate_ema(df, self.ema_fast, self.ema_slow)
+        fast_val = ema_fast.iloc[-1]
+        slow_val = ema_slow.iloc[-1]
+        price = df["close"].iloc[-1]
+
+        if fast_val > slow_val and price > fast_val:
+            trend = Trend.BULLISH
+        elif fast_val < slow_val and price < fast_val:
+            trend = Trend.BEARISH
+        else:
+            trend = Trend.NEUTRAL
+
+        symbol = df.attrs.get("symbol", "?")
+        logger.info(
+            "HTF тренд %s: %s (EMA%d=%.4f, EMA%d=%.4f, price=%.4f)",
+            symbol, trend.value, self.ema_fast, fast_val, self.ema_slow, slow_val, price,
+        )
+        return trend

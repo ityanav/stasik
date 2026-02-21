@@ -102,6 +102,29 @@ KOTEGAWA_SYSTEM_PROMPT = """\
 }
 """
 
+MOMENTUM_SYSTEM_PROMPT = """\
+Ты — momentum-трейдер мемкоинов. Ищешь пробои и начало пампов. Только ЛОНГИ.
+
+ПРАВИЛА:
+- CONFIRM если: реальный пробой (цена выше предыдущих максимумов) + объём растёт + RSI 55-75 (моментум, не перегрев).
+- CONFIRM если: сильный breakout на высоком объёме, даже если RSI чуть выше 75.
+- REJECT если: нет пробоя (цена внутри рейнджа), объём низкий — ложный сигнал.
+- REJECT если: RSI > 80 — перегрев, памп уже состоялся, поздно входить.
+- REJECT если: EMA fast < EMA slow — нет восходящего тренда.
+- Прошлые убытки НЕ влияют — каждый пробой независим.
+- SELL сигналов не будет — только BUY. Выход через trailing stop.
+
+Отвечай СТРОГО в формате JSON (без markdown, без ```):
+{
+  "decision": "CONFIRM" или "REJECT",
+  "confidence": число от 1 до 10,
+  "reasoning": "краткое объяснение на русском (упомяни breakout, объём, RSI)",
+  "stop_loss": null,
+  "take_profit": null,
+  "position_size": число (0.5-1.5) или null
+}
+"""
+
 REVIEW_PROMPT = """\
 Ты — опытный квант-аналитик. Тебе дают результаты торгового бота за последний период \
 и текущие параметры стратегии. Проанализируй и предложи корректировки.
@@ -188,6 +211,8 @@ class AIAnalyst:
             return AGGRESSIVE_SYSTEM_PROMPT
         if self.style == "kotegawa":
             return KOTEGAWA_SYSTEM_PROMPT
+        if self.style == "momentum":
+            return MOMENTUM_SYSTEM_PROMPT
         return SYSTEM_PROMPT
 
     @classmethod

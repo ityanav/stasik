@@ -12,7 +12,7 @@ from src.risk.manager import RiskManager
 from src.storage.database import Database
 from src.strategy.ai_analyst import AIAnalyst, extract_indicator_values, format_risk_text, summarize_candles
 from src.strategy.indicators import calculate_atr, calculate_sma_deviation
-from src.strategy.signals import KotegawaGenerator, Signal, SignalGenerator, SignalResult, Trend
+from src.strategy.signals import KotegawaGenerator, MomentumGenerator, Signal, SignalGenerator, SignalResult, Trend
 
 logger = logging.getLogger(__name__)
 
@@ -131,6 +131,9 @@ class TradingEngine:
         if mode == "kotegawa":
             logger.info("Strategy mode: Kotegawa (mean reversion)")
             return KotegawaGenerator(config)
+        if mode == "momentum":
+            logger.info("Strategy mode: Momentum (breakout, long-only)")
+            return MomentumGenerator(config)
         return SignalGenerator(config)
 
     def _update_market_bias(self):
