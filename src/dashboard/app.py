@@ -43,6 +43,33 @@ class Dashboard:
         self._setup_routes()
         self._runner: web.AppRunner | None = None
 
+        # Standalone Bybit client (used when engine is None)
+        self._client = None
+        if not engine and config.get("bybit"):
+            try:
+                from src.exchange.client import BybitClient
+                self._client = BybitClient(config)
+                logger.info("Dashboard: standalone BybitClient initialized")
+            except Exception:
+                logger.warning("Dashboard: failed to init standalone BybitClient")
+
+    def _get_client(self):
+        """Get Bybit client from engine or standalone."""
+        if self.engine:
+            return self.engine.client
+        return self._client
+
+    @staticmethod
+    def _check_service_active(service: str) -> bool:
+        try:
+            result = subprocess.run(
+                ["systemctl", "is-active", service],
+                capture_output=True, text=True, timeout=3,
+            )
+            return result.stdout.strip() == "active"
+        except Exception:
+            return False
+
     def _setup_routes(self):
         self.app.router.add_get("/login", self._login_page)
         self.app.router.add_post("/login", self._login_post)
@@ -52,6 +79,10 @@ class Dashboard:
         self.app.router.add_get("/api/trades", self._api_trades)
         self.app.router.add_get("/api/pnl", self._api_pnl)
         self.app.router.add_get("/api/positions", self._api_positions)
+        self.app.router.add_post("/api/toggle-service", self._api_toggle_service)
+        self.app.router.add_post("/api/close-position", self._api_close_position)
+        self.app.router.add_post("/api/close-all", self._api_close_all)
+        self.app.router.add_post("/api/double-position", self._api_double_position)
         self.app.router.add_get("/api/instances", self._api_instances)
 
     async def start(self):
@@ -175,12 +206,12 @@ class Dashboard:
         balance = 0.0
         running = False
         tbank_balance = 0.0
-        if not is_archive and self.engine:
+        if not is_archive and self._get_client():
             try:
-                balance = self.engine.client.get_balance()
+                balance = self._get_client().get_balance()
             except Exception:
                 pass
-            running = self.engine._running
+            running = self._check_service_active("stasik")
 
         exchange = self.config.get("exchange", "bybit")
         currency = "RUB" if exchange == "tbank" else "USDT"
@@ -201,7 +232,7 @@ class Dashboard:
                 except Exception:
                     pass
             # Get TBank balance (only for live mode)
-            if not is_archive and "TBANK" in inst_name.upper() and self.engine:
+            if not is_archive and "TBANK" in inst_name.upper():
                 try:
                     from src.exchange.tbank_client import TBankClient
                     import yaml
@@ -497,13 +528,13 @@ class Dashboard:
                     logger.warning("Failed to read positions from %s", inst_name)
 
         # Enrich positions with live unrealised PnL (calculated per-instance)
-        if not is_archive and self.engine and positions:
+        if not is_archive and self._get_client() and positions:
             try:
                 exchange = self.config.get("exchange", "bybit")
                 if exchange == "tbank":
-                    raw = self.engine.client.get_positions()
+                    raw = self._get_client().get_positions()
                 else:
-                    raw = self.engine.client.get_positions(category="linear")
+                    raw = self._get_client().get_positions(category="linear")
                 # Use mark_price to calculate PnL per position (not Bybit total)
                 live_mark = {p["symbol"]: p.get("mark_price", 0) for p in raw}
                 for pos in positions:
@@ -518,6 +549,135 @@ class Dashboard:
                 pass
 
         return web.json_response(positions)
+
+    async def _api_toggle_service(self, request: web.Request) -> web.Response:
+        """Start or stop a systemd service."""
+        try:
+            data = await request.json()
+            service = data.get("service", "")
+            action = data.get("action", "")  # "start" or "stop"
+            if not service or action not in ("start", "stop"):
+                return web.json_response({"ok": False, "error": "Bad request"}, status=400)
+            # Whitelist: only known stasik services
+            allowed = {"stasik", "stasik-degen", "stasik-swing", "stasik-tbank-scalp", "stasik-tbank-swing", "stasik-dashboard"}
+            if service not in allowed:
+                return web.json_response({"ok": False, "error": "Unknown service"}, status=400)
+
+            result = subprocess.run(
+                ["systemctl", action, service],
+                capture_output=True, text=True, timeout=10,
+            )
+            if result.returncode != 0:
+                return web.json_response({"ok": False, "error": result.stderr.strip()}, status=500)
+            return web.json_response({"ok": True, "message": f"{service} {action}ed"})
+        except Exception as e:
+            logger.exception("toggle-service error")
+            return web.json_response({"ok": False, "error": str(e)}, status=500)
+
+    async def _api_close_position(self, request: web.Request) -> web.Response:
+        """Close a single position by symbol."""
+        if self.engine:
+            try:
+                data = await request.json()
+                symbol = data.get("symbol", "")
+                if not symbol:
+                    return web.json_response({"ok": False, "error": "No symbol"}, status=400)
+                result = await self.engine.close_position(symbol)
+                return web.json_response({"ok": True, "message": result})
+            except Exception as e:
+                logger.exception("close-position error")
+                return web.json_response({"ok": False, "error": str(e)}, status=500)
+        # Standalone mode — close via BybitClient directly
+        client = self._get_client()
+        if not client:
+            return web.json_response({"ok": False, "error": "No client"}, status=503)
+        try:
+            data = await request.json()
+            symbol = data.get("symbol", "")
+            if not symbol:
+                return web.json_response({"ok": False, "error": "No symbol"}, status=400)
+            positions = client.get_positions(symbol=symbol, category="linear")
+            closed = False
+            for p in positions:
+                if p["symbol"] == symbol and p["size"] > 0:
+                    close_side = "Sell" if p["side"] == "Buy" else "Buy"
+                    client.place_order(symbol=symbol, side=close_side, qty=p["size"], category="linear")
+                    closed = True
+            if not closed:
+                return web.json_response({"ok": True, "message": f"Позиция {symbol} не найдена"})
+            return web.json_response({"ok": True, "message": f"Закрыто: {symbol}"})
+        except Exception as e:
+            logger.exception("close-position error")
+            return web.json_response({"ok": False, "error": str(e)}, status=500)
+
+    async def _api_close_all(self, request: web.Request) -> web.Response:
+        """Close all open positions."""
+        if self.engine:
+            try:
+                result = await self.engine.close_all_positions()
+                return web.json_response({"ok": True, "message": result})
+            except Exception as e:
+                logger.exception("close-all error")
+                return web.json_response({"ok": False, "error": str(e)}, status=500)
+        # Standalone mode
+        client = self._get_client()
+        if not client:
+            return web.json_response({"ok": False, "error": "No client"}, status=503)
+        try:
+            positions = client.get_positions(category="linear")
+            count = 0
+            for p in positions:
+                if p["size"] > 0:
+                    close_side = "Sell" if p["side"] == "Buy" else "Buy"
+                    client.place_order(symbol=p["symbol"], side=close_side, qty=p["size"], category="linear")
+                    count += 1
+            return web.json_response({"ok": True, "message": f"Закрыто {count} позиций"})
+        except Exception as e:
+            logger.exception("close-all error")
+            return web.json_response({"ok": False, "error": str(e)}, status=500)
+
+    async def _api_double_position(self, request: web.Request) -> web.Response:
+        """Open a new position with 2x size in the same direction."""
+        client = self._get_client()
+        if not client:
+            return web.json_response({"ok": False, "error": "No client"}, status=503)
+        try:
+            data = await request.json()
+            symbol = data.get("symbol", "")
+            side = data.get("side", "")
+            qty = float(data.get("qty", 0))
+            instance = data.get("instance", "")
+            if not symbol or not side or qty <= 0:
+                return web.json_response({"ok": False, "error": "Missing symbol/side/qty"}, status=400)
+            # Add same qty to double the position (existing + new = 2x)
+            client.place_order(symbol=symbol, side=side, qty=qty, category="linear")
+            # Update qty in the correct DB so dashboard reflects the change
+            db_path = self._resolve_instance_db(instance)
+            if db_path and Path(db_path).exists():
+                try:
+                    async with aiosqlite.connect(db_path) as db:
+                        await db.execute(
+                            "UPDATE trades SET qty = qty + ? WHERE symbol = ? AND status = 'open'",
+                            (qty, symbol),
+                        )
+                        await db.commit()
+                except Exception:
+                    logger.warning("Failed to update qty in DB for %s", symbol)
+            return web.json_response({"ok": True, "message": f"X2: {side} +{qty} {symbol}"})
+        except Exception as e:
+            logger.exception("double-position error")
+            return web.json_response({"ok": False, "error": str(e)}, status=500)
+
+    def _resolve_instance_db(self, instance: str) -> str | None:
+        """Map instance name to its DB path."""
+        instance_upper = (instance or "").upper()
+        main_name = self.config.get("instance_name", "SCALP").upper()
+        if not instance_upper or instance_upper == main_name:
+            return str(self.db.db_path)
+        for inst in self.config.get("other_instances", []):
+            if inst.get("name", "").upper() == instance_upper:
+                return inst.get("db_path", "")
+        return None
 
     async def _api_instances(self, request: web.Request) -> web.Response:
         source = request.query.get("source", "live")
@@ -563,6 +723,7 @@ class Dashboard:
 
             instances.append({
                 "name": self.config.get("instance_name", "SCALP"),
+                "service": "stasik",
                 "running": False,
                 "daily_pnl": scalp_daily,
                 "total_pnl": scalp_total,
@@ -580,10 +741,11 @@ class Dashboard:
             scalp_total = await self.db.get_total_pnl()
             scalp_stats = await self.db.get_trade_stats()
             scalp_open = await self.db.get_open_trades()
-            running = self.engine._running if self.engine else False
+            running = self._check_service_active("stasik")
 
             instances.append({
                 "name": self.config.get("instance_name", "SCALP"),
+                "service": "stasik",
                 "running": running,
                 "daily_pnl": scalp_daily,
                 "total_pnl": scalp_total,
@@ -669,6 +831,7 @@ class Dashboard:
 
         return {
             "name": name,
+            "service": service,
             "running": running,
             "daily_pnl": daily,
             "total_pnl": total,
@@ -783,17 +946,22 @@ body{font-family:'Segoe UI',-apple-system,sans-serif;background:var(--bg);color:
 .header{
   background:#fff;
   border-bottom:1px solid var(--border);
-  padding:16px 24px;display:flex;align-items:center;justify-content:space-between;
-  position:sticky;top:0;z-index:100;
+  padding:12px 24px;display:flex;align-items:center;justify-content:space-between;
+  position:sticky;top:0;z-index:100;gap:16px;flex-wrap:wrap;
 }
-.header-left{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+.header-left{display:flex;align-items:center;gap:12px;flex-shrink:0}
 .header .icon{font-size:32px}
 .header h1{font-size:20px;font-weight:700;color:#333;white-space:nowrap}
 .header h1 span{color:var(--purple);font-weight:400}
 .header-stats{font-size:13px;color:var(--muted);display:flex;align-items:center;gap:6px;border-left:1px solid #e0e0e6;padding-left:12px;white-space:nowrap}
 .header-stats .hs-val{color:#333;font-weight:600}
 .header-stats .hs-sep{color:#ccc;margin:0 4px}
-.header-right{display:flex;align-items:center;gap:16px}
+.header-center{display:flex;align-items:center;gap:10px;flex-wrap:wrap;font-size:13px}
+.header-center .msk-clock{font-weight:700;color:var(--purple);font-size:14px;font-variant-numeric:tabular-nums}
+.hsep{color:#ddd}
+.hmarket{display:flex;align-items:center;gap:5px}
+.hm-label{color:var(--muted);font-size:12px}
+.header-right{display:flex;align-items:center;gap:16px;flex-shrink:0}
 #status-badge{
   padding:5px 14px;border-radius:20px;font-size:12px;font-weight:600;letter-spacing:0.5px;
 }
@@ -877,7 +1045,7 @@ tr:hover{background:rgba(99,102,241,0.04)}
 .instance-card.degen::before{background:linear-gradient(90deg,#ec4899,#f472b6)}
 .instance-card.tbank::before{background:linear-gradient(90deg,#10b981,#34d399)}
 .instance-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px}
-.instance-name{font-size:18px;font-weight:700;color:#333;display:flex;align-items:center;gap:8px}
+.instance-name{font-size:18px;font-weight:700;color:#333;display:flex;align-items:center;gap:8px;flex:1;min-width:0}
 .instance-name .badge{
   font-size:10px;padding:3px 10px;border-radius:12px;font-weight:600;letter-spacing:0.5px;
 }
@@ -966,6 +1134,66 @@ tr:hover{background:rgba(99,102,241,0.04)}
 body.archive-mode{background:#faf5eb}
 body.archive-mode .header{background:#fff;border-bottom-color:rgba(245,158,11,0.25)}
 
+.btn-icon{
+  width:32px;height:32px;border-radius:8px;
+  font-size:14px;cursor:pointer;transition:all 0.2s;
+  border:1px solid;display:flex;align-items:center;justify-content:center;
+}
+.btn-icon-stop{background:rgba(229,57,53,0.08);border-color:rgba(229,57,53,0.25);color:#e53935}
+.btn-icon-stop:hover{background:rgba(229,57,53,0.18)}
+.btn-icon-play{background:rgba(22,163,74,0.08);border-color:rgba(22,163,74,0.25);color:#16a34a}
+.btn-icon-play:hover{background:rgba(22,163,74,0.18)}
+.btn-icon:disabled{opacity:0.4;cursor:not-allowed}
+
+.btn-close{
+  background:rgba(229,57,53,0.08);border:1px solid rgba(229,57,53,0.25);
+  color:#e53935;padding:5px 14px;border-radius:8px;font-size:12px;font-weight:600;
+  cursor:pointer;transition:all 0.2s;white-space:nowrap;
+}
+.btn-close:hover{background:rgba(229,57,53,0.18)}
+.btn-close:disabled{opacity:0.4;cursor:not-allowed}
+.btn-x2{
+  background:rgba(33,150,243,0.08);border:1px solid rgba(33,150,243,0.25);
+  color:#2196f3;padding:5px 10px;border-radius:8px;font-size:12px;font-weight:700;
+  cursor:pointer;transition:all 0.2s;white-space:nowrap;margin-right:6px;
+}
+.btn-x2:hover{background:rgba(33,150,243,0.18)}
+.btn-x2:disabled{opacity:0.4;cursor:not-allowed}
+.btn-close-all{
+  background:rgba(229,57,53,0.08);border:1px solid rgba(229,57,53,0.25);
+  color:#e53935;padding:10px 24px;border-radius:10px;font-size:14px;font-weight:600;
+  cursor:pointer;transition:all 0.2s;
+}
+.btn-close-all:hover{background:rgba(229,57,53,0.18)}
+.btn-close-all:disabled{opacity:0.4;cursor:not-allowed}
+
+.market-dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
+.market-dot.open{background:#16a34a;box-shadow:0 0 6px rgba(22,163,74,0.4)}
+.market-dot.closed{background:#e53935}
+.market-status{font-weight:600;font-size:12px}
+.market-status.open{color:var(--green)}
+.market-status.closed{color:var(--red)}
+.market-hours{color:var(--muted);font-size:11px}
+.market-bal{font-weight:700;font-size:13px;color:#333;background:var(--bg3);padding:2px 8px;border-radius:6px;font-variant-numeric:tabular-nums}
+
+.summary-bar{
+  background:#fff;border:1px solid var(--border);border-radius:12px;
+  padding:18px 24px;margin-bottom:20px;display:flex;align-items:center;gap:20px;
+  box-shadow:0 1px 4px rgba(0,0,0,0.06);flex-wrap:wrap;
+}
+.summary-main{text-align:center;min-width:140px}
+.summary-label{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:1.2px;margin-bottom:4px}
+.summary-value{font-size:32px;font-weight:800;font-variant-numeric:tabular-nums}
+.summary-divider{width:1px;height:48px;background:var(--border);flex-shrink:0}
+.summary-details{display:flex;flex-direction:column;gap:6px}
+.summary-item{display:flex;align-items:center;gap:8px}
+.summary-item-label{font-size:11px;color:var(--muted);min-width:56px}
+.summary-item-val{font-size:15px;font-weight:700;font-variant-numeric:tabular-nums}
+@media(max-width:600px){
+  .summary-bar{padding:14px 16px;gap:14px}
+  .summary-value{font-size:24px}
+  .summary-divider{width:100%;height:1px}
+}
 .last-update{text-align:center;color:#bbb;font-size:11px;padding:16px}
 
 @media(max-width:600px){
@@ -987,6 +1215,24 @@ body.archive-mode .header{background:#fff;border-bottom-color:rgba(245,158,11,0.
     <h1>Stasik <span>Trading Bot</span></h1>
     <div class="header-stats" id="header-stats"></div>
   </div>
+  <div class="header-center">
+    <span class="msk-clock" id="msk-clock">--:--:--</span>
+    <span class="hsep">|</span>
+    <div class="hmarket">
+      <span class="market-dot" id="bybit-dot"></span>
+      <span class="hm-label">Bybit</span>
+      <span class="market-status open">24/7</span>
+      <span class="market-bal" id="bybit-bal">—</span>
+    </div>
+    <span class="hsep">|</span>
+    <div class="hmarket">
+      <span class="market-dot" id="moex-dot"></span>
+      <span class="hm-label">MOEX</span>
+      <span class="market-status" id="moex-status">—</span>
+      <span class="market-hours" id="moex-hours"></span>
+      <span class="market-bal" id="tbank-bal">—</span>
+    </div>
+  </div>
   <div class="header-right">
     <div class="source-toggle" id="source-toggle">
       <button class="active" onclick="setSource('live')" data-source="live">Live</button>
@@ -999,6 +1245,47 @@ body.archive-mode .header{background:#fff;border-bottom-color:rgba(245,158,11,0.
 
 <div class="container">
   <div class="archive-banner" id="archive-banner" style="display:none">АРХИВ — данные до перехода на стратегию Котегавы</div>
+
+  <div class="summary-bar" id="summary-bar">
+    <div class="summary-main">
+      <div class="summary-label">Сегодня</div>
+      <div class="summary-value" id="summary-total">—</div>
+    </div>
+    <div class="summary-divider"></div>
+    <div class="summary-details">
+      <div class="summary-item">
+        <span class="summary-item-label">Bybit</span>
+        <span class="summary-item-val" id="summary-bybit">—</span>
+      </div>
+      <div class="summary-item">
+        <span class="summary-item-label">TBank</span>
+        <span class="summary-item-val" id="summary-tbank">—</span>
+      </div>
+    </div>
+    <div class="summary-divider"></div>
+    <div class="summary-details">
+      <div class="summary-item">
+        <span class="summary-item-label">Сделок</span>
+        <span class="summary-item-val" id="summary-trades">0</span>
+      </div>
+      <div class="summary-item">
+        <span class="summary-item-label">Позиции</span>
+        <span class="summary-item-val" id="summary-positions">0</span>
+      </div>
+    </div>
+    <div class="summary-divider"></div>
+    <div class="summary-details">
+      <div class="summary-item">
+        <span class="summary-item-label">Win Rate</span>
+        <span class="summary-item-val" id="summary-wr">—</span>
+      </div>
+      <div class="summary-item">
+        <span class="summary-item-label">Всего PnL</span>
+        <span class="summary-item-val" id="summary-all">—</span>
+      </div>
+    </div>
+  </div>
+
   <div class="instances" id="instances"></div>
 
   <div class="chart-section">
@@ -1076,9 +1363,12 @@ body.archive-mode .header{background:#fff;border-bottom-color:rgba(245,158,11,0.
     <h2>📊 Открытые позиции</h2>
     <div class="tbl-wrap">
       <table>
-        <thead><tr><th>Бот</th><th>Пара</th><th>Сторона</th><th>Размер</th><th>Вход</th><th>Unrealized PnL</th></tr></thead>
+        <thead><tr><th>Бот</th><th>Пара</th><th>Сторона</th><th>Размер</th><th>Вход</th><th>Unrealized PnL</th><th></th></tr></thead>
         <tbody id="pos-body"></tbody>
       </table>
+    </div>
+    <div id="close-all-wrap" style="display:none;margin-top:14px;text-align:right">
+      <button class="btn-close-all" onclick="closeAllPositions()">Закрыть все позиции</button>
     </div>
   </div>
 
@@ -1147,14 +1437,20 @@ async function loadInstances(){
       const tf=(isScalp||isDegen)?i.timeframe+'м':i.timeframe;
       const cur=isTbank?'RUB':'USDT';
       const icon=isTbank?'🏦':isDegen?'🎰':isScalp?'⚡':'🌊';
+      const svc=i.service||'';
+      const toggleBtn=svc&&currentSource==='live'?
+        (i.running?`<button class="btn-icon btn-icon-stop" onclick="toggleService('${svc}','stop',this)" title="Остановить">&#9632;</button>`
+                  :`<button class="btn-icon btn-icon-play" onclick="toggleService('${svc}','start',this)" title="Запустить">&#9654;</button>`):'';
       return`<div class="instance-card ${cardCls} fade-in">
         <div class="instance-header">
           <div class="instance-name">
             ${icon}
             <span>${i.name}</span>
-            <span class="badge ${badgeCls}">${tf} / ${i.leverage}x</span>
           </div>
-          <div class="instance-status ${i.running?'on':'off'}">${i.running?'РАБОТАЕТ':'СТОП'}</div>
+          <div style="display:flex;align-items:center;gap:8px;flex-shrink:0">
+            ${toggleBtn}
+            <div class="instance-status ${i.running?'on':'off'}">${i.running?'РАБОТАЕТ':'СТОП'}</div>
+          </div>
         </div>
         <div class="instance-stats">
           <div class="instance-stat"><h4>За день</h4><div class="val ${cls(i.daily_pnl)}">${fmt(i.daily_pnl)} ${cur}</div></div>
@@ -1168,6 +1464,28 @@ async function loadInstances(){
         </div>
       </div>`;
     }).join('');
+    // Summary widget
+    let bybitDay=0,tbankDay=0,bybitAll=0,tbankAll=0,totalTrades=0,totalPos=0,totalWins=0,totalLosses=0;
+    list.forEach(i=>{
+      const tb=i.name.toUpperCase().includes('TBANK');
+      if(tb){tbankDay+=i.daily_pnl;tbankAll+=i.total_pnl}
+      else{bybitDay+=i.daily_pnl;bybitAll+=i.total_pnl}
+      totalTrades+=i.total_trades;totalPos+=i.open_positions;
+      totalWins+=i.wins;totalLosses+=i.losses;
+    });
+    const totalDay=bybitDay+tbankDay;
+    document.getElementById('summary-total').className='summary-value '+(totalDay>=0?'g':'r');
+    document.getElementById('summary-total').textContent=(totalDay>=0?'+':'')+totalDay.toFixed(2)+' USDT';
+    document.getElementById('summary-bybit').className='summary-item-val '+(bybitDay>=0?'g':'r');
+    document.getElementById('summary-bybit').textContent=(bybitDay>=0?'+':'')+bybitDay.toFixed(2)+' USDT';
+    document.getElementById('summary-tbank').className='summary-item-val '+(tbankDay>=0?'g':'r');
+    document.getElementById('summary-tbank').textContent=(tbankDay>=0?'+':'')+tbankDay.toFixed(2)+' RUB';
+    document.getElementById('summary-trades').textContent=totalTrades;
+    document.getElementById('summary-positions').textContent=totalPos;
+    const wr=totalTrades>0?(totalWins/totalTrades*100).toFixed(1)+'%':'—';
+    document.getElementById('summary-wr').textContent=wr;
+    document.getElementById('summary-all').className='summary-item-val '+(bybitAll+tbankAll>=0?'g':'r');
+    document.getElementById('summary-all').textContent=(bybitAll>=0?'+':'')+bybitAll.toFixed(0)+' USDT';
   }catch(e){console.error('instances',e)}
 }
 
@@ -1179,9 +1497,12 @@ async function loadStats(){
     b.textContent=s.running?'РАБОТАЕТ':'ОСТАНОВЛЕН';
     const tb=s.tbank_balance||0;
     const hs=document.getElementById('header-stats');
-    hs.innerHTML=`Баланс: <span class="hs-val">${s.balance.toLocaleString('ru-RU',{maximumFractionDigits:0})} USDT</span>`
-      +(tb?` / <span class="hs-val">${tb.toLocaleString('ru-RU',{maximumFractionDigits:0})} RUB</span>`:'')
-      +`<span class="hs-sep">|</span>сделок: <span class="hs-val">${s.all_trades||s.total_trades}</span>`;
+    hs.innerHTML=`сделок: <span class="hs-val">${s.all_trades||s.total_trades}</span>`;
+    // Balance widgets in market bar
+    const bybitBal=document.getElementById('bybit-bal');
+    const tbankBal=document.getElementById('tbank-bal');
+    bybitBal.textContent=s.balance?s.balance.toLocaleString('ru-RU',{maximumFractionDigits:0})+' USDT':'—';
+    tbankBal.textContent=tb?tb.toLocaleString('ru-RU',{maximumFractionDigits:0})+' RUB':'—';
   }catch(e){console.error('stats',e)}
 }
 
@@ -1541,23 +1862,76 @@ async function loadChart(){
   }catch(e){console.error('chart',e)}
 }
 
+async function toggleService(service,action,btn){
+  const label=action==='stop'?'Остановить':'Запустить';
+  if(!confirm(label+' '+service+'?'))return;
+  const old=btn.innerHTML;
+  btn.disabled=true;btn.innerHTML='&#8987;';
+  try{
+    const r=await fetch('/api/toggle-service',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({service,action})});
+    const d=await r.json();
+    if(d.ok){btn.innerHTML='&#10003;';setTimeout(()=>loadAll(),2000)}
+    else{alert(d.error||'Ошибка');btn.disabled=false;btn.innerHTML=old}
+  }catch(e){alert('Ошибка: '+e);btn.disabled=false;btn.innerHTML=old}
+}
+
+async function closePosition(symbol,btn){
+  if(!confirm('Закрыть позицию '+symbol+'?'))return;
+  btn.disabled=true;btn.textContent='...';
+  try{
+    const r=await fetch('/api/close-position',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({symbol})});
+    const d=await r.json();
+    if(d.ok){btn.textContent='OK';setTimeout(()=>loadAll(),1500)}
+    else{alert(d.error||'Ошибка');btn.disabled=false;btn.textContent='Закрыть'}
+  }catch(e){alert('Ошибка: '+e);btn.disabled=false;btn.textContent='Закрыть'}
+}
+async function doublePosition(symbol,side,qty,instance,btn){
+  if(!confirm('Удвоить позицию '+symbol+'? (добавить +'+qty+' '+side+')'))return;
+  btn.disabled=true;btn.textContent='...';
+  try{
+    const r=await fetch('/api/double-position',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({symbol,side,qty,instance})});
+    const d=await r.json();
+    if(d.ok){btn.textContent='OK';setTimeout(()=>loadAll(),1500)}
+    else{alert(d.error||'Ошибка');btn.disabled=false;btn.textContent='X2'}
+  }catch(e){alert('Ошибка: '+e);btn.disabled=false;btn.textContent='X2'}
+}
+async function closeAllPositions(){
+  if(!confirm('Закрыть ВСЕ позиции?'))return;
+  const btn=document.querySelector('.btn-close-all');
+  btn.disabled=true;btn.textContent='Закрываю...';
+  try{
+    const r=await fetch('/api/close-all',{method:'POST',headers:{'Content-Type':'application/json'}});
+    const d=await r.json();
+    if(d.ok){btn.textContent='Готово';setTimeout(()=>loadAll(),1500)}
+    else{alert(d.error||'Ошибка');btn.disabled=false;btn.textContent='Закрыть все позиции'}
+  }catch(e){alert('Ошибка: '+e);btn.disabled=false;btn.textContent='Закрыть все позиции'}
+}
+
 async function loadPositions(){
   try{
     const pos=await(await fetch('/api/positions?source='+currentSource)).json();
     const body=document.getElementById('pos-body');
-    if(!pos.length){body.innerHTML='<tr><td colspan="6" style="text-align:center;color:#bbb;padding:20px">Нет открытых позиций</td></tr>';return}
+    const wrap=document.getElementById('close-all-wrap');
+    if(!pos.length){
+      body.innerHTML='<tr><td colspan="7" style="text-align:center;color:#bbb;padding:20px">Нет открытых позиций</td></tr>';
+      wrap.style.display='none';return;
+    }
+    wrap.style.display=currentSource==='live'?'':'none';
     body.innerHTML=pos.map(p=>{
       const pnl=parseFloat(p.unrealised_pnl)||0;
       const inst=(p.instance||'').toUpperCase();
       const isCls=inst.includes('TBANK')?'inst-tbank':inst.includes('DEGEN')?'inst-degen':inst.includes('SCALP')?'inst-scalp':'inst-swing';
       const iLabel=inst.includes('TBANK-SCALP')?'TB-SCALP':inst.includes('TBANK-SWING')?'TB-SWING':inst.includes('DEGEN')?'DEGEN':inst.includes('SCALP')?'SCALP':'SWING';
       const cur=inst.includes('TBANK')?'RUB':'USDT';
+      const closeBtn=currentSource==='live'?`<button class="btn-close" onclick="closePosition('${p.symbol}',this)">Закрыть</button>`:'';
+      const x2Btn=currentSource==='live'&&!inst.includes('TBANK')?`<button class="btn-x2" onclick="doublePosition('${p.symbol}','${p.side}',${p.size},'${p.instance||''}',this)">X2</button>`:'';
       return`<tr class="fade-in">
         <td><span class="inst-tag ${isCls}">${iLabel}</span></td>
         <td><strong>${p.symbol}</strong></td>
         <td class="${p.side==='Buy'?'side-long':'side-short'}">${p.side==='Buy'?'ЛОНГ':'ШОРТ'}</td>
         <td>${p.size}</td><td>${parseFloat(p.entry_price).toFixed(2)}</td>
-        <td class="${cls(pnl)}"><strong>${fmt(pnl)} ${cur}</strong></td></tr>`;
+        <td class="${cls(pnl)}"><strong>${fmt(pnl)} ${cur}</strong></td>
+        <td>${x2Btn} ${closeBtn}</td></tr>`;
     }).join('');
   }catch(e){console.error('positions',e)}
 }
@@ -1594,9 +1968,42 @@ async function loadAll(){
   await loadInstances();
   await Promise.all([loadStats(),loadChart(),loadPositions(),loadTrades(currentPage)]);
   document.getElementById('last-update').textContent=
-    'Обновлено: '+new Date().toLocaleTimeString('ru-RU')+' (автообновление каждые 30 сек)';
+    'Обновлено: '+new Date().toLocaleTimeString('ru-RU')+' (автообновление каждые 10 сек)';
 }
+function updateMarketBar(){
+  const now=new Date();
+  const msk=new Date(now.toLocaleString('en-US',{timeZone:'Europe/Moscow'}));
+  const h=msk.getHours(),m=msk.getMinutes(),day=msk.getDay();
+  const pad=n=>String(n).padStart(2,'0');
+  document.getElementById('msk-clock').textContent=pad(h)+':'+pad(m)+':'+pad(msk.getSeconds())+' МСК';
+  // Bybit always open
+  document.getElementById('bybit-dot').className='market-dot open';
+  // MOEX: Mon-Fri 10:00-18:50 MSK
+  const moexDot=document.getElementById('moex-dot');
+  const moexSt=document.getElementById('moex-status');
+  const moexHr=document.getElementById('moex-hours');
+  const t=h*60+m;
+  const isWeekday=day>=1&&day<=5;
+  const mainOpen=10*60, mainClose=18*60+50;  // 10:00-18:50
+  const evenOpen=19*60+5, evenClose=23*60+50; // 19:05-23:50
+  if(!isWeekday){
+    moexDot.className='market-dot closed';moexSt.className='market-status closed';
+    moexSt.textContent='Выходной';moexHr.textContent='пн-пт 10:00-18:50';
+  }else if(t>=mainOpen&&t<mainClose){
+    moexDot.className='market-dot open';moexSt.className='market-status open';
+    moexSt.textContent='Основная';moexHr.textContent='до '+pad(18)+':'+pad(50);
+  }else if(t>=evenOpen&&t<evenClose){
+    moexDot.className='market-dot open';moexSt.className='market-status open';
+    moexSt.textContent='Вечерняя';moexHr.textContent='до '+pad(23)+':'+pad(50);
+  }else{
+    moexDot.className='market-dot closed';moexSt.className='market-status closed';
+    if(t<mainOpen){moexSt.textContent='Закрыта';moexHr.textContent='откроется в 10:00'}
+    else{moexSt.textContent='Закрыта';moexHr.textContent='откроется в 10:00'}
+  }
+}
+updateMarketBar();setInterval(updateMarketBar,1000);
+
 loadAll();
-setInterval(async()=>{await loadInstances();loadStats();loadChart();loadPositions()},30000);
+setInterval(async()=>{await loadInstances();loadStats();loadChart();loadPositions()},10000);
 </script>
 </body></html>"""

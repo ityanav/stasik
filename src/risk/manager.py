@@ -22,11 +22,14 @@ class RiskManager:
         self.atr_trail_min = risk.get("atr_trail_min", 0.2) / 100
         self.atr_trail_max = risk.get("atr_trail_max", 2.0) / 100
         self.max_position_margin_pct = risk.get("max_position_margin_pct", 30) / 100
+        self.max_risk_per_trade = risk.get("max_risk_per_trade", 0)  # absolute $ cap per trade (0 = off)
+        self.daily_drawdown_from_profit = risk.get("daily_drawdown_from_profit", 0) / 100  # e.g. 50 = halt if lost 50% of peak daily profit
 
         # Commission rate (0 for Bybit, e.g. 0.04 for T-Invest = 0.04%)
         self.commission_rate = risk.get("commission_rate", 0.0) / 100
 
         self._daily_pnl: float = 0.0
+        self._daily_peak_pnl: float = 0.0
         self._daily_date: date = date.today()
         self._halted: bool = False
 
@@ -36,6 +39,7 @@ class RiskManager:
         today = date.today()
         if today != self._daily_date:
             self._daily_pnl = 0.0
+            self._daily_peak_pnl = 0.0
             self._daily_date = today
             self._halted = False
             logger.info("Daily PnL reset for %s", today)
@@ -43,11 +47,26 @@ class RiskManager:
     def record_pnl(self, pnl: float, balance: float):
         self._check_day_reset()
         self._daily_pnl += pnl
+        # Classic daily loss limit (% of balance)
         if balance > 0 and abs(self._daily_pnl) / balance >= self.max_daily_loss_pct and self._daily_pnl < 0:
             self._halted = True
             logger.warning(
                 "Daily loss limit reached: %.2f (%.1f%% of %.2f)",
                 self._daily_pnl, self._daily_pnl / balance * 100, balance,
+            )
+
+    def check_global_drawdown(self, global_daily_pnl: float):
+        """Check drawdown from peak across ALL bots. Called by engine after each trade."""
+        if self.daily_drawdown_from_profit <= 0:
+            return
+        if global_daily_pnl > self._daily_peak_pnl:
+            self._daily_peak_pnl = global_daily_pnl
+        if self._daily_peak_pnl > 0 and global_daily_pnl <= self._daily_peak_pnl * (1 - self.daily_drawdown_from_profit):
+            self._halted = True
+            logger.warning(
+                "Global drawdown from profit: peak=%.2f now=%.2f (lost %.0f%% of all-bots profit)",
+                self._daily_peak_pnl, global_daily_pnl,
+                (1 - global_daily_pnl / self._daily_peak_pnl) * 100,
             )
 
     @property
@@ -86,6 +105,8 @@ class RiskManager:
         leverage: int = 1,
     ) -> float:
         risk_amount = balance * self.risk_per_trade
+        if self.max_risk_per_trade > 0:
+            risk_amount = min(risk_amount, self.max_risk_per_trade)
         effective_sl = sl_pct if sl_pct is not None else self.stop_loss_pct
         if effective_sl <= 0:
             effective_sl = self.stop_loss_pct

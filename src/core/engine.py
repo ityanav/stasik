@@ -107,6 +107,7 @@ class TradingEngine:
         self._market_bias_symbol: str = config["strategy"].get("bias_symbol", "BTCUSDT")
         self._market_bias_enabled: bool = config["strategy"].get("market_bias", True)
         self._bias_score_bonus: int = config["strategy"].get("bias_score_bonus", 1)
+        self._bias_block_bearish: bool = config["strategy"].get("bias_block_bearish", False)
 
         # Liquidity filter
         strat = config.get("strategy", {})
@@ -209,6 +210,17 @@ class TradingEngine:
         self.risk._daily_pnl = today_pnl
         if today_pnl != 0:
             logger.info("Restored daily PnL: %.2f", today_pnl)
+
+        # Restore global peak PnL for drawdown-from-profit check
+        if self.risk.daily_drawdown_from_profit > 0:
+            try:
+                daily_map = await self._get_all_daily_pnl()
+                global_pnl = sum(daily_map.values())
+                self.risk._daily_peak_pnl = max(global_pnl, 0)
+                if global_pnl > 0:
+                    logger.info("Restored global peak PnL: %.2f", global_pnl)
+            except Exception:
+                pass
 
         # Restore cooldowns from recent losing trades closed today
         await self._restore_cooldowns()
@@ -473,6 +485,10 @@ class TradingEngine:
 
         # Liquidity filter (before candle fetch to save API calls)
         if not self._check_liquidity(symbol):
+            return
+
+        # Hard block: skip all new entries in bearish market (momentum long-only)
+        if self._bias_block_bearish and self._market_bias == "bearish":
             return
 
         df = self.client.get_klines(
@@ -1080,7 +1096,7 @@ class TradingEngine:
         balance = self.client.get_balance()
         await self.db.close_trade(trade["id"], exit_price, pnl)
         await self.db.update_daily_pnl(pnl)
-        self.risk.record_pnl(pnl, balance)
+        await self._record_pnl(pnl, balance)
 
         # Cooldown after loss
         if pnl < 0 and self._cooldown_seconds > 0:
@@ -1229,7 +1245,7 @@ class TradingEngine:
             balance = self.client.get_balance()
             await self.db.close_trade(trade["id"], exit_price, actual_pnl)
             await self.db.update_daily_pnl(actual_pnl)
-            self.risk.record_pnl(actual_pnl, balance)
+            await self._record_pnl(actual_pnl, balance)
         except Exception:
             logger.exception("Profit target: DB update failed for %s", symbol)
 
@@ -1292,7 +1308,7 @@ class TradingEngine:
             balance = self.client.get_balance()
             await self.db.close_trade(trade["id"], exit_price, actual_pnl)
             await self.db.update_daily_pnl(actual_pnl)
-            self.risk.record_pnl(actual_pnl, balance)
+            await self._record_pnl(actual_pnl, balance)
         except Exception:
             logger.exception("Loss target: DB update failed for %s", symbol)
 
@@ -1385,7 +1401,7 @@ class TradingEngine:
             balance = self.client.get_balance()
             await self.db.close_trade(trade["id"], cur_price, upnl)
             await self.db.update_daily_pnl(upnl)
-            self.risk.record_pnl(upnl, balance)
+            await self._record_pnl(upnl, balance)
         except Exception:
             logger.exception("Kotegawa exit: DB update failed for %s", symbol)
 
@@ -1481,7 +1497,7 @@ class TradingEngine:
             balance = self.client.get_balance()
             await self.db.close_trade(trade["id"], cur_price, upnl)
             await self.db.update_daily_pnl(upnl)
-            self.risk.record_pnl(upnl, balance)
+            await self._record_pnl(upnl, balance)
         except Exception:
             logger.exception("Smart exit: DB update failed for %s", symbol)
 
@@ -1848,6 +1864,17 @@ class TradingEngine:
                 result[inst_name] = 0.0
 
         return result
+
+    async def _record_pnl(self, pnl: float, balance: float):
+        """Record PnL and check global drawdown across all bots."""
+        await self._record_pnl(pnl, balance)
+        if self.risk.daily_drawdown_from_profit > 0:
+            try:
+                daily_map = await self._get_all_daily_pnl()
+                global_pnl = sum(daily_map.values())
+                self.risk.check_global_drawdown(global_pnl)
+            except Exception:
+                logger.warning("Failed to check global drawdown")
 
     async def _format_balance_block(self) -> str:
         """Format full balance block with accounts, yesterday, today, current."""
@@ -2358,7 +2385,7 @@ class TradingEngine:
                     await self.db.close_trade(t["id"], exit_price, pnl)
                     await self.db.update_daily_pnl(pnl)
                     balance = self.client.get_balance()
-                    self.risk.record_pnl(pnl, balance)
+                    await self._record_pnl(pnl, balance)
                 except Exception:
                     logger.exception("Failed to update DB for %s", symbol)
 
@@ -2479,7 +2506,7 @@ class TradingEngine:
                 await self.db.close_trade(t["id"], exit_price, pnl)
                 await self.db.update_daily_pnl(pnl)
                 balance = self.client.get_balance()
-                self.risk.record_pnl(pnl, balance)
+                await self._record_pnl(pnl, balance)
             except Exception:
                 logger.exception("Failed to update DB for %s", t["symbol"])
 
