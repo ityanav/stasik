@@ -139,7 +139,9 @@ class Dashboard:
                 try:
                     async with aiosqlite.connect(archive_path) as db:
                         db.row_factory = aiosqlite.Row
-                        cur = await db.execute("SELECT COALESCE(SUM(pnl), 0) as total FROM daily_pnl")
+                        cur = await db.execute(
+                            "SELECT COALESCE(SUM(pnl), 0) as total FROM trades WHERE status = 'closed'"
+                        )
                         row = await cur.fetchone()
                         if row:
                             total_pnl = float(row["total"])
@@ -300,10 +302,7 @@ class Dashboard:
 
         instance_name = self.config.get("instance_name", "SCALP")
 
-        if tf in ("1D", "1M"):
-            return await self._pnl_daily(days, tf, instance_name, source)
-        else:
-            return await self._pnl_intraday(tf, instance_name, source)
+        return await self._pnl_intraday(tf, instance_name, source)
 
     async def _pnl_daily(self, days: int, tf: str, instance_name: str, source: str = "live") -> web.Response:
         """Daily or monthly PnL from daily_pnl table."""
@@ -372,16 +371,11 @@ class Dashboard:
         return web.json_response(result)
 
     async def _pnl_intraday(self, tf: str, instance_name: str, source: str = "live") -> web.Response:
-        """Intraday PnL from trades table (10m, 30m, 1H buckets)."""
-        from datetime import datetime, timedelta
+        """Intraday PnL from trades table — all trades from the very first one."""
+        from datetime import datetime
 
-        minutes = {"1m": 1, "5m": 5, "10m": 10, "30m": 30, "1H": 60}.get(tf, 60)
-        # How far back to look — for archive use much larger window
-        if source == "archive":
-            lookback_hours = {"1m": 24, "5m": 72, "10m": 168, "30m": 720, "1H": 2160}.get(tf, 720)
-        else:
-            lookback_hours = {"1m": 2, "5m": 4, "10m": 6, "30m": 24, "1H": 72}.get(tf, 24)
-        since = (datetime.utcnow() - timedelta(hours=lookback_hours)).strftime("%Y-%m-%d %H:%M:%S")
+        minutes = {"1m": 1, "5m": 5, "10m": 10, "30m": 30, "1H": 60, "1D": 1440, "1M": 43200}.get(tf, 60)
+        per_trade = True  # always show each trade as a separate point
 
         main_db_path = _get_db_path(str(self.db.db_path), source)
         all_dbs = [(main_db_path, instance_name)]
@@ -390,6 +384,7 @@ class Dashboard:
             if db_path and Path(db_path).exists():
                 all_dbs.append((db_path, inst.get("name", "???")))
 
+        all_trades: list[dict] = []
         pnl_by_bucket: dict[str, dict] = {}
 
         for db_path, inst_name in all_dbs:
@@ -397,8 +392,7 @@ class Dashboard:
                 async with aiosqlite.connect(db_path) as db:
                     db.row_factory = aiosqlite.Row
                     cur = await db.execute(
-                        "SELECT closed_at, pnl FROM trades WHERE status='closed' AND closed_at >= ? ORDER BY closed_at",
-                        (since,),
+                        "SELECT closed_at, pnl FROM trades WHERE status='closed' ORDER BY closed_at",
                     )
                     rows = await cur.fetchall()
                     for r in rows:
@@ -412,19 +406,28 @@ class Dashboard:
                                 dt = datetime.fromisoformat(ts)
                             except Exception:
                                 continue
-                        # Round down to bucket
-                        bucket_min = (dt.minute // minutes) * minutes
-                        bucket_dt = dt.replace(minute=bucket_min, second=0, microsecond=0)
-                        key = bucket_dt.strftime("%Y-%m-%d %H:%M")
 
-                        if key not in pnl_by_bucket:
-                            pnl_by_bucket[key] = {"trade_date": key, "pnl": 0, "trades_count": 0}
-                        pnl_by_bucket[key]["pnl"] += r["pnl"] or 0
-                        pnl_by_bucket[key]["trades_count"] += 1
-                        pnl_by_bucket[key][inst_name] = pnl_by_bucket[key].get(inst_name, 0) + (r["pnl"] or 0)
+                        if per_trade:
+                            key = dt.strftime("%Y-%m-%d %H:%M:%S")
+                            all_trades.append({
+                                "trade_date": key, "pnl": r["pnl"] or 0,
+                                "trades_count": 1, inst_name: r["pnl"] or 0,
+                            })
+                        else:
+                            bucket_min = (dt.minute // minutes) * minutes
+                            bucket_dt = dt.replace(minute=bucket_min, second=0, microsecond=0)
+                            key = bucket_dt.strftime("%Y-%m-%d %H:%M")
+                            if key not in pnl_by_bucket:
+                                pnl_by_bucket[key] = {"trade_date": key, "pnl": 0, "trades_count": 0}
+                            pnl_by_bucket[key]["pnl"] += r["pnl"] or 0
+                            pnl_by_bucket[key]["trades_count"] += 1
+                            pnl_by_bucket[key][inst_name] = pnl_by_bucket[key].get(inst_name, 0) + (r["pnl"] or 0)
             except Exception:
                 logger.warning("Failed to read intraday PnL from %s", inst_name)
 
+        if per_trade:
+            all_trades.sort(key=lambda x: x["trade_date"])
+            return web.json_response(all_trades)
         result = sorted(pnl_by_bucket.values(), key=lambda x: x["trade_date"])
         return web.json_response(result)
 
@@ -457,25 +460,17 @@ class Dashboard:
                 except Exception:
                     logger.warning("Failed to read archive positions from %s", main_archive)
         else:
-            # Live: current engine positions
-            if self.engine:
-                try:
-                    exchange = self.config.get("exchange", "bybit")
-                    if exchange == "tbank":
-                        raw = self.engine.client.get_positions()
-                    else:
-                        raw = self.engine.client.get_positions(category="linear")
-                    for p in raw:
-                        positions.append({
-                            "symbol": p["symbol"],
-                            "side": p["side"],
-                            "size": p["size"],
-                            "entry_price": p["entry_price"],
-                            "unrealised_pnl": p["unrealised_pnl"],
-                            "instance": instance_name,
-                        })
-                except Exception:
-                    pass
+            # Live: read open trades from main DB (same as other instances)
+            main_open = await self.db.get_open_trades()
+            for t in main_open:
+                positions.append({
+                    "symbol": t["symbol"],
+                    "side": t["side"],
+                    "size": float(t["qty"]),
+                    "entry_price": float(t["entry_price"]),
+                    "unrealised_pnl": 0.0,
+                    "instance": instance_name,
+                })
 
         # Other instances — open trades from DB
         for inst in self.config.get("other_instances", []):
@@ -501,6 +496,21 @@ class Dashboard:
                 except Exception:
                     logger.warning("Failed to read positions from %s", inst_name)
 
+        # Enrich Bybit positions with live unrealised PnL
+        if not is_archive and self.engine and positions:
+            try:
+                exchange = self.config.get("exchange", "bybit")
+                if exchange == "tbank":
+                    raw = self.engine.client.get_positions()
+                else:
+                    raw = self.engine.client.get_positions(category="linear")
+                live_pnl = {p["symbol"]: p["unrealised_pnl"] for p in raw}
+                for pos in positions:
+                    if pos["symbol"] in live_pnl:
+                        pos["unrealised_pnl"] = live_pnl[pos["symbol"]]
+            except Exception:
+                pass
+
         return web.json_response(positions)
 
     async def _api_instances(self, request: web.Request) -> web.Response:
@@ -521,7 +531,9 @@ class Dashboard:
                 try:
                     async with aiosqlite.connect(archive_path) as db:
                         db.row_factory = aiosqlite.Row
-                        cur = await db.execute("SELECT COALESCE(SUM(pnl), 0) as total FROM daily_pnl")
+                        cur = await db.execute(
+                            "SELECT COALESCE(SUM(pnl), 0) as total FROM trades WHERE status = 'closed'"
+                        )
                         row = await cur.fetchone()
                         if row:
                             scalp_total = float(row["total"])
@@ -615,14 +627,17 @@ class Dashboard:
                 async with aiosqlite.connect(db_path) as db:
                     db.row_factory = aiosqlite.Row
                     cur = await db.execute(
-                        "SELECT pnl FROM daily_pnl WHERE trade_date = ?",
+                        "SELECT COALESCE(SUM(pnl), 0) as total FROM trades "
+                        "WHERE status = 'closed' AND date(closed_at) = ?",
                         (date.today().isoformat(),),
                     )
                     row = await cur.fetchone()
                     if row:
-                        daily = float(row["pnl"])
+                        daily = float(row["total"])
 
-                    cur = await db.execute("SELECT COALESCE(SUM(pnl), 0) as total FROM daily_pnl")
+                    cur = await db.execute(
+                        "SELECT COALESCE(SUM(pnl), 0) as total FROM trades WHERE status = 'closed'"
+                    )
                     row = await cur.fetchone()
                     if row:
                         total = float(row["total"])
@@ -673,37 +688,37 @@ _LOGIN_HTML = """<!DOCTYPE html>
 *{box-sizing:border-box;margin:0;padding:0}
 body{
   font-family:'Segoe UI',-apple-system,sans-serif;
-  background:linear-gradient(135deg,#0f0f23 0%,#1a1a3e 50%,#0f0f23 100%);
+  background:#f3f3f7;
   min-height:100vh;display:flex;align-items:center;justify-content:center;
-  color:#e0e0e0;
+  color:#333;
 }
 .login-box{
-  background:rgba(26,26,62,0.85);backdrop-filter:blur(20px);
-  border:1px solid rgba(255,255,255,0.06);
+  background:#fff;
+  border:1px solid #e8e8ef;
   border-radius:20px;padding:40px 36px;width:100%;max-width:400px;
-  box-shadow:0 20px 60px rgba(0,0,0,0.5);
+  box-shadow:0 4px 24px rgba(0,0,0,0.08);
 }
 .logo{text-align:center;margin-bottom:28px}
 .logo .icon{font-size:48px;display:block;margin-bottom:8px}
-.logo h1{font-size:22px;font-weight:700;color:#fff;letter-spacing:1px}
-.logo p{font-size:13px;color:#666;margin-top:4px}
+.logo h1{font-size:22px;font-weight:700;color:#333;letter-spacing:1px}
+.logo p{font-size:13px;color:#999;margin-top:4px}
 .error{
-  background:rgba(255,82,82,0.15);color:#ff5252;
+  background:rgba(255,82,82,0.1);color:#e53935;
   padding:10px 14px;border-radius:10px;font-size:13px;
   margin-bottom:16px;text-align:center;
 }
-label{font-size:12px;color:#888;text-transform:uppercase;letter-spacing:1px;display:block;margin-bottom:6px}
+label{font-size:12px;color:#999;text-transform:uppercase;letter-spacing:1px;display:block;margin-bottom:6px}
 input[type=text],input[type=password]{
-  width:100%;padding:12px 14px;border:1px solid rgba(255,255,255,0.08);
-  border-radius:10px;background:rgba(15,15,35,0.6);color:#fff;
+  width:100%;padding:12px 14px;border:1px solid #e0e0e6;
+  border-radius:10px;background:#f9f9fb;color:#333;
   font-size:15px;outline:none;transition:border 0.2s;margin-bottom:16px;
 }
 input:focus{border-color:#6366f1}
 .captcha-row{display:flex;align-items:center;gap:10px;margin-bottom:16px}
 .captcha-q{
-  background:rgba(99,102,241,0.12);border:1px solid rgba(99,102,241,0.2);
+  background:rgba(99,102,241,0.08);border:1px solid rgba(99,102,241,0.2);
   border-radius:10px;padding:10px 16px;font-size:16px;font-weight:600;
-  color:#a5b4fc;white-space:nowrap;
+  color:#6366f1;white-space:nowrap;
 }
 .captcha-row input{margin-bottom:0;flex:1}
 button{
@@ -752,50 +767,51 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
 <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-datalabels@2/dist/chartjs-plugin-datalabels.min.js"></script>
 <style>
 :root{
-  --bg:#0f0f23;--bg2:#1a1a3e;--bg3:#12122e;
-  --green:#00e676;--red:#ff5252;--purple:#6366f1;
-  --text:#e0e0e0;--muted:#888;--border:rgba(255,255,255,0.06);
+  --bg:#f3f3f7;--bg2:#ffffff;--bg3:#f9f9fb;
+  --green:#16a34a;--red:#e53935;--purple:#6366f1;
+  --text:#333;--muted:#999;--border:#e8e8ef;
 }
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:'Segoe UI',-apple-system,sans-serif;background:var(--bg);color:var(--text);min-height:100vh}
 
 .header{
-  background:linear-gradient(90deg,var(--bg2),rgba(99,102,241,0.15));
+  background:#fff;
   border-bottom:1px solid var(--border);
   padding:16px 24px;display:flex;align-items:center;justify-content:space-between;
-  position:sticky;top:0;z-index:100;backdrop-filter:blur(12px);
+  position:sticky;top:0;z-index:100;
 }
 .header-left{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
 .header .icon{font-size:32px}
-.header h1{font-size:20px;font-weight:700;color:#fff;white-space:nowrap}
+.header h1{font-size:20px;font-weight:700;color:#333;white-space:nowrap}
 .header h1 span{color:var(--purple);font-weight:400}
-.header-stats{font-size:13px;color:var(--muted);display:flex;align-items:center;gap:6px;border-left:1px solid rgba(255,255,255,0.1);padding-left:12px;white-space:nowrap}
-.header-stats .hs-val{color:#fff;font-weight:600}
-.header-stats .hs-sep{color:rgba(255,255,255,0.15);margin:0 4px}
+.header-stats{font-size:13px;color:var(--muted);display:flex;align-items:center;gap:6px;border-left:1px solid #e0e0e6;padding-left:12px;white-space:nowrap}
+.header-stats .hs-val{color:#333;font-weight:600}
+.header-stats .hs-sep{color:#ccc;margin:0 4px}
 .header-right{display:flex;align-items:center;gap:16px}
 #status-badge{
   padding:5px 14px;border-radius:20px;font-size:12px;font-weight:600;letter-spacing:0.5px;
 }
-#status-badge.on{background:rgba(0,230,118,0.15);color:var(--green);border:1px solid rgba(0,230,118,0.3)}
-#status-badge.off{background:rgba(255,82,82,0.15);color:var(--red);border:1px solid rgba(255,82,82,0.3)}
+#status-badge.on{background:rgba(22,163,74,0.1);color:var(--green);border:1px solid rgba(22,163,74,0.3)}
+#status-badge.off{background:rgba(229,57,53,0.08);color:var(--red);border:1px solid rgba(229,57,53,0.25)}
 .logout-btn{
-  background:rgba(255,255,255,0.06);border:1px solid var(--border);
-  color:#aaa;padding:6px 16px;border-radius:10px;font-size:13px;
+  background:#f3f3f7;border:1px solid var(--border);
+  color:#666;padding:6px 16px;border-radius:10px;font-size:13px;
   text-decoration:none;transition:all 0.2s;
 }
-.logout-btn:hover{background:rgba(255,82,82,0.15);color:var(--red);border-color:rgba(255,82,82,0.3)}
+.logout-btn:hover{background:rgba(229,57,53,0.08);color:var(--red);border-color:rgba(229,57,53,0.25)}
 
 .container{max-width:1200px;margin:0 auto;padding:24px}
 
 .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:14px;margin-bottom:24px}
 .card{
-  background:var(--bg2);border:1px solid var(--border);border-radius:16px;
+  background:#fff;border:1px solid var(--border);border-radius:12px;
   padding:20px;transition:transform 0.2s,box-shadow 0.2s;position:relative;overflow:hidden;
+  box-shadow:0 1px 4px rgba(0,0,0,0.06);
 }
-.card:hover{transform:translateY(-2px);box-shadow:0 8px 30px rgba(0,0,0,0.3)}
+.card:hover{transform:translateY(-2px);box-shadow:0 4px 16px rgba(0,0,0,0.1)}
 .card::before{
   content:'';position:absolute;top:0;left:0;right:0;height:3px;
-  background:linear-gradient(90deg,var(--purple),transparent);border-radius:16px 16px 0 0;
+  background:linear-gradient(90deg,var(--purple),transparent);border-radius:12px 12px 0 0;
 }
 .card .card-icon{font-size:24px;margin-bottom:8px;display:block}
 .card h3{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:1.2px}
@@ -803,40 +819,40 @@ body{font-family:'Segoe UI',-apple-system,sans-serif;background:var(--bg);color:
 .g{color:var(--green)}.r{color:var(--red)}
 
 .chart-section{
-  background:var(--bg2);border:1px solid var(--border);border-radius:16px;
-  padding:24px;margin-bottom:24px;
+  background:#fff;border:1px solid var(--border);border-radius:12px;
+  padding:24px;margin-bottom:24px;box-shadow:0 1px 4px rgba(0,0,0,0.06);
 }
-.chart-section h2{font-size:16px;color:#fff;margin-bottom:16px;display:flex;align-items:center;gap:8px}
+.chart-section h2{font-size:16px;color:#333;margin-bottom:16px;display:flex;align-items:center;gap:8px}
 
 .section{
-  background:var(--bg3);border:1px solid var(--border);border-radius:16px;
-  padding:20px;margin-bottom:24px;
+  background:#fff;border:1px solid var(--border);border-radius:12px;
+  padding:20px;margin-bottom:24px;box-shadow:0 1px 4px rgba(0,0,0,0.06);
 }
-.section h2{font-size:16px;color:#fff;margin-bottom:14px;display:flex;align-items:center;gap:8px}
+.section h2{font-size:16px;color:#333;margin-bottom:14px;display:flex;align-items:center;gap:8px}
 
 table{width:100%;border-collapse:collapse}
-th{text-align:left;padding:10px 12px;color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:1px;border-bottom:2px solid var(--bg2)}
-td{padding:10px 12px;font-size:13px;border-bottom:1px solid rgba(255,255,255,0.03)}
+th{text-align:left;padding:10px 12px;color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:1px;border-bottom:2px solid #eee}
+td{padding:10px 12px;font-size:13px;border-bottom:1px solid #f0f0f4}
 tr{transition:background 0.2s}
-tr:hover{background:rgba(99,102,241,0.06)}
+tr:hover{background:rgba(99,102,241,0.04)}
 .side-long{color:var(--green);font-weight:600}
 .side-short{color:var(--red);font-weight:600}
 .status-closed{color:var(--muted)}
 .status-open{color:var(--purple);font-weight:600}
 .inst-tag{font-size:10px;padding:2px 8px;border-radius:8px;font-weight:600;letter-spacing:0.5px}
-.inst-scalp{background:rgba(99,102,241,0.15);color:#a5b4fc}
-.inst-swing{background:rgba(245,158,11,0.15);color:#fbbf24}
-.inst-degen{background:rgba(236,72,153,0.15);color:#f472b6}
-.inst-tbank{background:rgba(16,185,129,0.15);color:#34d399}
+.inst-scalp{background:rgba(99,102,241,0.1);color:#4f46e5}
+.inst-swing{background:rgba(245,158,11,0.1);color:#d97706}
+.inst-degen{background:rgba(236,72,153,0.1);color:#db2777}
+.inst-tbank{background:rgba(16,185,129,0.1);color:#059669}
 .tbl-wrap{overflow-x:auto}
 
 .pagination{display:flex;align-items:center;justify-content:center;gap:12px;margin-top:14px}
 .pagination button{
-  background:rgba(99,102,241,0.12);border:1px solid rgba(99,102,241,0.2);
+  background:rgba(99,102,241,0.08);border:1px solid rgba(99,102,241,0.2);
   color:var(--purple);padding:8px 18px;border-radius:8px;font-size:13px;
   cursor:pointer;transition:all 0.2s;
 }
-.pagination button:hover{background:rgba(99,102,241,0.25)}
+.pagination button:hover{background:rgba(99,102,241,0.15)}
 .pagination button:disabled{opacity:0.3;cursor:not-allowed}
 .pagination .page-info{color:var(--muted);font-size:13px}
 
@@ -844,28 +860,28 @@ tr:hover{background:rgba(99,102,241,0.06)}
   display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:14px;margin-bottom:20px;
 }
 .instance-card{
-  background:var(--bg2);border:1px solid var(--border);border-radius:16px;
-  padding:20px;position:relative;overflow:hidden;
+  background:#fff;border:1px solid var(--border);border-radius:12px;
+  padding:20px;position:relative;overflow:hidden;box-shadow:0 1px 4px rgba(0,0,0,0.06);
 }
 .instance-card::before{
-  content:'';position:absolute;top:0;left:0;right:0;height:3px;border-radius:16px 16px 0 0;
+  content:'';position:absolute;top:0;left:0;right:0;height:3px;border-radius:12px 12px 0 0;
 }
 .instance-card.scalp::before{background:linear-gradient(90deg,#6366f1,#a78bfa)}
 .instance-card.swing::before{background:linear-gradient(90deg,#f59e0b,#fbbf24)}
 .instance-card.degen::before{background:linear-gradient(90deg,#ec4899,#f472b6)}
 .instance-card.tbank::before{background:linear-gradient(90deg,#10b981,#34d399)}
 .instance-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px}
-.instance-name{font-size:18px;font-weight:700;color:#fff;display:flex;align-items:center;gap:8px}
+.instance-name{font-size:18px;font-weight:700;color:#333;display:flex;align-items:center;gap:8px}
 .instance-name .badge{
   font-size:10px;padding:3px 10px;border-radius:12px;font-weight:600;letter-spacing:0.5px;
 }
-.badge-scalp{background:rgba(99,102,241,0.15);color:#a5b4fc;border:1px solid rgba(99,102,241,0.3)}
-.badge-swing{background:rgba(245,158,11,0.15);color:#fbbf24;border:1px solid rgba(245,158,11,0.3)}
-.badge-degen{background:rgba(236,72,153,0.15);color:#f472b6;border:1px solid rgba(236,72,153,0.3)}
-.badge-tbank{background:rgba(16,185,129,0.15);color:#34d399;border:1px solid rgba(16,185,129,0.3)}
+.badge-scalp{background:rgba(99,102,241,0.1);color:#4f46e5;border:1px solid rgba(99,102,241,0.25)}
+.badge-swing{background:rgba(245,158,11,0.1);color:#d97706;border:1px solid rgba(245,158,11,0.25)}
+.badge-degen{background:rgba(236,72,153,0.1);color:#db2777;border:1px solid rgba(236,72,153,0.25)}
+.badge-tbank{background:rgba(16,185,129,0.1);color:#059669;border:1px solid rgba(16,185,129,0.25)}
 .instance-status{font-size:12px;font-weight:600;padding:4px 12px;border-radius:12px}
-.instance-status.on{background:rgba(0,230,118,0.12);color:var(--green)}
-.instance-status.off{background:rgba(255,82,82,0.12);color:var(--red)}
+.instance-status.on{background:rgba(22,163,74,0.1);color:var(--green)}
+.instance-status.off{background:rgba(229,57,53,0.08);color:var(--red)}
 .instance-stats{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}
 .instance-stat h4{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:1px;margin-bottom:4px}
 .instance-stat .val{font-size:20px;font-weight:700}
@@ -875,43 +891,76 @@ tr:hover{background:rgba(99,102,241,0.06)}
 .fade-in{animation:fadeIn 0.4s ease}
 .tf-buttons{display:flex;gap:4px}
 .tf-buttons button{
-  background:rgba(99,102,241,0.1);border:1px solid rgba(99,102,241,0.2);
-  color:#a5b4fc;padding:6px 14px;border-radius:8px;font-size:12px;font-weight:600;
+  background:#f3f3f7;border:1px solid #e0e0e6;
+  color:#666;padding:6px 14px;border-radius:20px;font-size:12px;font-weight:600;
   cursor:pointer;transition:all 0.2s;
 }
-.tf-buttons button:hover{background:rgba(99,102,241,0.25)}
-.tf-buttons button.active{background:rgba(99,102,241,0.35);border-color:#6366f1;color:#fff}
+.tf-buttons button:hover{background:#e8e8ef}
+.tf-buttons button.active{background:var(--purple);border-color:var(--purple);color:#fff}
 
-.chart-dual-wrap{display:flex;flex-direction:column;gap:16px}
-.chart-half{background:var(--bg3);border:1px solid var(--border);border-radius:12px;padding:16px;position:relative}
-.chart-half-label{font-size:12px;font-weight:600;margin-bottom:10px;display:flex;align-items:center;gap:6px}
+.chart-half{background:#f9f9fb;border:1px solid var(--border);border-radius:12px;padding:16px;position:relative}
+.chart-half-label{font-size:12px;font-weight:600;color:#555;margin-bottom:10px;display:flex;align-items:center;gap:6px}
 .dot{width:10px;height:10px;border-radius:50%;display:inline-block}
 .dot-bybit{background:#818cf8}
 .dot-degen{background:#f472b6}
 .dot-tbank{background:#34d399}
+.dot-swing{background:#f59e0b}
 .chart-legend-custom{display:flex;gap:12px;font-size:12px;color:var(--muted)}
 .chart-legend-custom .leg-item{display:flex;align-items:center;gap:5px}
 .leg-bar{width:12px;height:10px;border-radius:2px}
 .leg-line{width:14px;height:2px;border-radius:1px}
 
-.source-toggle{display:flex;gap:0;border-radius:10px;overflow:hidden;border:1px solid rgba(99,102,241,0.2)}
+.chart-grid{
+  display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));
+  gap:14px;margin-top:16px;
+}
+.chart-mini{
+  background:#f9f9fb;border:1px solid var(--border);border-radius:12px;
+  padding:14px;position:relative;
+}
+.chart-mini-header{
+  display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;
+}
+.expand-btn{
+  background:rgba(99,102,241,0.08);border:1px solid rgba(99,102,241,0.2);
+  color:var(--purple);width:28px;height:28px;border-radius:6px;
+  cursor:pointer;font-size:14px;transition:all 0.2s;
+}
+.expand-btn:hover{background:rgba(99,102,241,0.15)}
+.chart-fullscreen-overlay{
+  position:fixed;top:0;left:0;right:0;bottom:0;
+  background:rgba(0,0,0,0.6);z-index:1000;
+  display:flex;align-items:center;justify-content:center;padding:24px;
+}
+.chart-fullscreen-content{
+  background:#fff;border-radius:16px;padding:24px;
+  width:95vw;max-height:90vh;position:relative;
+}
+.close-btn{
+  position:absolute;top:12px;right:12px;
+  background:#f3f3f7;border:1px solid var(--border);
+  width:32px;height:32px;border-radius:8px;
+  cursor:pointer;font-size:16px;color:#666;
+}
+
+.source-toggle{display:flex;gap:0;border-radius:20px;overflow:hidden;border:1px solid #e0e0e6}
 .source-toggle button{
-  background:rgba(99,102,241,0.08);border:none;color:#a5b4fc;padding:6px 16px;
+  background:#f3f3f7;border:none;color:#666;padding:6px 16px;
   font-size:12px;font-weight:600;cursor:pointer;transition:all 0.2s;
 }
-.source-toggle button:hover{background:rgba(99,102,241,0.2)}
-.source-toggle button.active{background:rgba(99,102,241,0.35);color:#fff}
-.source-toggle button.archive-active{background:rgba(245,158,11,0.35);color:#fbbf24}
+.source-toggle button:hover{background:#e8e8ef}
+.source-toggle button.active{background:var(--purple);color:#fff}
+.source-toggle button.archive-active{background:#d97706;color:#fff}
 .archive-banner{
-  background:linear-gradient(90deg,rgba(245,158,11,0.15),rgba(245,158,11,0.05));
-  border:1px solid rgba(245,158,11,0.3);border-radius:10px;
+  background:rgba(245,158,11,0.08);
+  border:1px solid rgba(245,158,11,0.25);border-radius:10px;
   padding:10px 20px;margin-bottom:16px;text-align:center;
-  color:#fbbf24;font-size:14px;font-weight:600;
+  color:#d97706;font-size:14px;font-weight:600;
 }
-body.archive-mode{background:linear-gradient(135deg,#1a1508 0%,#1a1a3e 50%,#1a1508 100%)}
-body.archive-mode .header{background:linear-gradient(90deg,var(--bg2),rgba(245,158,11,0.15))}
+body.archive-mode{background:#faf5eb}
+body.archive-mode .header{background:#fff;border-bottom-color:rgba(245,158,11,0.25)}
 
-.last-update{text-align:center;color:#555;font-size:11px;padding:16px}
+.last-update{text-align:center;color:#bbb;font-size:11px;padding:16px}
 
 @media(max-width:600px){
   .container{padding:14px}
@@ -920,6 +969,8 @@ body.archive-mode .header{background:linear-gradient(90deg,var(--bg2),rgba(245,1
   .card .val{font-size:20px}
   .header{padding:12px 16px;flex-wrap:wrap;gap:10px}
   .header h1{font-size:16px}
+  .chart-grid{grid-template-columns:1fr}
+  .chart-fullscreen-content{width:100vw;padding:16px;border-radius:12px}
 }
 </style>
 </head><body>
@@ -960,10 +1011,58 @@ body.archive-mode .header{background:linear-gradient(90deg,var(--bg2),rgba(245,1
         </div>
       </div>
     </div>
-    <div class="chart-dual-wrap" id="chart-wrap">
-      <div class="chart-half"><div class="chart-half-label"><span class="dot dot-bybit"></span>Bybit (USDT)</div><canvas id="pnlChartBybit"></canvas></div>
-      <div class="chart-half" id="degen-chart-half" style="display:none"><div class="chart-half-label"><span class="dot dot-degen"></span>DEGEN Memes (USDT)</div><canvas id="pnlChartDegen"></canvas></div>
-      <div class="chart-half" id="tbank-chart-half" style="display:none"><div class="chart-half-label"><span class="dot dot-tbank"></span>T-Bank (RUB)</div><canvas id="pnlChartTbank"></canvas></div>
+    <!-- Combined chart: all instances -->
+    <div class="chart-half">
+      <div class="chart-half-label">Все инстансы — кумулятивный PnL</div>
+      <canvas id="pnlChartCombined"></canvas>
+    </div>
+
+    <!-- Mini-charts grid -->
+    <div class="chart-grid" id="chart-grid">
+      <div class="chart-mini" id="mini-scalp">
+        <div class="chart-mini-header">
+          <span class="chart-half-label" style="margin:0"><span class="dot dot-bybit"></span>SCALP</span>
+          <button class="expand-btn" onclick="expandChart('SCALP')">&#x2922;</button>
+        </div>
+        <canvas id="pnlChartScalp"></canvas>
+      </div>
+      <div class="chart-mini" id="mini-degen">
+        <div class="chart-mini-header">
+          <span class="chart-half-label" style="margin:0"><span class="dot dot-degen"></span>DEGEN</span>
+          <button class="expand-btn" onclick="expandChart('DEGEN')">&#x2922;</button>
+        </div>
+        <canvas id="pnlChartDegen"></canvas>
+      </div>
+      <div class="chart-mini" id="mini-swing">
+        <div class="chart-mini-header">
+          <span class="chart-half-label" style="margin:0"><span class="dot dot-swing"></span>SWING</span>
+          <button class="expand-btn" onclick="expandChart('SWING')">&#x2922;</button>
+        </div>
+        <canvas id="pnlChartSwing"></canvas>
+      </div>
+      <div class="chart-mini" id="mini-tbank-scalp">
+        <div class="chart-mini-header">
+          <span class="chart-half-label" style="margin:0"><span class="dot dot-tbank"></span>TB-SCALP</span>
+          <button class="expand-btn" onclick="expandChart('TBANK-SCALP')">&#x2922;</button>
+        </div>
+        <canvas id="pnlChartTbankScalp"></canvas>
+      </div>
+      <div class="chart-mini" id="mini-tbank-swing">
+        <div class="chart-mini-header">
+          <span class="chart-half-label" style="margin:0"><span class="dot dot-tbank"></span>TB-SWING</span>
+          <button class="expand-btn" onclick="expandChart('TBANK-SWING')">&#x2922;</button>
+        </div>
+        <canvas id="pnlChartTbankSwing"></canvas>
+      </div>
+    </div>
+  </div>
+
+  <!-- Fullscreen overlay for expanded charts -->
+  <div class="chart-fullscreen-overlay" id="chart-fullscreen" style="display:none" onclick="closeFullscreen(event)">
+    <div class="chart-fullscreen-content" onclick="event.stopPropagation()">
+      <button class="close-btn" onclick="closeFullscreen()">&#x2715;</button>
+      <div id="fullscreen-label" style="font-size:14px;font-weight:600;color:#555;margin-bottom:12px"></div>
+      <canvas id="pnlChartFull"></canvas>
     </div>
   </div>
 
@@ -982,7 +1081,7 @@ body.archive-mode .header{background:linear-gradient(90deg,var(--bg2),rgba(245,1
     <div class="tbl-wrap">
       <table>
         <thead><tr>
-          <th>Бот</th><th>Пара</th><th>Сторона</th><th>Вход</th><th>Выход</th><th>PnL</th><th>Статус</th>
+          <th>Бот</th><th>Пара</th><th>Сторона</th><th>Вход</th><th>Выход</th><th>PnL</th><th>Время</th><th>Статус</th>
         </tr></thead>
         <tbody id="tbody"></tbody>
       </table>
@@ -1030,8 +1129,6 @@ function setSource(src){
 async function loadInstances(){
   try{
     const list=await(await fetch('/api/instances?source='+currentSource)).json();
-    _hasTbankInst=list.some(i=>i.name.toLowerCase().includes('tbank'));
-    _hasDegenInst=list.some(i=>i.name.toLowerCase().includes('degen'));
     const el=document.getElementById('instances');
     el.innerHTML=list.map(i=>{
       const key=i.name.toLowerCase();
@@ -1082,255 +1179,359 @@ async function loadStats(){
   }catch(e){console.error('stats',e)}
 }
 
-let chartBybit=null, chartDegen=null, chartTbank=null, _hasTbankInst=false, _hasDegenInst=false;
+let chartCombined=null, miniCharts={}, chartFull=null, instanceData={};
+const INST_COLORS={SCALP:'#818cf8',DEGEN:'#f472b6',SWING:'#f59e0b','TBANK-SCALP':'#34d399','TBANK-SWING':'#059669'};
+const INST_CANVAS={SCALP:'pnlChartScalp',DEGEN:'pnlChartDegen',SWING:'pnlChartSwing','TBANK-SCALP':'pnlChartTbankScalp','TBANK-SWING':'pnlChartTbankSwing'};
+const INST_MINI={SCALP:'mini-scalp',DEGEN:'mini-degen',SWING:'mini-swing','TBANK-SCALP':'mini-tbank-scalp','TBANK-SWING':'mini-tbank-swing'};
+const INST_CURRENCY={SCALP:'USDT',DEGEN:'USDT',SWING:'USDT','TBANK-SCALP':'RUB','TBANK-SWING':'RUB'};
+const INST_SYM={SCALP:'$',DEGEN:'$',SWING:'$','TBANK-SCALP':'\u20bd','TBANK-SWING':'\u20bd'};
 
-function buildWaterfall(canvasId, labels, dailyArr, posColor, negColor, currency, sym){
+function buildArea(canvasId, labels, dailyArr, lineColor, currency, sym){
   const ctx=document.getElementById(canvasId).getContext('2d');
 
-  // Build floating bar ranges: each bar floats from cumBefore → cumAfter
-  const ranges=[];
+  // Cumulative PnL
+  const cumulative=[];
   let cum=0;
-  dailyArr.forEach(v=>{
-    const from=cum;
-    cum+=v;
-    ranges.push([Math.min(from,cum), Math.max(from,cum)]);
-  });
-  const colors=dailyArr.map(v=>v>=0?posColor:negColor);
+  dailyArr.forEach(v=>{cum+=v;cumulative.push(cum)});
 
-  // Connector lines dataset (thin lines connecting bars)
-  const connectors=[];
-  let c2=0;
-  dailyArr.forEach((v,i)=>{
-    c2+=v;
-    connectors.push(c2);
-  });
+  // Y range: ±100% from peak |cumPnL| (symmetric around 0)
+  const peak=Math.max(1,Math.max(...cumulative.map(Math.abs)));
+  const yMax=Math.ceil(peak*2);const yMin=-yMax;
 
-  return new Chart(ctx,{type:'bar',
-    plugins:[ChartDataLabels,{
-      id:'waterfall-connectors',
-      afterDatasetsDraw(chart){
-        const meta=chart.getDatasetMeta(0);
-        const ctx2=chart.ctx;
-        ctx2.save();
-        ctx2.setLineDash([3,3]);
-        ctx2.strokeStyle='rgba(255,255,255,0.15)';
-        ctx2.lineWidth=1;
-        for(let i=0;i<meta.data.length-1;i++){
-          const bar=meta.data[i];
-          const next=meta.data[i+1];
-          // connect end of current bar to start of next
-          const endY=dailyArr[i]>=0?bar.y:bar.base;
-          ctx2.beginPath();
-          ctx2.moveTo(bar.x,endY);
-          ctx2.lineTo(next.x,endY);
-          ctx2.stroke();
-        }
-        ctx2.restore();
-      }
-    }],
-    data:{labels,datasets:[{
-      data:ranges,
-      backgroundColor:colors,
-      borderRadius:3,
-      borderSkipped:false,
-      datalabels:{
-        display:c=>dailyArr[c.dataIndex]!==0,
-        formatter:(v,c)=>{const d=dailyArr[c.dataIndex];return(d>=0?'+':'')+d.toFixed(0)},
-        color:c=>dailyArr[c.dataIndex]>=0?'#00e676':'#ff5252',
-        anchor:c=>dailyArr[c.dataIndex]>=0?'end':'start',
-        align:c=>dailyArr[c.dataIndex]>=0?'top':'bottom',
-        font:{size:10,weight:'bold'},
-      }
+  // Pad x-axis +20% with empty space
+  const extra=Math.max(1,Math.ceil(labels.length*0.2));
+  const padLabels=[...labels];const padCum=[...cumulative];const padDaily=[...dailyArr];
+  for(let i=0;i<extra;i++){padLabels.push('');padCum.push(null);padDaily.push(0)}
+
+  // Plugin: fill green above 0, red below 0
+  const zeroFillPlugin={
+    id:'zeroFill',
+    beforeDatasetsDraw(chart){
+      const meta=chart.getDatasetMeta(0);
+      if(!meta.data.length)return;
+      const {ctx:c,chartArea:{left,right,bottom},scales:{y}}=chart;
+      const zeroY=y.getPixelForValue(0);
+      c.save();
+      // Green region (above zero) — clip to above zero line
+      c.beginPath();
+      c.rect(left,chart.chartArea.top,right-left,zeroY-chart.chartArea.top);
+      c.clip();
+      c.beginPath();
+      c.moveTo(meta.data[0].x,zeroY);
+      meta.data.forEach(pt=>c.lineTo(pt.x,pt.y));
+      c.lineTo(meta.data[meta.data.length-1].x,zeroY);
+      c.closePath();
+      const gGreen=c.createLinearGradient(0,chart.chartArea.top,0,zeroY);
+      gGreen.addColorStop(0,'rgba(22,163,74,0.25)');
+      gGreen.addColorStop(1,'rgba(22,163,74,0.03)');
+      c.fillStyle=gGreen;c.fill();
+      c.restore();
+      // Red region (below zero) — clip to below zero line
+      c.save();
+      c.beginPath();
+      c.rect(left,zeroY,right-left,bottom-zeroY);
+      c.clip();
+      c.beginPath();
+      c.moveTo(meta.data[0].x,zeroY);
+      meta.data.forEach(pt=>c.lineTo(pt.x,pt.y));
+      c.lineTo(meta.data[meta.data.length-1].x,zeroY);
+      c.closePath();
+      const gRed=c.createLinearGradient(0,zeroY,0,bottom);
+      gRed.addColorStop(0,'rgba(229,57,53,0.03)');
+      gRed.addColorStop(1,'rgba(229,57,53,0.25)');
+      c.fillStyle=gRed;c.fill();
+      c.restore();
+    }
+  };
+
+  return new Chart(ctx,{type:'line',
+    plugins:[ChartDataLabels,zeroFillPlugin],
+    data:{labels:padLabels,datasets:[{
+      data:padCum,
+      borderColor:lineColor,
+      borderWidth:2.5,
+      pointRadius:ctx2=>padCum[ctx2.dataIndex]!==null?4:0,
+      pointBackgroundColor:ctx2=>{const v=padCum[ctx2.dataIndex];return v===null?'transparent':v>=0?'#16a34a':'#e53935'},
+      pointBorderColor:'#fff',
+      pointBorderWidth:2,
+      pointHoverRadius:6,
+      pointHoverBackgroundColor:lineColor,
+      pointHoverBorderColor:'#fff',
+      pointHoverBorderWidth:2,
+      tension:0.3,
+      fill:false,
+      spanGaps:false,
     }]},
     options:{responsive:true,maintainAspectRatio:true,
       interaction:{intersect:false,mode:'index'},
       plugins:{
         legend:{display:false},
-        datalabels:{},
+        datalabels:{
+          display:c=>padCum[c.dataIndex]!==null,
+          formatter:(v,c)=>{const d=padDaily[c.dataIndex];return(v>=0?'+':'')+v.toFixed(0)+'('+(d>=0?'+':'')+d.toFixed(0)+'$)'},
+          color:c=>padCum[c.dataIndex]>=0?'#16a34a':'#e53935',
+          anchor:'end',align:'top',
+          font:{size:9,weight:'bold'},
+          offset:4,
+        },
         tooltip:{
-          backgroundColor:'rgba(26,26,62,0.95)',titleColor:'#fff',bodyColor:'#e0e0e0',
-          borderColor:'rgba(99,102,241,0.3)',borderWidth:1,cornerRadius:10,padding:12,
+          filter:c=>padCum[c.dataIndex]!==null,
+          backgroundColor:'#fff',titleColor:'#333',bodyColor:'#555',
+          borderColor:'#e0e0e6',borderWidth:1,cornerRadius:10,padding:12,
+          displayColors:false,
           callbacks:{
             label:c=>{
               const i=c.dataIndex;
-              const d=dailyArr[i];
-              const total=connectors[i];
+              const d=padDaily[i];
+              const total=padCum[i];
+              if(total===null)return'';
               return[
-                'PnL: '+(d>=0?'+':'')+d.toFixed(2)+' '+currency,
-                'Итого: '+(total>=0?'+':'')+total.toFixed(2)+' '+currency
+                '\u0417\u0430 \u043f\u0435\u0440\u0438\u043e\u0434: '+(d>=0?'+':'')+d.toFixed(2)+' '+currency,
+                '\u0418\u0442\u043e\u0433\u043e: '+(total>=0?'+':'')+total.toFixed(2)+' '+currency
               ];
             }
           }
         }
       },
       scales:{
-        x:{ticks:{color:'#555',maxRotation:45,font:{size:11}},grid:{display:false}},
+        x:{ticks:{color:'#999',maxRotation:45,font:{size:11}},grid:{display:false}},
         y:{
-          ticks:{color:'#888',callback:v=>(v>=0?'+':'')+v.toFixed(0)+' '+sym,font:{size:10}},
-          grid:{color:c=>c.tick.value===0?'rgba(255,255,255,0.35)':'rgba(255,255,255,0.04)',lineWidth:c=>c.tick.value===0?2:1},
+          min:yMin,max:yMax,
+          ticks:{color:'#999',callback:v=>(v>=0?'+':'')+v.toFixed(0)+' '+sym,font:{size:10}},
+          grid:{color:c=>c.tick.value===0?'rgba(0,0,0,0.2)':'rgba(0,0,0,0.05)',lineWidth:c=>c.tick.value===0?2:1},
         }
       }
     }
   });
 }
 
-function buildLineChart(canvasId, labels, dailyArr, lineColor, fillColor, currency, sym){
+function buildCombinedChart(canvasId, allLabels, seriesMap){
+  // seriesMap: {SCALP: {labels:[], daily:[]}, DEGEN: {...}, ...}
   const ctx=document.getElementById(canvasId).getContext('2d');
-  // Build cumulative PnL
-  const cumulative=[];
-  let cum=0;
-  dailyArr.forEach(v=>{cum+=v;cumulative.push(cum)});
 
-  // Gradient fill
-  const gradient=ctx.createLinearGradient(0,0,0,300);
-  gradient.addColorStop(0,fillColor);
-  gradient.addColorStop(1,'rgba(0,0,0,0)');
+  // Pad x-axis +20% with empty space (same as buildArea)
+  const extra=Math.max(1,Math.ceil(allLabels.length*0.2));
+  const padLabels=[...allLabels];
+  for(let i=0;i<extra;i++){padLabels.push('')}
+
+  const datasets=[];
+  const dailyMaps={};  // for datalabels: dailyMaps[datasetIdx][pointIdx]
+  let dsIdx=0;
+  Object.keys(seriesMap).forEach(name=>{
+    const s=seriesMap[name];
+    const color=INST_COLORS[name]||'#999';
+    // Build cumulative PnL aligned to allLabels
+    const cumMap={};const dayMap={};let cum=0;
+    for(let i=0;i<s.labels.length;i++){cum+=s.daily[i];cumMap[s.labels[i]]=cum;dayMap[s.labels[i]]=s.daily[i]}
+    const data=[];const daily=[];let lastVal=null;
+    allLabels.forEach(l=>{
+      if(cumMap[l]!==undefined){lastVal=cumMap[l];data.push(lastVal);daily.push(dayMap[l]||0)}
+      else{data.push(lastVal);daily.push(0)}
+    });
+    // Pad with nulls
+    for(let i=0;i<extra;i++){data.push(null);daily.push(0)}
+    dailyMaps[dsIdx]=daily;
+    datasets.push({
+      label:name,
+      data:data,
+      borderColor:color,
+      backgroundColor:color,
+      borderWidth:2.5,
+      pointRadius:c=>data[c.dataIndex]!==null?4:0,
+      pointBackgroundColor:color,
+      pointBorderColor:'#fff',
+      pointBorderWidth:2,
+      pointHoverRadius:6,
+      pointHoverBackgroundColor:color,
+      pointHoverBorderColor:'#fff',
+      pointHoverBorderWidth:2,
+      tension:0.3,
+      fill:false,
+      spanGaps:true,
+    });
+    dsIdx++;
+  });
 
   return new Chart(ctx,{type:'line',
     plugins:[ChartDataLabels],
-    data:{labels,datasets:[{
-      data:cumulative,
-      borderColor:lineColor,
-      backgroundColor:gradient,
-      fill:true,
-      tension:0.3,
-      borderWidth:2.5,
-      pointRadius:dailyArr.length>20?0:4,
-      pointHoverRadius:6,
-      pointBackgroundColor:lineColor,
-      pointBorderColor:'#1a1a3e',
-      pointBorderWidth:2,
-      datalabels:{
-        display:c=>{
-          const len=cumulative.length;
-          if(len<=10)return true;
-          if(len<=20)return c.dataIndex%2===0||c.dataIndex===len-1;
-          return c.dataIndex===0||c.dataIndex===len-1||c.dataIndex%Math.ceil(len/8)===0;
-        },
-        formatter:v=>(v>=0?'+':'')+v.toFixed(0),
-        color:c=>cumulative[c.dataIndex]>=0?'#00e676':'#ff5252',
-        anchor:'end',align:'top',
-        font:{size:10,weight:'bold'},
-        offset:4,
-      }
-    },{
-      // Daily PnL as thin bars behind the line
-      type:'bar',
-      data:dailyArr,
-      backgroundColor:dailyArr.map(v=>v>=0?'rgba(244,114,182,0.3)':'rgba(255,82,82,0.3)'),
-      borderRadius:2,
-      datalabels:{display:false},
-    }]},
+    data:{labels:padLabels,datasets:datasets},
     options:{responsive:true,maintainAspectRatio:true,
       interaction:{intersect:false,mode:'index'},
       plugins:{
-        legend:{display:false},
-        datalabels:{},
+        legend:{display:true,position:'top',labels:{
+          usePointStyle:true,pointStyle:'circle',padding:16,
+          font:{size:12,weight:'600'},
+        }},
+        datalabels:{
+          display:c=>{const v=c.dataset.data[c.dataIndex];return v!==null&&dailyMaps[c.datasetIndex][c.dataIndex]!==0},
+          formatter:(v,c)=>{const d=dailyMaps[c.datasetIndex][c.dataIndex];return(v>=0?'+':'')+v.toFixed(0)+'('+(d>=0?'+':'')+d.toFixed(0)+')'},
+          color:c=>c.dataset.borderColor,
+          anchor:'end',align:'top',
+          font:{size:9,weight:'bold'},
+          offset:4,
+        },
         tooltip:{
-          backgroundColor:'rgba(26,26,62,0.95)',titleColor:'#fff',bodyColor:'#e0e0e0',
-          borderColor:'rgba(236,72,153,0.3)',borderWidth:1,cornerRadius:10,padding:12,
+          filter:c=>c.parsed.y!==null,
+          backgroundColor:'#fff',titleColor:'#333',bodyColor:'#555',
+          borderColor:'#e0e0e6',borderWidth:1,cornerRadius:10,padding:12,
           callbacks:{
             label:c=>{
-              if(c.datasetIndex===0){
-                return 'Кумулятивный: '+(c.raw>=0?'+':'')+c.raw.toFixed(2)+' '+currency;
-              }
-              const d=dailyArr[c.dataIndex];
-              return 'За период: '+(d>=0?'+':'')+d.toFixed(2)+' '+currency;
+              const v=c.parsed.y;
+              if(v===null)return'';
+              const cur=INST_CURRENCY[c.dataset.label]||'USDT';
+              const d=dailyMaps[c.datasetIndex][c.dataIndex];
+              return c.dataset.label+': '+(v>=0?'+':'')+v.toFixed(2)+' '+cur+' ('+(d>=0?'+':'')+d.toFixed(2)+')';
             }
           }
         }
       },
       scales:{
-        x:{ticks:{color:'#555',maxRotation:45,font:{size:11}},grid:{display:false}},
+        x:{ticks:{color:'#999',maxRotation:45,font:{size:10},maxTicksLimit:20},grid:{display:false}},
         y:{
-          ticks:{color:'#888',callback:v=>(v>=0?'+':'')+v.toFixed(0)+' '+sym,font:{size:10}},
-          grid:{color:c=>c.tick.value===0?'rgba(255,255,255,0.35)':'rgba(255,255,255,0.04)',lineWidth:c=>c.tick.value===0?2:1},
+          ticks:{color:'#999',callback:v=>(v>=0?'+':'')+v.toFixed(0),font:{size:10}},
+          grid:{color:c=>c.tick.value===0?'rgba(0,0,0,0.2)':'rgba(0,0,0,0.05)',lineWidth:c=>c.tick.value===0?2:1},
         }
       }
     }
   });
 }
 
+function expandChart(instName){
+  const d=instanceData[instName];
+  if(!d||!d.labels.length)return;
+  if(chartFull){chartFull.destroy();chartFull=null}
+  const color=INST_COLORS[instName]||'#818cf8';
+  const cur=INST_CURRENCY[instName]||'USDT';
+  const sym=INST_SYM[instName]||'$';
+  document.getElementById('fullscreen-label').textContent=instName+' — кумулятивный PnL ('+cur+')';
+  chartFull=buildArea('pnlChartFull',d.labels,d.daily,color,cur,sym);
+  document.getElementById('chart-fullscreen').style.display='flex';
+}
+
+function closeFullscreen(e){
+  if(e&&e.target!==document.getElementById('chart-fullscreen'))return;
+  document.getElementById('chart-fullscreen').style.display='none';
+  if(chartFull){chartFull.destroy();chartFull=null}
+}
+
 async function loadChart(){
   try{
     const pnl=await(await fetch('/api/pnl?days=30&tf='+currentTF+'&source='+currentSource)).json();
-    // Always destroy old charts first
-    if(chartBybit){chartBybit.destroy();chartBybit=null}
-    if(chartDegen){chartDegen.destroy();chartDegen=null}
-    if(chartTbank){chartTbank.destroy();chartTbank=null}
+    // Destroy old charts
+    if(chartCombined){chartCombined.destroy();chartCombined=null}
+    Object.values(miniCharts).forEach(c=>c.destroy());miniCharts={};
+    instanceData={};
+
     if(!pnl.length){
-      // No data — show placeholder text on canvases
-      ['pnlChartBybit','pnlChartDegen','pnlChartTbank'].forEach(id=>{
-        const c=document.getElementById(id);
-        const cx=c.getContext('2d');cx.clearRect(0,0,c.width,c.height);
-        cx.fillStyle='#555';cx.font='14px sans-serif';cx.textAlign='center';
-        cx.fillText('Нет данных за выбранный период',c.width/2,c.height/2);
+      const cc=document.getElementById('pnlChartCombined');
+      const cx=cc.getContext('2d');cx.clearRect(0,0,cc.width,cc.height);
+      cx.fillStyle='#bbb';cx.font='14px sans-serif';cx.textAlign='center';
+      cx.fillText('Нет данных за выбранный период',cc.width/2,cc.height/2);
+      // Show all mini-charts with "no data" placeholder
+      Object.keys(INST_MINI).forEach(name=>{
+        const el=document.getElementById(INST_MINI[name]);
+        el.style.display='';
+        const c=document.getElementById(INST_CANVAS[name]);
+        const cx2=c.getContext('2d');cx2.clearRect(0,0,c.width,c.height);
+        cx2.fillStyle='#bbb';cx2.font='13px sans-serif';cx2.textAlign='center';
+        cx2.fillText('Нет данных',c.width/2,c.height/2);
       });
-      document.getElementById('degen-chart-half').style.display=_hasDegenInst?'':'none';
-      document.getElementById('tbank-chart-half').style.display=_hasTbankInst?'':'none';
+      document.getElementById('chart-legend').innerHTML='';
       return;
     }
+
     const labels=pnl.map(d=>{
       const dt=d.trade_date;
-      if(currentTF==='1M')return dt;
-      if(currentTF==='1D')return dt.slice(5);
-      return dt.length>10?dt.slice(11,16):dt;
+      if(currentTF==='1M')return dt.slice(0,7);
+      if(currentTF==='1D')return dt.slice(5,10);
+      return dt.length>16?dt.slice(5,16).replace('T',' '):dt.length>10?dt.slice(11,16):dt;
     });
 
-    const bybitDaily=[], degenDaily=[], tbankDaily=[];
-    let hasTbank=false, hasDegen=false;
-    pnl.forEach(d=>{
-      let bPnl=0, dPnl=0, tPnl=0;
-      Object.keys(d).forEach(k=>{
-        if(k==='trade_date'||k==='pnl'||k==='trades_count')return;
-        const ku=k.toUpperCase();
-        if(ku.includes('TBANK')){tPnl+=d[k];hasTbank=true}
-        else if(ku.includes('DEGEN')){dPnl+=d[k];hasDegen=true}
-        else{bPnl+=d[k]}
+    // Parse per-instance data from API response
+    // API keys: SCALP, DEGEN, SWING, TBANK-SCALP, TBANK-SWING
+    const instDaily={};
+    const KNOWN_INST=['SCALP','DEGEN','SWING','TBANK-SCALP','TBANK-SWING'];
+
+    pnl.forEach((d,i)=>{
+      const keys=Object.keys(d).filter(k=>!['trade_date','pnl','trades_count'].includes(k));
+      if(keys.length===0){
+        // Fallback: no instance keys, assign all pnl to SCALP
+        if(!instDaily['SCALP'])instDaily['SCALP']=new Array(pnl.length).fill(0);
+        instDaily['SCALP'][i]=d.pnl||0;
+        return;
+      }
+      keys.forEach(k=>{
+        const name=k.toUpperCase();
+        // Normalize to known instance names
+        let mapped=KNOWN_INST.find(n=>name===n||name.replace(/_/g,'-')===n);
+        if(!mapped){
+          // Fuzzy: TBANK_SCALP -> TBANK-SCALP, etc
+          if(name.includes('TBANK')&&name.includes('SCALP'))mapped='TBANK-SCALP';
+          else if(name.includes('TBANK')&&name.includes('SWING'))mapped='TBANK-SWING';
+          else if(name.includes('DEGEN'))mapped='DEGEN';
+          else if(name.includes('SWING'))mapped='SWING';
+          else mapped='SCALP';
+        }
+        if(!instDaily[mapped])instDaily[mapped]=new Array(pnl.length).fill(0);
+        instDaily[mapped][i]+=(d[k]||0);
       });
-      if(!Object.keys(d).some(k=>!['trade_date','pnl','trades_count'].includes(k))){bPnl=d.pnl}
-      bybitDaily.push(bPnl);degenDaily.push(dPnl);tbankDaily.push(tPnl);
     });
 
-    chartBybit=buildWaterfall('pnlChartBybit',labels,bybitDaily,
-      'rgba(129,140,248,0.75)','rgba(255,82,82,0.75)','USDT','$');
-
-    const dgHalf=document.getElementById('degen-chart-half');
-    if(hasDegen||_hasDegenInst){
-      dgHalf.style.display='';
-      if(hasDegen){
-        chartDegen=buildLineChart('pnlChartDegen',labels,degenDaily,
-          '#f472b6','rgba(244,114,182,0.15)','USDT','$');
-      }else{
-        const c=document.getElementById('pnlChartDegen');
-        const cx=c.getContext('2d');cx.clearRect(0,0,c.width,c.height);
-        cx.fillStyle='#555';cx.font='14px sans-serif';cx.textAlign='center';
-        cx.fillText('DEGEN ещё не торговал',c.width/2,c.height/2);
-      }
-    }else{dgHalf.style.display='none'}
-
-    const tbHalf=document.getElementById('tbank-chart-half');
-    if(hasTbank||_hasTbankInst){
-      tbHalf.style.display='';
-      if(hasTbank){
-        chartTbank=buildWaterfall('pnlChartTbank',labels,tbankDaily,
-          'rgba(52,211,153,0.75)','rgba(255,82,82,0.75)','RUB','₽');
-      }else{
-        const c=document.getElementById('pnlChartTbank');
-        const cx=c.getContext('2d');cx.clearRect(0,0,c.width,c.height);
-        cx.fillStyle='#555';cx.font='14px sans-serif';cx.textAlign='center';
-        cx.fillText('Нет данных TBank за выбранный период',c.width/2,c.height/2);
-      }
-    }else{
-      tbHalf.style.display='none';
+    // Filter: keep only points where instance had a trade
+    function filterSeries(lbl,daily){
+      const fl=[],fd=[];
+      for(let i=0;i<daily.length;i++){if(daily[i]!==0){fl.push(lbl[i]);fd.push(daily[i])}}
+      return{labels:fl,daily:fd};
     }
 
-    // Legend
-    document.getElementById('chart-legend').innerHTML=`
-      <span class="leg-item"><span class="leg-bar" style="background:rgba(129,140,248,0.75)"></span>Профит</span>
-      <span class="leg-item"><span class="leg-bar" style="background:rgba(255,82,82,0.75)"></span>Убыток</span>
-      <span class="leg-item"><span class="leg-line" style="background:#f472b6"></span>DEGEN кумулятив</span>
-    `;
+    // Build per-instance filtered data and cache for fullscreen
+    const seriesMap={};
+    const allInstLabels=new Set();
+    Object.keys(instDaily).forEach(name=>{
+      const filtered=filterSeries(labels,instDaily[name]);
+      if(filtered.daily.length>0){
+        instanceData[name]=filtered;
+        seriesMap[name]=filtered;
+        filtered.labels.forEach(l=>allInstLabels.add(l));
+      }
+    });
+
+    // Combined chart — all instances with data
+    const allLabels=[...allInstLabels].sort();
+    if(Object.keys(seriesMap).length>0){
+      chartCombined=buildCombinedChart('pnlChartCombined',allLabels,seriesMap);
+    }else{
+      const cc=document.getElementById('pnlChartCombined');
+      const cx=cc.getContext('2d');cx.clearRect(0,0,cc.width,cc.height);
+      cx.fillStyle='#bbb';cx.font='14px sans-serif';cx.textAlign='center';
+      cx.fillText('Нет закрытых сделок',cc.width/2,cc.height/2);
+    }
+
+    // Mini-charts per instance (always show all)
+    KNOWN_INST.forEach(name=>{
+      const miniEl=document.getElementById(INST_MINI[name]);
+      miniEl.style.display='';
+      const d=instanceData[name];
+      if(d&&d.daily.length>0){
+        const canvasId=INST_CANVAS[name];
+        const color=INST_COLORS[name];
+        const cur=INST_CURRENCY[name];
+        const sym=INST_SYM[name];
+        miniCharts[name]=buildArea(canvasId,d.labels,d.daily,color,cur,sym);
+      }else{
+        const c=document.getElementById(INST_CANVAS[name]);
+        const cx=c.getContext('2d');cx.clearRect(0,0,c.width,c.height);
+        cx.fillStyle='#bbb';cx.font='13px sans-serif';cx.textAlign='center';
+        cx.fillText('Нет данных',c.width/2,c.height/2);
+      }
+    });
+
+    // Legend (all instances)
+    const legHtml=KNOWN_INST.map(name=>
+      '<span class="leg-item"><span class="dot" style="background:'+INST_COLORS[name]+'"></span>'+name+'</span>'
+    ).join('');
+    document.getElementById('chart-legend').innerHTML=legHtml;
+
   }catch(e){console.error('chart',e)}
 }
 
@@ -1338,7 +1539,7 @@ async function loadPositions(){
   try{
     const pos=await(await fetch('/api/positions?source='+currentSource)).json();
     const body=document.getElementById('pos-body');
-    if(!pos.length){body.innerHTML='<tr><td colspan="6" style="text-align:center;color:#555;padding:20px">Нет открытых позиций</td></tr>';return}
+    if(!pos.length){body.innerHTML='<tr><td colspan="6" style="text-align:center;color:#bbb;padding:20px">Нет открытых позиций</td></tr>';return}
     body.innerHTML=pos.map(p=>{
       const pnl=parseFloat(p.unrealised_pnl)||0;
       const inst=(p.instance||'').toUpperCase();
@@ -1367,12 +1568,15 @@ async function loadTrades(page){
       const inst=(t.instance||'').toUpperCase();
       const isCls=inst.includes('TBANK')?'inst-tbank':inst.includes('DEGEN')?'inst-degen':inst.includes('SCALP')?'inst-scalp':'inst-swing';
       const iLabel=inst.includes('TBANK-SCALP')?'TB-SCALP':inst.includes('TBANK-SWING')?'TB-SWING':inst.includes('DEGEN')?'DEGEN':inst.includes('SCALP')?'SCALP':'SWING';
+      const tTime=t.closed_at||t.opened_at||'';
+      const tFmt=tTime?tTime.replace('T',' ').slice(5,16):'—';
       return`<tr class="fade-in">
         <td><span class="inst-tag ${isCls}">${iLabel}</span></td>
         <td><strong>${t.symbol}</strong></td>
         <td class="${t.side==='Buy'?'side-long':'side-short'}">${t.side==='Buy'?'ЛОНГ':'ШОРТ'}</td>
         <td>${t.entry_price||'-'}</td><td>${t.exit_price||'-'}</td>
         <td class="${cls(p)}"><strong>${p?p.toFixed(2):'-'}</strong></td>
+        <td style="color:var(--muted);font-size:12px">${tFmt}</td>
         <td class="${t.status==='closed'?'status-closed':'status-open'}">${t.status}</td></tr>`;
     }).join('');
   }catch(e){console.error('trades',e)}

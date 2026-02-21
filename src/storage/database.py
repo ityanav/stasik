@@ -144,14 +144,17 @@ class Database:
     async def get_daily_pnl(self, day: date | None = None) -> float:
         day = day or date.today()
         cursor = await self._db.execute(
-            "SELECT pnl FROM daily_pnl WHERE trade_date = ?",
+            "SELECT COALESCE(SUM(pnl), 0) as total FROM trades "
+            "WHERE status = 'closed' AND date(closed_at) = ?",
             (day.isoformat(),),
         )
         row = await cursor.fetchone()
-        return float(row["pnl"]) if row else 0.0
+        return float(row["total"]) if row else 0.0
 
     async def get_total_pnl(self) -> float:
-        cursor = await self._db.execute("SELECT COALESCE(SUM(pnl), 0) as total FROM daily_pnl")
+        cursor = await self._db.execute(
+            "SELECT COALESCE(SUM(pnl), 0) as total FROM trades WHERE status = 'closed'"
+        )
         row = await cursor.fetchone()
         return float(row["total"])
 
