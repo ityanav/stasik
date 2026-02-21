@@ -109,12 +109,14 @@ other_instances:
     service: "stasik-swing"
     timeframe: "D"
     leverage: "2x"
+    exit_ratio: 0.7
     pairs: ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "ADAUSDT", "AVAXUSDT", "LINKUSDT", "NEARUSDT", "SUIUSDT", "APTUSDT"]
   - name: "DEGEN"
     db_path: "/root/stasik/data/degen.db"
     service: "stasik-degen"
-    timeframe: "1м"
+    timeframe: "5"
     leverage: "10x"
+    exit_ratio: 0.65
     pairs: ["DOGEUSDT", "TRUMPUSDT", "WIFUSDT", "1000PEPEUSDT", "SHIB1000USDT", "1000BONKUSDT", "1000FLOKIUSDT", "FARTCOINUSDT", "PNUTUSDT", "ACTUSDT", "POPCATUSDT", "MEMEUSDT", "PENGUUSDT", "BRETTUSDT", "NOTUSDT", "GOATUSDT", "MOODENGUSDT", "VINEUSDT", "MELANIAUSDT", "VIRTUALUSDT"]
   - name: "TBANK-SCALP"
     db_path: "/root/stasik/data/tbank_scalp.db"

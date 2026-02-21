@@ -1,5 +1,6 @@
 import logging
 import subprocess
+import time
 from datetime import date
 from pathlib import Path
 
@@ -52,12 +53,37 @@ class Dashboard:
                 logger.info("Dashboard: standalone BybitClient initialized")
             except Exception:
                 logger.warning("Dashboard: failed to init standalone BybitClient")
+        self._sma_cache: dict = {}  # (symbol, timeframe) -> (sma_val, timestamp)
 
     def _get_client(self):
         """Get Bybit client from engine or standalone."""
         if self.engine:
             return self.engine.client
         return self._client
+
+    def _get_cached_sma(self, symbol: str, timeframe: str, period: int = 25):
+        """Get SMA value with caching to avoid excessive API calls."""
+        cache_key = (symbol, timeframe)
+        now = time.time()
+        if cache_key in self._sma_cache:
+            val, ts = self._sma_cache[cache_key]
+            ttl = 3600 if timeframe in ("D", "W") else 120
+            if now - ts < ttl:
+                return val
+        try:
+            client = self._get_client()
+            if not client:
+                return None
+            df = client.get_klines(symbol, timeframe, limit=100, category="linear")
+            if df is None or df.empty:
+                return None
+            from src.strategy.indicators import calculate_sma
+            sma = calculate_sma(df, period)
+            sma_val = float(sma.iloc[-1])
+            self._sma_cache[cache_key] = (sma_val, now)
+            return sma_val
+        except Exception:
+            return None
 
     @staticmethod
     def _check_service_active(service: str) -> bool:
@@ -83,6 +109,8 @@ class Dashboard:
         self.app.router.add_post("/api/close-position", self._api_close_position)
         self.app.router.add_post("/api/close-all", self._api_close_all)
         self.app.router.add_post("/api/double-position", self._api_double_position)
+        self.app.router.add_post("/api/set-sl", self._api_set_sl)
+        self.app.router.add_post("/api/set-tp", self._api_set_tp)
         self.app.router.add_get("/api/instances", self._api_instances)
 
     async def start(self):
@@ -152,7 +180,8 @@ class Dashboard:
     # --- API routes ---
 
     async def _index(self, request: web.Request) -> web.Response:
-        return web.Response(text=_DASHBOARD_HTML, content_type="text/html")
+        return web.Response(text=_DASHBOARD_HTML, content_type="text/html",
+                            headers={"Cache-Control": "no-cache, no-store, must-revalidate"})
 
     async def _api_stats(self, request: web.Request) -> web.Response:
         source = request.query.get("source", "live")
@@ -476,7 +505,7 @@ class Dashboard:
                     async with aiosqlite.connect(main_archive) as db:
                         db.row_factory = aiosqlite.Row
                         cur = await db.execute(
-                            "SELECT symbol, side, entry_price, qty FROM trades WHERE status = 'open'"
+                            "SELECT symbol, side, entry_price, qty, stop_loss, take_profit FROM trades WHERE status = 'open'"
                         )
                         rows = await cur.fetchall()
                         for r in rows:
@@ -485,6 +514,8 @@ class Dashboard:
                                 "side": r["side"],
                                 "size": float(r["qty"]),
                                 "entry_price": float(r["entry_price"]),
+                                "stop_loss": float(r["stop_loss"] if r["stop_loss"] else 0),
+                                "take_profit": float(r["take_profit"] if r["take_profit"] else 0),
                                 "unrealised_pnl": 0.0,
                                 "instance": instance_name,
                             })
@@ -499,6 +530,8 @@ class Dashboard:
                     "side": t["side"],
                     "size": float(t["qty"]),
                     "entry_price": float(t["entry_price"]),
+                    "stop_loss": float(t.get("stop_loss") or 0),
+                    "take_profit": float(t.get("take_profit") or 0),
                     "unrealised_pnl": 0.0,
                     "instance": instance_name,
                 })
@@ -512,7 +545,7 @@ class Dashboard:
                     async with aiosqlite.connect(db_path) as db:
                         db.row_factory = aiosqlite.Row
                         cur = await db.execute(
-                            "SELECT symbol, side, entry_price, qty FROM trades WHERE status = 'open'"
+                            "SELECT symbol, side, entry_price, qty, stop_loss, take_profit FROM trades WHERE status = 'open'"
                         )
                         rows = await cur.fetchall()
                         for r in rows:
@@ -521,6 +554,8 @@ class Dashboard:
                                 "side": r["side"],
                                 "size": float(r["qty"]),
                                 "entry_price": float(r["entry_price"]),
+                                "stop_loss": float(r["stop_loss"] if r["stop_loss"] else 0),
+                                "take_profit": float(r["take_profit"] if r["take_profit"] else 0),
                                 "unrealised_pnl": 0.0,
                                 "instance": inst_name,
                             })
@@ -535,18 +570,71 @@ class Dashboard:
                     raw = self._get_client().get_positions()
                 else:
                     raw = self._get_client().get_positions(category="linear")
-                # Use mark_price to calculate PnL per position (not Bybit total)
                 live_mark = {p["symbol"]: p.get("mark_price", 0) for p in raw}
                 for pos in positions:
                     sym = pos["symbol"]
+                    inst = (pos.get("instance") or "").upper()
+                    if "TBANK" in inst:
+                        continue
+                    mark = 0
                     if sym in live_mark and live_mark[sym]:
                         mark = float(live_mark[sym])
+                    else:
+                        try:
+                            mark = self._get_client().get_last_price(sym, category="linear")
+                        except Exception:
+                            pass
+                    if mark > 0:
                         entry = float(pos["entry_price"])
                         qty = float(pos["size"])
                         direction = 1 if pos["side"] == "Buy" else -1
                         pos["unrealised_pnl"] = round((mark - entry) * qty * direction, 2)
             except Exception:
                 pass
+
+        # Calculate entry_amount and target exit price (Kotegawa)
+        main_exit_ratio = self.config.get("strategy", {}).get("kotegawa_exit_ratio", 0.8)
+        main_timeframe = self.config.get("trading", {}).get("timeframe", "5")
+        inst_upper = (self.config.get("instance_name") or "SCALP").upper()
+        exit_ratios = {inst_upper: main_exit_ratio}
+        timeframes = {inst_upper: main_timeframe}
+        for inst in self.config.get("other_instances", []):
+            iname = inst.get("name", "").upper()
+            exit_ratios[iname] = inst.get("exit_ratio", 0.8)
+            tf = inst.get("timeframe", "5").replace("м", "").replace("m", "")
+            timeframes[iname] = tf
+
+        for pos in positions:
+            entry = float(pos["entry_price"])
+            qty = float(pos["size"])
+            sl = float(pos.get("stop_loss") or 0)
+            tp = float(pos.get("take_profit") or 0)
+            pos["entry_amount"] = round(entry * qty, 2)
+            pos["target_price"] = None
+            # SL PnL: loss in currency when stop-loss triggers
+            if sl > 0:
+                if pos["side"] == "Buy":
+                    pos["sl_pnl"] = round((sl - entry) * qty, 2)
+                else:
+                    pos["sl_pnl"] = round((entry - sl) * qty, 2)
+            else:
+                pos["sl_pnl"] = None
+            # TP PnL: profit in currency when take-profit triggers
+            if tp > 0:
+                if pos["side"] == "Buy":
+                    pos["tp_pnl"] = round((tp - entry) * qty, 2)
+                else:
+                    pos["tp_pnl"] = round((entry - tp) * qty, 2)
+            else:
+                pos["tp_pnl"] = None
+            inst = (pos.get("instance") or "").upper()
+            if "TBANK" in inst or is_archive or not self._get_client():
+                continue
+            er = exit_ratios.get(inst, 0.8)
+            tf = timeframes.get(inst, "5")
+            sma_val = self._get_cached_sma(pos["symbol"], tf)
+            if sma_val and sma_val > 0:
+                pos["target_price"] = round(entry + er * (sma_val - entry), 6)
 
         return web.json_response(positions)
 
@@ -594,18 +682,67 @@ class Dashboard:
         try:
             data = await request.json()
             symbol = data.get("symbol", "")
+            instance = data.get("instance", "")
             if not symbol:
                 return web.json_response({"ok": False, "error": "No symbol"}, status=400)
-            positions = client.get_positions(symbol=symbol, category="linear")
-            closed = False
-            for p in positions:
-                if p["symbol"] == symbol and p["size"] > 0:
-                    close_side = "Sell" if p["side"] == "Buy" else "Buy"
-                    client.place_order(symbol=symbol, side=close_side, qty=p["size"], category="linear")
-                    closed = True
-            if not closed:
-                return web.json_response({"ok": True, "message": f"Позиция {symbol} не найдена"})
-            return web.json_response({"ok": True, "message": f"Закрыто: {symbol}"})
+            # Try to close on exchange
+            exchange_closed = False
+            try:
+                positions = client.get_positions(symbol=symbol, category="linear")
+                for p in positions:
+                    if p["symbol"] == symbol and p["size"] > 0:
+                        close_side = "Sell" if p["side"] == "Buy" else "Buy"
+                        client.place_order(symbol=symbol, side=close_side, qty=p["size"], category="linear")
+                        exchange_closed = True
+            except Exception:
+                logger.warning("Failed to close %s on exchange", symbol)
+            # Close in DB (get current price for PnL)
+            db_path = self._resolve_instance_db(instance)
+            if not db_path:
+                # Fallback: find which DB has this symbol
+                all_dbs = [(str(self.db.db_path), self.config.get("instance_name", "SCALP"))]
+                for inst in self.config.get("other_instances", []):
+                    all_dbs.append((inst.get("db_path", ""), inst.get("name", "")))
+                for dp, _ in all_dbs:
+                    if dp and Path(dp).exists():
+                        try:
+                            async with aiosqlite.connect(dp) as db:
+                                cur = await db.execute(
+                                    "SELECT id FROM trades WHERE symbol=? AND status='open'", (symbol,))
+                                if await cur.fetchone():
+                                    db_path = dp
+                                    break
+                        except Exception:
+                            pass
+            if db_path and Path(db_path).exists():
+                try:
+                    mark = 0
+                    try:
+                        mark = client.get_last_price(symbol, category="linear")
+                    except Exception:
+                        pass
+                    async with aiosqlite.connect(db_path) as db:
+                        db.row_factory = aiosqlite.Row
+                        cur = await db.execute(
+                            "SELECT id, side, entry_price, qty FROM trades WHERE symbol=? AND status='open'",
+                            (symbol,))
+                        rows = await cur.fetchall()
+                        for r in rows:
+                            entry = float(r["entry_price"])
+                            qty = float(r["qty"])
+                            pnl = 0.0
+                            if mark > 0:
+                                direction = 1 if r["side"] == "Buy" else -1
+                                pnl = round((mark - entry) * qty * direction, 2)
+                            await db.execute(
+                                "UPDATE trades SET exit_price=?, pnl=?, status='closed', closed_at=? WHERE id=?",
+                                (mark if mark > 0 else entry, pnl, __import__('datetime').datetime.utcnow().isoformat(), r["id"]))
+                        await db.commit()
+                        logger.info("Closed %d trade(s) in DB for %s (pnl per trade calculated)", len(rows), symbol)
+                except Exception:
+                    logger.exception("Failed to close %s in DB", symbol)
+            msg = f"Закрыто: {symbol}" + ("" if exchange_closed else " (только в БД)")
+            return web.json_response({"ok": True, "message": msg})
         except Exception as e:
             logger.exception("close-position error")
             return web.json_response({"ok": False, "error": str(e)}, status=500)
@@ -666,6 +803,124 @@ class Dashboard:
             return web.json_response({"ok": True, "message": f"X2: {side} +{qty} {symbol}"})
         except Exception as e:
             logger.exception("double-position error")
+            return web.json_response({"ok": False, "error": str(e)}, status=500)
+
+    async def _api_set_sl(self, request: web.Request) -> web.Response:
+        """Set stop-loss by loss amount (USDT). Calculates SL price and sets on exchange + DB."""
+        client = self._get_client()
+        if not client:
+            return web.json_response({"ok": False, "error": "No client"}, status=503)
+        try:
+            data = await request.json()
+            symbol = data.get("symbol", "")
+            loss_amount = float(data.get("amount", 0))
+            instance = data.get("instance", "")
+            side = data.get("side", "")
+            entry_price = float(data.get("entry_price", 0))
+            qty = float(data.get("qty", 0))
+            if not symbol or loss_amount <= 0 or not side or entry_price <= 0 or qty <= 0:
+                return web.json_response({"ok": False, "error": "Missing params"}, status=400)
+
+            # Calculate SL price from loss amount
+            # Buy: sl_price = entry - loss / qty
+            # Sell: sl_price = entry + loss / qty
+            if side == "Buy":
+                sl_price = entry_price - loss_amount / qty
+            else:
+                sl_price = entry_price + loss_amount / qty
+
+            if sl_price <= 0:
+                return web.json_response({"ok": False, "error": "SL price <= 0"}, status=400)
+
+            sl_price = round(sl_price, 6)
+
+            # Update SL in DB first
+            db_path = self._resolve_instance_db(instance)
+            if db_path and Path(db_path).exists():
+                try:
+                    async with aiosqlite.connect(db_path) as db:
+                        await db.execute(
+                            "UPDATE trades SET stop_loss = ? WHERE symbol = ? AND status = 'open'",
+                            (sl_price, symbol),
+                        )
+                        await db.commit()
+                except Exception:
+                    logger.warning("Failed to update SL in DB for %s", symbol)
+
+            # Set SL on Bybit (may fail if no position on exchange)
+            exchange_ok = False
+            try:
+                client.session.set_trading_stop(
+                    category="linear", symbol=symbol,
+                    stopLoss=str(sl_price), positionIdx=0,
+                )
+                exchange_ok = True
+            except Exception:
+                logger.warning("set_trading_stop failed for %s (no position on exchange?)", symbol)
+
+            logger.info("SL set: %s %s @ %s (loss=%s, exchange=%s)", side, symbol, sl_price, loss_amount, exchange_ok)
+            return web.json_response({"ok": True, "sl_price": sl_price, "exchange": exchange_ok})
+        except Exception as e:
+            logger.exception("set-sl error")
+            return web.json_response({"ok": False, "error": str(e)}, status=500)
+
+    async def _api_set_tp(self, request: web.Request) -> web.Response:
+        """Set take-profit by profit amount (USDT). Calculates TP price and sets on exchange + DB."""
+        client = self._get_client()
+        if not client:
+            return web.json_response({"ok": False, "error": "No client"}, status=503)
+        try:
+            data = await request.json()
+            symbol = data.get("symbol", "")
+            profit_amount = float(data.get("amount", 0))
+            instance = data.get("instance", "")
+            side = data.get("side", "")
+            entry_price = float(data.get("entry_price", 0))
+            qty = float(data.get("qty", 0))
+            if not symbol or profit_amount <= 0 or not side or entry_price <= 0 or qty <= 0:
+                return web.json_response({"ok": False, "error": "Missing params"}, status=400)
+
+            # Calculate TP price from profit amount
+            # Buy: tp_price = entry + profit / qty
+            # Sell: tp_price = entry - profit / qty
+            if side == "Buy":
+                tp_price = entry_price + profit_amount / qty
+            else:
+                tp_price = entry_price - profit_amount / qty
+
+            if tp_price <= 0:
+                return web.json_response({"ok": False, "error": "TP price <= 0"}, status=400)
+
+            tp_price = round(tp_price, 6)
+
+            # Update TP in DB first
+            db_path = self._resolve_instance_db(instance)
+            if db_path and Path(db_path).exists():
+                try:
+                    async with aiosqlite.connect(db_path) as db:
+                        await db.execute(
+                            "UPDATE trades SET take_profit = ? WHERE symbol = ? AND status = 'open'",
+                            (tp_price, symbol),
+                        )
+                        await db.commit()
+                except Exception:
+                    logger.warning("Failed to update TP in DB for %s", symbol)
+
+            # Set TP on Bybit (may fail if no position on exchange)
+            exchange_ok = False
+            try:
+                client.session.set_trading_stop(
+                    category="linear", symbol=symbol,
+                    takeProfit=str(tp_price), positionIdx=0,
+                )
+                exchange_ok = True
+            except Exception:
+                logger.warning("set_trading_stop (TP) failed for %s (no position on exchange?)", symbol)
+
+            logger.info("TP set: %s %s @ %s (profit=%s, exchange=%s)", side, symbol, tp_price, profit_amount, exchange_ok)
+            return web.json_response({"ok": True, "tp_price": tp_price, "exchange": exchange_ok})
+        except Exception as e:
+            logger.exception("set-tp error")
             return web.json_response({"ok": False, "error": str(e)}, status=500)
 
     def _resolve_instance_db(self, instance: str) -> str | None:
@@ -1159,6 +1414,20 @@ body.archive-mode .header{background:#fff;border-bottom-color:rgba(245,158,11,0.
 }
 .btn-x2:hover{background:rgba(33,150,243,0.18)}
 .btn-x2:disabled{opacity:0.4;cursor:not-allowed}
+.sl-wrap{display:inline-flex;align-items:center;gap:4px}
+.sl-input{width:60px;padding:3px 6px;border:1px solid rgba(229,57,53,0.3);border-radius:6px;font-size:12px;text-align:right;background:rgba(229,57,53,0.04);color:#333;-moz-appearance:textfield}
+.sl-input::-webkit-outer-spin-button,.sl-input::-webkit-inner-spin-button{-webkit-appearance:none;margin:0}
+.sl-input:focus{outline:none;border-color:#e53935}
+.btn-sl{background:rgba(229,57,53,0.08);border:1px solid rgba(229,57,53,0.25);color:#e53935;padding:3px 8px;border-radius:6px;font-size:11px;font-weight:600;cursor:pointer;white-space:nowrap}
+.btn-sl:hover{background:rgba(229,57,53,0.18)}
+.btn-sl:disabled{opacity:0.4;cursor:not-allowed}
+.tp-wrap{display:inline-flex;align-items:center;gap:4px}
+.tp-input{width:60px;padding:3px 6px;border:1px solid rgba(76,175,80,0.3);border-radius:6px;font-size:12px;text-align:right;background:rgba(76,175,80,0.04);color:#333;-moz-appearance:textfield}
+.tp-input::-webkit-outer-spin-button,.tp-input::-webkit-inner-spin-button{-webkit-appearance:none;margin:0}
+.tp-input:focus{outline:none;border-color:#4caf50}
+.btn-tp{background:rgba(76,175,80,0.08);border:1px solid rgba(76,175,80,0.25);color:#388e3c;padding:3px 8px;border-radius:6px;font-size:11px;font-weight:600;cursor:pointer;white-space:nowrap}
+.btn-tp:hover{background:rgba(76,175,80,0.18)}
+.btn-tp:disabled{opacity:0.4;cursor:not-allowed}
 .btn-close-all{
   background:rgba(229,57,53,0.08);border:1px solid rgba(229,57,53,0.25);
   color:#e53935;padding:10px 24px;border-radius:10px;font-size:14px;font-weight:600;
@@ -1363,7 +1632,7 @@ body.archive-mode .header{background:#fff;border-bottom-color:rgba(245,158,11,0.
     <h2>📊 Открытые позиции</h2>
     <div class="tbl-wrap">
       <table>
-        <thead><tr><th>Бот</th><th>Пара</th><th>Сторона</th><th>Размер</th><th>Вход</th><th>Unrealized PnL</th><th></th></tr></thead>
+        <thead><tr><th>Бот</th><th>Пара</th><th>Сторона</th><th>Размер</th><th>Вход</th><th>Сумма</th><th>Тейк-профит</th><th>Стоп-лосс</th><th>Unrealized PnL</th><th></th></tr></thead>
         <tbody id="pos-body"></tbody>
       </table>
     </div>
@@ -1875,11 +2144,11 @@ async function toggleService(service,action,btn){
   }catch(e){alert('Ошибка: '+e);btn.disabled=false;btn.innerHTML=old}
 }
 
-async function closePosition(symbol,btn){
+async function closePosition(symbol,instance,btn){
   if(!confirm('Закрыть позицию '+symbol+'?'))return;
   btn.disabled=true;btn.textContent='...';
   try{
-    const r=await fetch('/api/close-position',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({symbol})});
+    const r=await fetch('/api/close-position',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({symbol,instance})});
     const d=await r.json();
     if(d.ok){btn.textContent='OK';setTimeout(()=>loadAll(),1500)}
     else{alert(d.error||'Ошибка');btn.disabled=false;btn.textContent='Закрыть'}
@@ -1907,13 +2176,40 @@ async function closeAllPositions(){
   }catch(e){alert('Ошибка: '+e);btn.disabled=false;btn.textContent='Закрыть все позиции'}
 }
 
+let slEditing=false;
+async function setSL(symbol,side,entryPrice,qty,instance,btn){
+  const input=btn.parentElement.querySelector('.sl-input');
+  const amount=parseFloat(input.value);
+  if(!amount||amount<=0){alert('Введите сумму стоп-лосса');return}
+  btn.disabled=true;btn.textContent='...';
+  try{
+    const r=await fetch('/api/set-sl',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({symbol,side,amount,entry_price:entryPrice,qty,instance})});
+    const d=await r.json();
+    if(d.ok){btn.textContent='OK';input.blur();slEditing=false;setTimeout(()=>loadAll(),1000)}
+    else{alert(d.error||'Ошибка');btn.disabled=false;btn.textContent='OK'}
+  }catch(e){alert('Ошибка: '+e);btn.disabled=false;btn.textContent='OK'}
+}
+async function setTP(symbol,side,entryPrice,qty,instance,btn){
+  const input=btn.parentElement.querySelector('.tp-input');
+  const amount=parseFloat(input.value);
+  if(!amount||amount<=0){alert('Введите сумму тейк-профита');return}
+  btn.disabled=true;btn.textContent='...';
+  try{
+    const r=await fetch('/api/set-tp',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({symbol,side,amount,entry_price:entryPrice,qty,instance})});
+    const d=await r.json();
+    if(d.ok){btn.textContent='OK';input.blur();slEditing=false;setTimeout(()=>loadAll(),1000)}
+    else{alert(d.error||'Ошибка');btn.disabled=false;btn.textContent='OK'}
+  }catch(e){alert('Ошибка: '+e);btn.disabled=false;btn.textContent='OK'}
+}
+
 async function loadPositions(){
   try{
+    if(slEditing)return;
     const pos=await(await fetch('/api/positions?source='+currentSource)).json();
     const body=document.getElementById('pos-body');
     const wrap=document.getElementById('close-all-wrap');
     if(!pos.length){
-      body.innerHTML='<tr><td colspan="7" style="text-align:center;color:#bbb;padding:20px">Нет открытых позиций</td></tr>';
+      body.innerHTML='<tr><td colspan="10" style="text-align:center;color:#bbb;padding:20px">Нет открытых позиций</td></tr>';
       wrap.style.display='none';return;
     }
     wrap.style.display=currentSource==='live'?'':'none';
@@ -1923,13 +2219,23 @@ async function loadPositions(){
       const isCls=inst.includes('TBANK')?'inst-tbank':inst.includes('DEGEN')?'inst-degen':inst.includes('SCALP')?'inst-scalp':'inst-swing';
       const iLabel=inst.includes('TBANK-SCALP')?'TB-SCALP':inst.includes('TBANK-SWING')?'TB-SWING':inst.includes('DEGEN')?'DEGEN':inst.includes('SCALP')?'SCALP':'SWING';
       const cur=inst.includes('TBANK')?'RUB':'USDT';
-      const closeBtn=currentSource==='live'?`<button class="btn-close" onclick="closePosition('${p.symbol}',this)">Закрыть</button>`:'';
+      const closeBtn=currentSource==='live'?`<button class="btn-close" onclick="closePosition('${p.symbol}','${p.instance||''}',this)">Закрыть</button>`:'';
       const x2Btn=currentSource==='live'&&!inst.includes('TBANK')?`<button class="btn-x2" onclick="doublePosition('${p.symbol}','${p.side}',${p.size},'${p.instance||''}',this)">X2</button>`:'';
+      const entryAmt=parseFloat(p.entry_amount)||0;
+      const tpPnl=p.tp_pnl!=null?p.tp_pnl:null;
+      const tpVal=tpPnl!=null?Math.abs(Math.round(tpPnl)):'';
+      const tpInput=currentSource==='live'&&!inst.includes('TBANK')?`<span class="tp-wrap"><input class="tp-input" type="number" value="${tpVal}" placeholder="100" onfocus="slEditing=true" onblur="setTimeout(()=>{if(!document.querySelector('.tp-input:focus,.sl-input:focus'))slEditing=false},300)"><button class="btn-tp" onclick="setTP('${p.symbol}','${p.side}',${p.entry_price},${p.size},'${p.instance||''}',this)">OK</button></span>`:(tpPnl!=null?`<strong class="g">${fmt(tpPnl)} ${cur}</strong>`:'—');
+      const slPnl=p.sl_pnl!=null?p.sl_pnl:null;
+      const slVal=slPnl!=null?Math.abs(Math.round(slPnl)):'';
+      const slInput=currentSource==='live'&&!inst.includes('TBANK')?`<span class="sl-wrap"><input class="sl-input" type="number" value="${slVal}" placeholder="100" onfocus="slEditing=true" onblur="setTimeout(()=>{if(!document.querySelector('.sl-input:focus,.tp-input:focus'))slEditing=false},300)"><button class="btn-sl" onclick="setSL('${p.symbol}','${p.side}',${p.entry_price},${p.size},'${p.instance||''}',this)">OK</button></span>`:(slPnl!=null?`<strong class="r">${fmt(slPnl)} ${cur}</strong>`:'—');
       return`<tr class="fade-in">
         <td><span class="inst-tag ${isCls}">${iLabel}</span></td>
         <td><strong>${p.symbol}</strong></td>
         <td class="${p.side==='Buy'?'side-long':'side-short'}">${p.side==='Buy'?'ЛОНГ':'ШОРТ'}</td>
         <td>${p.size}</td><td>${parseFloat(p.entry_price).toFixed(2)}</td>
+        <td>${Math.round(entryAmt).toLocaleString()} ${cur}</td>
+        <td>${tpInput}</td>
+        <td>${slInput}</td>
         <td class="${cls(pnl)}"><strong>${fmt(pnl)} ${cur}</strong></td>
         <td>${x2Btn} ${closeBtn}</td></tr>`;
     }).join('');
@@ -2004,6 +2310,6 @@ function updateMarketBar(){
 updateMarketBar();setInterval(updateMarketBar,1000);
 
 loadAll();
-setInterval(async()=>{await loadInstances();loadStats();loadChart();loadPositions()},10000);
+setInterval(async()=>{if(slEditing)return;await loadInstances();loadStats();loadChart();loadPositions()},10000);
 </script>
 </body></html>"""

@@ -231,6 +231,7 @@ class TradingEngine:
         await self._notify("🚀 Бот запущен\nПары: " + ", ".join(self.pairs))
         logger.info("Trading engine started")
 
+        asyncio.create_task(self._run_sl_tp_monitor())
         await self._run_loop()
 
     async def _restore_cooldowns(self):
@@ -339,6 +340,7 @@ class TradingEngine:
         logger.info("Trading engine resumed")
         await self._notify("▶️ Торговля возобновлена\nПары: " + ", ".join(self.pairs))
         asyncio.create_task(self._run_loop())
+        asyncio.create_task(self._run_sl_tp_monitor())
 
     async def shutdown(self):
         """Full shutdown — close all connections. Called on process exit."""
@@ -355,6 +357,130 @@ class TradingEngine:
         if tf in tf_map:
             return tf_map[tf]
         return int(tf) * 60
+
+    async def _run_sl_tp_monitor(self):
+        """Real-time SL/TP monitor using WebSocket ticker stream.
+
+        Subscribes to live price updates and checks SL/TP on every tick
+        (~100ms latency). Falls back to 10s polling if WS unavailable.
+        """
+        if self.exchange_type == "tbank":
+            await self._run_sl_tp_poll()
+            return
+
+        # Demo accounts don't support WebSocket — use fast polling
+        demo = self.config.get("bybit", {}).get("demo", False)
+        if demo:
+            logger.info("SL/TP monitor: demo mode, using 5s polling")
+            await self._run_sl_tp_poll()
+            return
+
+        # Track subscribed symbols to re-subscribe when positions change
+        self._ws_prices: dict[str, float] = {}
+        self._ws_subscribed: set[str] = set()
+        self._ws = None
+
+        try:
+            from pybit.unified_trading import WebSocket
+            testnet = self.config.get("bybit", {}).get("testnet", False)
+            self._ws = WebSocket(testnet=testnet, channel_type="linear")
+            logger.info("SL/TP monitor: WebSocket connected")
+        except Exception:
+            logger.warning("SL/TP monitor: WebSocket failed, falling back to polling")
+            await self._run_sl_tp_poll()
+            return
+
+        # Refresh subscriptions & check SL/TP every 2s
+        while self._running:
+            try:
+                # Get current open trades with SL/TP
+                open_trades = await self.db.get_open_trades()
+                needed_symbols = set()
+                for t in open_trades:
+                    sl = t.get("stop_loss") or 0
+                    tp = t.get("take_profit") or 0
+                    if sl > 0 or tp > 0:
+                        needed_symbols.add(t["symbol"])
+
+                # Subscribe to new symbols
+                new_syms = needed_symbols - self._ws_subscribed
+                old_syms = self._ws_subscribed - needed_symbols
+                for sym in new_syms:
+                    try:
+                        self._ws.ticker_stream(symbol=sym,
+                                               callback=self._ws_on_ticker)
+                        self._ws_subscribed.add(sym)
+                        logger.info("SL/TP WS: subscribed %s", sym)
+                    except Exception:
+                        logger.warning("SL/TP WS: subscribe failed %s", sym)
+                # Unsubscribe closed symbols
+                for sym in old_syms:
+                    try:
+                        self._ws.unsubscribe(args=[f"tickers.{sym}"],
+                                             channel_type="linear")
+                    except Exception:
+                        pass
+                    self._ws_subscribed.discard(sym)
+                    self._ws_prices.pop(sym, None)
+
+                # Check SL/TP using WS prices
+                for trade in open_trades:
+                    if not self._running:
+                        break
+                    sym = trade["symbol"]
+                    cur_price = self._ws_prices.get(sym)
+                    if not cur_price:
+                        continue
+                    sl = trade.get("stop_loss") or 0
+                    tp = trade.get("take_profit") or 0
+                    if sl > 0:
+                        try:
+                            await self._check_db_stop_loss_with_price(trade, cur_price)
+                        except Exception:
+                            logger.exception("SL monitor error %s", sym)
+                    if tp > 0:
+                        try:
+                            await self._check_db_take_profit_with_price(trade, cur_price)
+                        except Exception:
+                            logger.exception("TP monitor error %s", sym)
+            except Exception:
+                logger.exception("SL/TP WS monitor error")
+            await asyncio.sleep(2)
+
+    def _ws_on_ticker(self, message: dict):
+        """Callback for WebSocket ticker updates."""
+        try:
+            data = message.get("data", {})
+            symbol = data.get("symbol", "")
+            last_price = data.get("lastPrice")
+            if symbol and last_price:
+                self._ws_prices[symbol] = float(last_price)
+        except Exception:
+            pass
+
+    async def _run_sl_tp_poll(self):
+        """Fast polling SL/TP check every 5 seconds."""
+        while self._running:
+            try:
+                open_trades = await self.db.get_open_trades()
+                for trade in open_trades:
+                    if not self._running:
+                        break
+                    sl = trade.get("stop_loss") or 0
+                    tp = trade.get("take_profit") or 0
+                    if sl > 0:
+                        try:
+                            await self._check_db_stop_loss(trade)
+                        except Exception:
+                            logger.exception("SL poll error %s", trade.get("symbol"))
+                    if tp > 0:
+                        try:
+                            await self._check_db_take_profit(trade)
+                        except Exception:
+                            logger.exception("TP poll error %s", trade.get("symbol"))
+            except Exception:
+                logger.exception("SL/TP poll error")
+            await asyncio.sleep(5)
 
     async def _run_loop(self):
         interval_sec = self._timeframe_to_seconds(self.timeframe)
@@ -838,6 +964,19 @@ class TradingEngine:
         else:
             sl = self.risk.calculate_sl_tp(price, side)[0]
 
+        # Clamp SL by max dollar loss (max_sl_usd)
+        max_sl_usd = self.config.get("risk", {}).get("max_sl_usd", 0)
+        if max_sl_usd > 0 and qty > 0:
+            sl_loss = abs(sl - price) * qty
+            if sl_loss > max_sl_usd:
+                max_sl_dist = max_sl_usd / qty
+                if side == "Buy":
+                    sl = round(price - max_sl_dist, 6)
+                else:
+                    sl = round(price + max_sl_dist, 6)
+                sl_source += f"→cap${max_sl_usd}"
+                logger.info("SL capped: %s $%.0f → $%.0f (max_sl_usd=%d)", symbol, sl_loss, max_sl_usd, max_sl_usd)
+
         if ai_tp_pct is not None and 0.5 <= ai_tp_pct <= 10.0:
             tp = price * (1 + ai_tp_pct / 100) if side == "Buy" else price * (1 - ai_tp_pct / 100)
             tp = round(tp, 6)
@@ -847,6 +986,32 @@ class TradingEngine:
             tp_source = f"ATR:{atr_tp_pct*100:.2f}%"
         else:
             tp = self.risk.calculate_sl_tp(price, side)[1]
+
+        # Take early TP: close at tp_take_pct% of calculated TP (e.g. 0.12 = 12%)
+        tp_take_pct = self.config.get("risk", {}).get("tp_take_pct", 0)
+        if tp_take_pct > 0 and qty > 0:
+            full_tp_profit = abs(tp - price) * qty
+            tp_dist = abs(tp - price) * tp_take_pct
+            if side == "Buy":
+                tp = round(price + tp_dist, 6)
+            else:
+                tp = round(price - tp_dist, 6)
+            actual_tp_profit = abs(tp - price) * qty
+            tp_source += f"→{tp_take_pct*100:.0f}%"
+            logger.info("TP reduced: %s $%.0f → $%.0f (%.0f%% of target)", symbol, full_tp_profit, actual_tp_profit, tp_take_pct * 100)
+
+        # Clamp SL: dollar loss must not exceed dollar TP
+        if qty > 0:
+            tp_usd = abs(tp - price) * qty
+            sl_usd = abs(sl - price) * qty
+            if sl_usd > tp_usd and tp_usd > 0:
+                sl_dist = abs(tp - price)  # same distance as TP
+                if side == "Buy":
+                    sl = round(price - sl_dist, 6)
+                else:
+                    sl = round(price + sl_dist, 6)
+                sl_source += f"→cap≤TP"
+                logger.info("SL capped to TP: %s $%.0f → $%.0f", symbol, sl_usd, tp_usd)
 
         # Place order with retry on qty rejection
         order = None
@@ -1029,6 +1194,8 @@ class TradingEngine:
             if trade["category"] not in ("linear", "tbank"):
                 continue
             try:
+                await self._check_db_stop_loss(trade)
+                await self._check_db_take_profit(trade)
                 await self._check_breakeven(trade)
                 if not trade.get("partial_closed"):
                     await self._check_partial_close(trade)
@@ -1320,6 +1487,136 @@ class TradingEngine:
         await self._notify(
             f"🛑 Loss target: закрыл {direction} {symbol}\n"
             f"PnL: {upnl:,.0f} USDT (лимит: -{target}$)"
+        )
+
+    async def _check_db_stop_loss(self, trade: dict):
+        """Close position when price hits stop_loss stored in DB (fetches price via REST)."""
+        sl = trade.get("stop_loss")
+        if not sl or sl <= 0:
+            return
+        try:
+            if self.exchange_type == "tbank":
+                cur_price = self.client.get_last_price(trade["symbol"])
+            else:
+                cur_price = self.client.get_last_price(trade["symbol"], category="linear")
+        except Exception:
+            return
+        await self._check_db_stop_loss_with_price(trade, cur_price)
+
+    async def _check_db_stop_loss_with_price(self, trade: dict, cur_price: float):
+        """Close position when price hits stop_loss stored in DB."""
+        sl = trade.get("stop_loss")
+        if not sl or sl <= 0 or not cur_price:
+            return
+
+        symbol = trade["symbol"]
+        side = trade["side"]
+        entry = trade["entry_price"]
+        qty = trade["qty"]
+
+        # Buy: close when price <= SL (price fell)
+        if side == "Buy" and cur_price > sl:
+            return
+        # Sell: close when price >= SL (price rose)
+        if side == "Sell" and cur_price < sl:
+            return
+
+        # SL hit — close position
+        if side == "Buy":
+            upnl = (cur_price - entry) * qty
+        else:
+            upnl = (entry - cur_price) * qty
+
+        # Try to close on exchange (may fail if position is phantom)
+        close_side = "Sell" if side == "Buy" else "Buy"
+        try:
+            if self.exchange_type == "tbank":
+                self.client.place_order(symbol=symbol, side=close_side, qty=qty)
+            else:
+                self.client.place_order(symbol=symbol, side=close_side, qty=qty, category="linear")
+        except Exception:
+            logger.warning("DB stop-loss: no position on exchange for %s, closing in DB only", symbol)
+
+        # Always close in DB
+        try:
+            balance = self.client.get_balance()
+            await self.db.close_trade(trade["id"], cur_price, upnl)
+            await self.db.update_daily_pnl(upnl)
+            await self._record_pnl(upnl, balance)
+        except Exception:
+            logger.exception("DB stop-loss: DB update failed for %s", symbol)
+
+        direction = "ЛОНГ" if side == "Buy" else "ШОРТ"
+        logger.info("🛑 SL сработал: %s %s @ %.6f (SL=%.6f, PnL=%.2f)", direction, symbol, cur_price, sl, upnl)
+        await self._notify(
+            f"🛑 Стоп-лосс: {direction} {symbol}\n"
+            f"Цена: {cur_price:,.6f} (SL: {sl:,.6f})\n"
+            f"PnL: {upnl:+,.2f}"
+        )
+
+    async def _check_db_take_profit(self, trade: dict):
+        """Close position when price hits take_profit stored in DB (fetches price via REST)."""
+        tp = trade.get("take_profit")
+        if not tp or tp <= 0:
+            return
+        try:
+            if self.exchange_type == "tbank":
+                cur_price = self.client.get_last_price(trade["symbol"])
+            else:
+                cur_price = self.client.get_last_price(trade["symbol"], category="linear")
+        except Exception:
+            return
+        await self._check_db_take_profit_with_price(trade, cur_price)
+
+    async def _check_db_take_profit_with_price(self, trade: dict, cur_price: float):
+        """Close position when price hits take_profit stored in DB."""
+        tp = trade.get("take_profit")
+        if not tp or tp <= 0 or not cur_price:
+            return
+
+        symbol = trade["symbol"]
+        side = trade["side"]
+        entry = trade["entry_price"]
+        qty = trade["qty"]
+
+        # Buy: close when price >= TP (price rose)
+        if side == "Buy" and cur_price < tp:
+            return
+        # Sell: close when price <= TP (price fell)
+        if side == "Sell" and cur_price > tp:
+            return
+
+        # TP hit — close position
+        if side == "Buy":
+            upnl = (cur_price - entry) * qty
+        else:
+            upnl = (entry - cur_price) * qty
+
+        # Try to close on exchange (may fail if position is phantom)
+        close_side = "Sell" if side == "Buy" else "Buy"
+        try:
+            if self.exchange_type == "tbank":
+                self.client.place_order(symbol=symbol, side=close_side, qty=qty)
+            else:
+                self.client.place_order(symbol=symbol, side=close_side, qty=qty, category="linear")
+        except Exception:
+            logger.warning("DB take-profit: no position on exchange for %s, closing in DB only", symbol)
+
+        # Always close in DB
+        try:
+            balance = self.client.get_balance()
+            await self.db.close_trade(trade["id"], cur_price, upnl)
+            await self.db.update_daily_pnl(upnl)
+            await self._record_pnl(upnl, balance)
+        except Exception:
+            logger.exception("DB take-profit: DB update failed for %s", symbol)
+
+        direction = "ЛОНГ" if side == "Buy" else "ШОРТ"
+        logger.info("🎯 TP сработал: %s %s @ %.6f (TP=%.6f, PnL=%.2f)", direction, symbol, cur_price, tp, upnl)
+        await self._notify(
+            f"🎯 Тейк-профит: {direction} {symbol}\n"
+            f"Цена: {cur_price:,.6f} (TP: {tp:,.6f})\n"
+            f"PnL: {upnl:+,.2f}"
         )
 
     async def _check_kotegawa_exit(self, trade: dict):
