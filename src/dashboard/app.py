@@ -1,7 +1,7 @@
 import logging
 import subprocess
 import time
-from datetime import date
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import aiosqlite
@@ -297,20 +297,40 @@ class Dashboard:
         page = int(request.query.get("page", "1"))
         per_page = int(request.query.get("per_page", "20"))
         source = request.query.get("source", "live")
+        date_param = request.query.get("date", "")
+        range_param = request.query.get("range", "day")
 
         instance_name = self.config.get("instance_name", "SCALP")
+
+        # Build date filter for SQL
+        if date_param:
+            if range_param == "week":
+                try:
+                    end = (datetime.strptime(date_param, "%Y-%m-%d") + timedelta(days=7)).strftime("%Y-%m-%d")
+                except ValueError:
+                    end = date_param
+                date_where = f" AND date(closed_at) >= '{date_param}' AND date(closed_at) < '{end}'"
+            else:
+                date_where = f" AND date(closed_at) = '{date_param}'"
+        elif source == "archive":
+            date_where = ""
+        else:
+            # Live, today only
+            date_where = " AND date(closed_at) = date('now')"
 
         # Collect all trades from all instances
         all_trades = []
 
-        # Main instance trades
+        # Main instance trades — always use direct SQL for date filtering
         main_db_path = _get_db_path(str(self.db.db_path), source)
         if source == "archive":
             if Path(main_db_path).exists():
                 try:
                     async with aiosqlite.connect(main_db_path) as db:
                         db.row_factory = aiosqlite.Row
-                        cur = await db.execute("SELECT * FROM trades ORDER BY id DESC LIMIT 1000")
+                        cur = await db.execute(
+                            f"SELECT * FROM trades WHERE 1=1{date_where} ORDER BY id DESC LIMIT 1000"
+                        )
                         rows = await cur.fetchall()
                         for r in rows:
                             t = dict(r)
@@ -319,10 +339,19 @@ class Dashboard:
                 except Exception:
                     logger.warning("Failed to read archive trades from %s", main_db_path)
         else:
-            main_trades = await self.db.get_recent_trades(1000)
-            for t in main_trades:
-                t["instance"] = t.get("instance") or instance_name
-                all_trades.append(t)
+            try:
+                async with aiosqlite.connect(str(self.db.db_path)) as db:
+                    db.row_factory = aiosqlite.Row
+                    cur = await db.execute(
+                        f"SELECT * FROM trades WHERE 1=1{date_where} ORDER BY id DESC LIMIT 1000"
+                    )
+                    rows = await cur.fetchall()
+                    for r in rows:
+                        t = dict(r)
+                        t["instance"] = t.get("instance") or instance_name
+                        all_trades.append(t)
+            except Exception:
+                logger.warning("Failed to read trades from main DB")
 
         # Other instances trades
         for inst in self.config.get("other_instances", []):
@@ -333,7 +362,7 @@ class Dashboard:
                     async with aiosqlite.connect(db_path) as db:
                         db.row_factory = aiosqlite.Row
                         cur = await db.execute(
-                            "SELECT * FROM trades ORDER BY id DESC LIMIT 1000"
+                            f"SELECT * FROM trades WHERE 1=1{date_where} ORDER BY id DESC LIMIT 1000"
                         )
                         rows = await cur.fetchall()
                         for r in rows:
@@ -359,10 +388,12 @@ class Dashboard:
         days = int(request.query.get("days", "30"))
         tf = request.query.get("tf", "1D")  # 10m, 30m, 1H, 1D, 1M
         source = request.query.get("source", "live")
+        date_param = request.query.get("date", "")
+        range_param = request.query.get("range", "day")
 
         instance_name = self.config.get("instance_name", "SCALP")
 
-        return await self._pnl_intraday(tf, instance_name, source)
+        return await self._pnl_intraday(tf, instance_name, source, date_param, range_param)
 
     async def _pnl_daily(self, days: int, tf: str, instance_name: str, source: str = "live") -> web.Response:
         """Daily or monthly PnL from daily_pnl table."""
@@ -430,12 +461,28 @@ class Dashboard:
         result = sorted(pnl_by_key.values(), key=lambda x: x["trade_date"])
         return web.json_response(result)
 
-    async def _pnl_intraday(self, tf: str, instance_name: str, source: str = "live") -> web.Response:
-        """Intraday PnL from trades table — all trades from the very first one."""
-        from datetime import datetime
+    async def _pnl_intraday(self, tf: str, instance_name: str, source: str = "live",
+                             date_param: str = "", range_param: str = "day") -> web.Response:
+        """Intraday PnL from trades table. Filters by date for live mode."""
 
         minutes = {"1m": 1, "5m": 5, "10m": 10, "30m": 30, "1H": 60, "1D": 1440, "1M": 43200}.get(tf, 60)
         per_trade = True  # always show each trade as a separate point
+
+        # Build date filter
+        if date_param:
+            if range_param == "week":
+                try:
+                    end = (datetime.strptime(date_param, "%Y-%m-%d") + timedelta(days=7)).strftime("%Y-%m-%d")
+                except ValueError:
+                    end = date_param
+                date_where = f" AND date(closed_at) >= '{date_param}' AND date(closed_at) < '{end}'"
+            else:
+                date_where = f" AND date(closed_at) = '{date_param}'"
+        elif source == "archive":
+            date_where = ""
+        else:
+            # Live, today only
+            date_where = " AND date(closed_at) = date('now')"
 
         main_db_path = _get_db_path(str(self.db.db_path), source)
         all_dbs = [(main_db_path, instance_name)]
@@ -452,7 +499,7 @@ class Dashboard:
                 async with aiosqlite.connect(db_path) as db:
                     db.row_factory = aiosqlite.Row
                     cur = await db.execute(
-                        "SELECT closed_at, pnl FROM trades WHERE status='closed' ORDER BY closed_at",
+                        f"SELECT closed_at, pnl FROM trades WHERE status='closed'{date_where} ORDER BY closed_at",
                     )
                     rows = await cur.fetchall()
                     for r in rows:
@@ -1327,6 +1374,20 @@ tr:hover{background:rgba(99,102,241,0.04)}
 .tf-buttons button:hover{background:#e8e8ef}
 .tf-buttons button.active{background:var(--purple);border-color:var(--purple);color:#fff}
 
+.date-nav{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.date-nav button{
+  background:#f3f3f7;border:1px solid #e0e0e6;
+  color:#666;padding:5px 12px;border-radius:20px;font-size:12px;font-weight:600;
+  cursor:pointer;transition:all 0.2s;
+}
+.date-nav button:hover{background:#e8e8ef}
+.date-nav button.active{background:var(--purple);border-color:var(--purple);color:#fff}
+.date-nav .date-label{font-size:13px;font-weight:700;color:#333;min-width:90px;text-align:center}
+.date-nav .date-badge{
+  background:rgba(217,119,6,0.1);color:#d97706;padding:3px 10px;border-radius:12px;
+  font-size:11px;font-weight:700;display:none;
+}
+
 .chart-half{background:#f9f9fb;border:1px solid var(--border);border-radius:12px;padding:16px;position:relative}
 .chart-half-label{font-size:12px;font-weight:600;color:#555;margin-bottom:10px;display:flex;align-items:center;gap:6px}
 .dot{width:10px;height:10px;border-radius:50%;display:inline-block}
@@ -1573,6 +1634,15 @@ body.archive-mode .header{background:#fff;border-bottom-color:rgba(245,158,11,0.
         </div>
       </div>
     </div>
+    <!-- Date navigator (shown only in archive mode) -->
+    <div class="date-nav" id="date-nav" style="display:none">
+      <button onclick="navDate(-1)">&#8592; Пред</button>
+      <span class="date-label" id="date-label">Сегодня</span>
+      <button onclick="navDate(1)">След &#8594;</button>
+      <button class="active" id="btn-today" onclick="setArchiveDate(null,'day')">Сегодня</button>
+      <button id="btn-week" onclick="toggleWeek()">Неделя</button>
+      <span class="date-badge" id="date-badge">Архив</span>
+    </div>
     <!-- Combined chart: all instances -->
     <div class="chart-half">
       <div class="chart-half-label">Все инстансы — кумулятивный PnL</div>
@@ -1663,8 +1733,91 @@ body.archive-mode .header{background:#fff;border-bottom-color:rgba(245,158,11,0.
 
 <script>
 let currentPage=1,hasNext=false,currentTF='1m',currentSource='live';
+let archiveDate=null; // null = today (live)
+let archiveRange='day'; // 'day' | 'week'
+
 function fmt(v){return(v>=0?'+':'')+v.toFixed(2)}
 function cls(v){return v>=0?'g':'r'}
+
+function fmtDateRu(d){
+  const dd=String(d.getDate()).padStart(2,'0');
+  const mm=String(d.getMonth()+1).padStart(2,'0');
+  return dd+'.'+mm+'.'+d.getFullYear();
+}
+function toISO(d){return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0')}
+
+function updateDateNav(){
+  const label=document.getElementById('date-label');
+  const badge=document.getElementById('date-badge');
+  const btnToday=document.getElementById('btn-today');
+  const btnWeek=document.getElementById('btn-week');
+  if(!archiveDate){
+    label.textContent='Сегодня';
+    badge.style.display='none';
+    btnToday.classList.add('active');
+  }else{
+    const d=new Date(archiveDate+'T00:00:00');
+    if(archiveRange==='week'){
+      const end=new Date(d);end.setDate(end.getDate()+6);
+      label.textContent=fmtDateRu(d)+' — '+fmtDateRu(end);
+    }else{
+      label.textContent=fmtDateRu(d);
+    }
+    badge.style.display='';
+    btnToday.classList.remove('active');
+  }
+  btnWeek.classList.toggle('active',archiveRange==='week');
+}
+
+function setArchiveDate(dateStr,range){
+  archiveDate=dateStr;
+  archiveRange=range||'day';
+  currentPage=1;
+  updateDateNav();
+  loadChart();
+  loadTrades(1);
+}
+
+function navDate(dir){
+  const step=archiveRange==='week'?7:1;
+  let d;
+  if(archiveDate){
+    d=new Date(archiveDate+'T00:00:00');
+  }else{
+    d=new Date();d.setHours(0,0,0,0);
+  }
+  d.setDate(d.getDate()+dir*step);
+  if(currentSource==='archive'){
+    setArchiveDate(toISO(d),archiveRange);
+  }else{
+    const today=new Date();today.setHours(0,0,0,0);
+    if(d>=today){
+      setArchiveDate(null,archiveRange);
+    }else{
+      setArchiveDate(toISO(d),archiveRange);
+    }
+  }
+}
+
+function toggleWeek(){
+  if(archiveRange==='week'){
+    archiveRange='day';
+  }else{
+    archiveRange='week';
+    // Align to Monday
+    if(archiveDate){
+      const d=new Date(archiveDate+'T00:00:00');
+      const dow=d.getDay()||7;
+      d.setDate(d.getDate()-(dow-1));
+      archiveDate=toISO(d);
+    }
+  }
+  currentPage=1;
+  updateDateNav();
+  loadChart();
+  loadTrades(1);
+}
+
 function setTF(tf){
   currentTF=tf;
   document.querySelectorAll('.tf-buttons button').forEach(b=>b.classList.toggle('active',b.dataset.tf===tf));
@@ -1673,19 +1826,26 @@ function setTF(tf){
 function setSource(src){
   currentSource=src;
   currentPage=1;
+  archiveDate=null;archiveRange='day';updateDateNav();
   document.querySelectorAll('.source-toggle button').forEach(b=>{
     b.classList.remove('active','archive-active');
     if(b.dataset.source===src){b.classList.add(src==='archive'?'archive-active':'active')}
   });
   const banner=document.getElementById('archive-banner');
   const badge=document.getElementById('status-badge');
+  const dateNav=document.getElementById('date-nav');
+  const instances=document.getElementById('instances');
   if(src==='archive'){
     banner.style.display='';
     badge.style.display='none';
+    dateNav.style.display='';
+    instances.style.display='none';
     document.body.classList.add('archive-mode');
   }else{
     banner.style.display='none';
     badge.style.display='';
+    dateNav.style.display='';
+    instances.style.display='';
     document.body.classList.remove('archive-mode');
   }
   loadAll();
@@ -1862,14 +2022,7 @@ function buildArea(canvasId, labels, dailyArr, lineColor, currency, sym){
       interaction:{intersect:false,mode:'index'},
       plugins:{
         legend:{display:false},
-        datalabels:{
-          display:c=>padCum[c.dataIndex]!==null,
-          formatter:(v,c)=>{const d=padDaily[c.dataIndex];return(v>=0?'+':'')+v.toFixed(0)+'('+(d>=0?'+':'')+d.toFixed(0)+'$)'},
-          color:c=>padCum[c.dataIndex]>=0?'#16a34a':'#e53935',
-          anchor:'end',align:'top',
-          font:{size:9,weight:'bold'},
-          offset:4,
-        },
+        datalabels:{display:false},
         tooltip:{
           filter:c=>padCum[c.dataIndex]!==null,
           backgroundColor:'#fff',titleColor:'#333',bodyColor:'#555',
@@ -1958,14 +2111,7 @@ function buildCombinedChart(canvasId, allLabels, seriesMap){
           usePointStyle:true,pointStyle:'circle',padding:16,
           font:{size:12,weight:'600'},
         }},
-        datalabels:{
-          display:c=>{const v=c.dataset.data[c.dataIndex];return v!==null&&dailyMaps[c.datasetIndex][c.dataIndex]!==0},
-          formatter:(v,c)=>{const d=dailyMaps[c.datasetIndex][c.dataIndex];return(v>=0?'+':'')+v.toFixed(0)+'('+(d>=0?'+':'')+d.toFixed(0)+')'},
-          color:c=>c.dataset.borderColor,
-          anchor:'end',align:'top',
-          font:{size:9,weight:'bold'},
-          offset:4,
-        },
+        datalabels:{display:false},
         tooltip:{
           filter:c=>c.parsed.y!==null,
           backgroundColor:'#fff',titleColor:'#333',bodyColor:'#555',
@@ -2012,7 +2158,9 @@ function closeFullscreen(e){
 
 async function loadChart(){
   try{
-    const pnl=await(await fetch('/api/pnl?days=30&tf='+currentTF+'&source='+currentSource)).json();
+    let pnlUrl='/api/pnl?days=30&tf='+currentTF+'&source='+currentSource;
+    if(archiveDate)pnlUrl+='&date='+archiveDate+'&range='+archiveRange;
+    const pnl=await(await fetch(pnlUrl)).json();
     // Destroy old charts
     if(chartCombined){chartCombined.destroy();chartCombined=null}
     Object.values(miniCharts).forEach(c=>c.destroy());miniCharts={};
@@ -2080,15 +2228,16 @@ async function loadChart(){
       return{labels:fl,daily:fd};
     }
 
-    // Build per-instance filtered data and cache for fullscreen
+    // Build per-instance data (no filtering — show gaps/zeros)
     const seriesMap={};
     const allInstLabels=new Set();
     Object.keys(instDaily).forEach(name=>{
-      const filtered=filterSeries(labels,instDaily[name]);
-      if(filtered.daily.length>0){
-        instanceData[name]=filtered;
-        seriesMap[name]=filtered;
-        filtered.labels.forEach(l=>allInstLabels.add(l));
+      const hasData=instDaily[name].some(v=>v!==0);
+      if(hasData){
+        const all={labels:labels,daily:instDaily[name]};
+        instanceData[name]=all;
+        seriesMap[name]=all;
+        labels.forEach(l=>allInstLabels.add(l));
       }
     });
 
@@ -2244,7 +2393,9 @@ async function loadPositions(){
 
 async function loadTrades(page){
   try{
-    const r=await(await fetch('/api/trades?page='+page+'&per_page=20&source='+currentSource)).json();
+    let tradesUrl='/api/trades?page='+page+'&per_page=20&source='+currentSource;
+    if(archiveDate)tradesUrl+='&date='+archiveDate+'&range='+archiveRange;
+    const r=await(await fetch(tradesUrl)).json();
     currentPage=r.page;hasNext=r.has_next;
     document.getElementById('prev-btn').disabled=currentPage<=1;
     document.getElementById('next-btn').disabled=!hasNext;

@@ -527,8 +527,14 @@ class TradingEngine:
         # Update market bias (cached, ~1 call/hour)
         self._update_market_bias()
 
+        # Weekend filter for stock exchanges (MOEX closed Sat/Sun)
+        now_utc = datetime.utcnow()
+        if self.config.get("exchange") == "tbank" and now_utc.weekday() >= 5:
+            logger.info("Выходной день (MOEX закрыта). Мониторинг позиций продолжается.")
+            return
+
         # Trading hours filter (UTC)
-        current_hour = datetime.utcnow().hour
+        current_hour = now_utc.hour
         if self._trading_hour_start < self._trading_hour_end:
             in_session = self._trading_hour_start <= current_hour < self._trading_hour_end
         else:
@@ -1005,6 +1011,20 @@ class TradingEngine:
             actual_tp_profit = abs(tp - price) * qty
             tp_source += f"→{tp_take_pct*100:.0f}%"
             logger.info("TP reduced: %s $%.0f → $%.0f (%.0f%% of target)", symbol, full_tp_profit, actual_tp_profit, tp_take_pct * 100)
+
+        # Clamp SL ≤ 60% of TP
+        if sl and tp and qty > 0:
+            sl_usd = abs(sl - price) * qty
+            tp_usd = abs(tp - price) * qty
+            max_sl_usd = tp_usd * 0.6
+            if tp_usd > 0 and sl_usd > max_sl_usd:
+                new_sl_dist = abs(tp - price) * 0.6
+                if side == "Buy":
+                    sl = round(price - new_sl_dist, 6)
+                else:
+                    sl = round(price + new_sl_dist, 6)
+                sl_source += "→60%TP"
+                logger.info("SL clamped to 60%% TP: %s $%.0f → $%.0f (TP $%.0f)", symbol, sl_usd, max_sl_usd, tp_usd)
 
         # Place order with retry on qty rejection
         order = None
@@ -1497,7 +1517,7 @@ class TradingEngine:
         await self._check_db_stop_loss_with_price(trade, cur_price)
 
     async def _dynamic_sl_tighten(self, trade: dict):
-        """Tighten SL: max SL = 83% of TP (TP=$120 → SL≤$100). Triggers at 80% of limit."""
+        """Tighten SL to max 60% of TP (in $). Triggers at 80% of limit."""
         sl = trade.get("stop_loss") or 0
         tp = trade.get("take_profit") or 0
         entry = trade.get("entry_price") or 0
@@ -1508,10 +1528,10 @@ class TradingEngine:
             return
 
         tp_usd = abs(tp - entry) * qty
-        max_sl_usd = tp_usd * 0.83  # SL не больше 83% от TP ($120 TP → $100 SL)
+        max_sl_usd = tp_usd * 0.6
         sl_usd = abs(sl - entry) * qty
         if tp_usd <= 0 or sl_usd <= max_sl_usd:
-            return  # SL already ≤ 83% of TP, nothing to do
+            return  # SL already ≤ 60% of TP
 
         # Get current price
         try:
@@ -1530,14 +1550,14 @@ class TradingEngine:
         else:
             unrealized_pnl = (entry - cur_price) * qty
 
-        # When loss reaches 80% of max_sl → tighten SL to 83% of TP
+        # When loss reaches 80% of limit → tighten SL to 60% of TP
         if unrealized_pnl < 0 and abs(unrealized_pnl) >= max_sl_usd * 0.8:
-            new_sl_dist = abs(tp - entry) * 0.83
+            new_sl_dist = abs(tp - entry) * 0.6
             if side == "Buy":
                 new_sl = round(entry - new_sl_dist, 6)
             else:
                 new_sl = round(entry + new_sl_dist, 6)
-            logger.info("Dynamic SL tighten: %s loss $%.0f → SL $%.0f→$%.0f (83%% of TP $%.0f)",
+            logger.info("Dynamic SL tighten: %s loss $%.0f → SL $%.0f→$%.0f (60%% of TP $%.0f)",
                         symbol, abs(unrealized_pnl), sl_usd, max_sl_usd, tp_usd)
             await self.db.update_trade(trade["id"], stop_loss=new_sl)
 

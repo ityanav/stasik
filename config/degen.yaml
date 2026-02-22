@@ -69,7 +69,7 @@ strategy:
 risk:
   risk_per_trade: 0.5                # 0.5% — чуть агрессивнее (было 0.3%)
   max_risk_per_trade: 200             # макс $200 убыток на позицию
-  tp_take_pct: 0.12                   # TP = 12% от рассчитанного (хотел $1000 → закроет на $120)
+  tp_take_pct: 0.25                   # TP = 25% от рассчитанного (хотел $1000 → закроет на $250)
   stop_loss: 1.5
   take_profit: 3.0
   max_open_positions: 10
