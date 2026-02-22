@@ -2202,7 +2202,7 @@ class TradingEngine:
 
     async def _record_pnl(self, pnl: float, balance: float):
         """Record PnL and check global drawdown across all bots."""
-        await self._record_pnl(pnl, balance)
+        self.risk.record_pnl(pnl, balance)
         if self.risk.daily_drawdown_from_profit > 0:
             try:
                 daily_map = await self._get_all_daily_pnl()

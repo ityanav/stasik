@@ -122,6 +122,17 @@ class Database:
         )
         await self._db.commit()
 
+    async def update_trade(self, trade_id: int, **kwargs):
+        """Update fields of an open trade (e.g., stop_loss, take_profit)."""
+        if not kwargs:
+            return
+        fields = ", ".join(f"{k} = ?" for k in kwargs)
+        values = list(kwargs.values()) + [trade_id]
+        await self._db.execute(
+            f"UPDATE trades SET {fields} WHERE id = ?", values
+        )
+        await self._db.commit()
+
     async def get_recent_trades(self, limit: int = 10, offset: int = 0) -> list[dict]:
         cursor = await self._db.execute(
             "SELECT * FROM trades ORDER BY id DESC LIMIT ? OFFSET ?", (limit, offset)
