@@ -57,6 +57,9 @@ strategy:
   htf_filter: true                   # ВКЛЮЧЁН — скачок должен подтверждаться на 1H (было false!)
   htf_score_min: 4                   # контр-тренд: нужен score >= 4
   htf_min_sma_dev: 1.0              # HTF (1H) должен показывать отклонение >= 1%
+  reversal_confirmation: true          # ждать подтверждающую свечу перед входом
+  reversal_candles: 1                  # 1 подтверждающая свеча
+  reversal_max_wait: 3                 # макс 3 свечи ожидания
   kotegawa_exit_ratio: 0.5           # 50% — фолбэк если scale_out выключен
   scale_out_enabled: true
   scale_out_stages: [0.20, 0.40, 0.50]   # memes spike fast — quick locks

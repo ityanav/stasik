@@ -86,6 +86,13 @@ class TradingEngine:
         # Kotegawa scaling in: track symbols where we already added to position
         self._scaled_in: set[str] = set()
 
+        # Reversal confirmation: pending signals waiting for confirming candle
+        self._pending_signals: dict[str, dict] = {}  # symbol -> pending signal data
+        strat_cfg = config.get("strategy", {})
+        self._reversal_confirmation: bool = strat_cfg.get("reversal_confirmation", False)
+        self._reversal_candles: int = strat_cfg.get("reversal_candles", 1)
+        self._reversal_max_wait: int = strat_cfg.get("reversal_max_wait", 3)
+
         # Trading hours filter
         trading_hours = config["trading"].get("trading_hours")
         if trading_hours and len(trading_hours) == 2:
@@ -682,6 +689,10 @@ class TradingEngine:
             logger.info("Market bias [%s]: %s score %d → %d", self._market_bias, symbol, original_score, result.score)
 
         if result.signal == Signal.HOLD:
+            # Clear pending reversal if signal is gone
+            if symbol in self._pending_signals:
+                logger.info("⏳ Reversal reset %s: сигнал стал HOLD", symbol)
+                del self._pending_signals[symbol]
             return
 
         # HTF trend + ADX + SMA deviation filter
@@ -787,6 +798,68 @@ class TradingEngine:
         # Spot: only Buy (no short selling)
         if category == "spot" and side == "Sell":
             return
+
+        # Reversal confirmation: wait for a confirming candle before entry
+        if (
+            self._reversal_confirmation
+            and isinstance(self.signal_gen, KotegawaGenerator)
+            and not is_scale_in
+        ):
+            pending = self._pending_signals.get(symbol)
+            if pending:
+                # Signal direction changed — reset pending
+                if pending["side"] != side:
+                    logger.info("⏳ Reversal reset %s: сигнал сменился %s → %s", symbol, pending["side"], side)
+                    del self._pending_signals[symbol]
+                    # Fall through to create new pending below
+
+            pending = self._pending_signals.get(symbol)
+            if pending is None:
+                # New signal — store as pending, don't enter yet
+                self._pending_signals[symbol] = {
+                    "side": side,
+                    "score": result.score,
+                    "details": result.details,
+                    "candles_waited": 0,
+                }
+                logger.info(
+                    "⏳ Pending reversal %s %s (score=%d, dev=%.1f%%) — ждём подтверждающую свечу",
+                    side, symbol, result.score, result.details.get("sma_dev", 0),
+                )
+                return
+            else:
+                # Check last closed candle (iloc[-2], current candle is still forming)
+                prev_candle = df.iloc[-2]
+                confirmed = False
+                if side == "Buy" and prev_candle["close"] > prev_candle["open"]:
+                    confirmed = True  # green candle confirms buy
+                elif side == "Sell" and prev_candle["close"] < prev_candle["open"]:
+                    confirmed = True  # red candle confirms sell
+
+                if confirmed:
+                    logger.info(
+                        "✅ Reversal confirmed %s %s (waited %d candles)",
+                        side, symbol, pending["candles_waited"],
+                    )
+                    del self._pending_signals[symbol]
+                    # Continue to AI / _open_trade below
+                else:
+                    pending["candles_waited"] += 1
+                    # Update score/details with fresh values
+                    pending["score"] = result.score
+                    pending["details"] = result.details
+                    if pending["candles_waited"] >= self._reversal_max_wait:
+                        logger.info(
+                            "❌ Reversal timeout %s %s (waited %d candles, max=%d)",
+                            side, symbol, pending["candles_waited"], self._reversal_max_wait,
+                        )
+                        del self._pending_signals[symbol]
+                    else:
+                        logger.info(
+                            "⏳ Waiting reversal %s %s (candle %d/%d)",
+                            side, symbol, pending["candles_waited"], self._reversal_max_wait,
+                        )
+                    return
 
         # AI analyst filter
         ai_reasoning = ""
