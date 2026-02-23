@@ -1000,17 +1000,50 @@ class Dashboard:
                 return inst.get("pairs", [])
         return []
 
+    def _get_instance_config_leverage(self, instance: str) -> int:
+        """Get configured leverage for an instance from its YAML config."""
+        import yaml as _yaml
+        instance_upper = (instance or "").upper()
+        main_name = self.config.get("instance_name", "SCALP").upper()
+        if instance_upper == main_name:
+            return int(self.config.get("trading", {}).get("leverage", 10))
+        for inst in self.config.get("other_instances", []):
+            if inst.get("name", "").upper() == instance_upper:
+                # Try loading the actual config file for accurate leverage
+                svc = inst.get("service", "")
+                cfg_map = {
+                    "stasik-swing": "config/swing.yaml",
+                    "stasik-degen": "config/degen.yaml",
+                }
+                cfg_path = cfg_map.get(svc, "")
+                if cfg_path:
+                    try:
+                        with open(cfg_path) as f:
+                            inst_cfg = _yaml.safe_load(f)
+                        return int(inst_cfg.get("trading", {}).get("leverage", 10))
+                    except Exception:
+                        pass
+                # Fallback: parse from "10x" string
+                lev_str = str(inst.get("leverage", "10x")).replace("x", "")
+                try:
+                    return int(lev_str)
+                except ValueError:
+                    return 10
+        return 10
+
     async def _api_set_leverage(self, request: web.Request) -> web.Response:
         client = self._get_client()
         if not client:
             return web.json_response({"ok": False, "error": "No client"}, status=503)
         try:
             data = await request.json()
-            leverage = int(data.get("leverage", 0))
+            raw_leverage = data.get("leverage", 0)
+            restore_config = raw_leverage == "config"
+            leverage = 0 if restore_config else int(raw_leverage)
             symbol = data.get("symbol", "")
             instance = data.get("instance", "")
 
-            if leverage not in self._ALLOWED_LEVERAGE:
+            if not restore_config and leverage not in self._ALLOWED_LEVERAGE:
                 return web.json_response(
                     {"ok": False, "error": f"Invalid leverage: {leverage}"},
                     status=400,
@@ -1031,15 +1064,17 @@ class Dashboard:
                         {"ok": False, "error": f"Unknown instance: {instance}"},
                         status=400,
                     )
+                inst_leverage = self._get_instance_config_leverage(instance) if restore_config else leverage
                 for pair in pairs:
                     try:
-                        client.set_leverage(pair, leverage, category="linear")
+                        client.set_leverage(pair, inst_leverage, category="linear")
                         results["ok"].append(pair)
                     except Exception as e:
                         if "leverage not modified" not in str(e).lower():
                             results["failed"].append({"symbol": pair, "error": str(e)})
                         else:
                             results["ok"].append(pair)
+                leverage = inst_leverage
             else:
                 return web.json_response(
                     {"ok": False, "error": "Provide 'symbol' or 'instance'"},
@@ -1567,6 +1602,8 @@ body.archive-mode .header{background:#fff;border-bottom-color:rgba(245,158,11,0.
 .btn-bulk-restart:hover{background:rgba(33,150,243,0.18)}
 .btn-bulk-stop{background:rgba(229,57,53,0.08);border-color:rgba(229,57,53,0.25);color:#e53935}
 .btn-bulk-stop:hover{background:rgba(229,57,53,0.18)}
+.btn-bulk-nolev{background:rgba(99,102,241,0.08);border-color:rgba(99,102,241,0.25);color:#6366f1}
+.btn-bulk-nolev:hover{background:rgba(99,102,241,0.18)}
 .btn-icon:disabled{opacity:0.4;cursor:not-allowed}
 
 .btn-close-x{
@@ -1722,6 +1759,7 @@ body.archive-mode .header{background:#fff;border-bottom-color:rgba(245,158,11,0.
   <div class="bulk-actions" id="bulk-actions">
     <button class="btn-bulk btn-bulk-restart" onclick="bulkAction('restart')">&#8635; Restart All</button>
     <button class="btn-bulk btn-bulk-stop" onclick="bulkAction('stop')">&#9632; Kill All</button>
+    <button class="btn-bulk btn-bulk-nolev" id="btn-nolev" onclick="toggleAllLeverage()">1x No Leverage</button>
   </div>
 
   <div class="chart-section">
@@ -2414,6 +2452,39 @@ async function bulkAction(action){
   btns.forEach(b=>{b.disabled=false});
   if(fail)alert(label+': '+ok+' ок, '+fail+' ошибок');
   setTimeout(()=>loadAll(),2000);
+}
+
+async function toggleAllLeverage(){
+  const btn=document.getElementById('btn-nolev');
+  const isOff=btn.dataset.state==='1x';
+  const newLev=isOff?0:1;
+  const label=isOff?'Вернуть плечо из конфигов':'Убрать плечо (1x) для ВСЕХ Bybit инстансов';
+  if(!confirm(label+'?'))return;
+  btn.disabled=true;
+  const instances=['SCALP','DEGEN','SWING'];
+  let ok=0,fail=0;
+  if(isOff){
+    for(const inst of instances){
+      try{
+        const r=await fetch('/api/set-leverage',{method:'POST',headers:{'Content-Type':'application/json'},
+          body:JSON.stringify({instance:inst,leverage:'config'})});
+        const d=await r.json();if(d.ok)ok++;else fail++;
+      }catch(e){fail++}
+    }
+    btn.dataset.state='';btn.textContent='1x No Leverage';
+  }else{
+    for(const inst of instances){
+      try{
+        const r=await fetch('/api/set-leverage',{method:'POST',headers:{'Content-Type':'application/json'},
+          body:JSON.stringify({instance:inst,leverage:1})});
+        const d=await r.json();if(d.ok)ok++;else fail++;
+      }catch(e){fail++}
+    }
+    btn.dataset.state='1x';btn.textContent='Restore Leverage';
+  }
+  btn.disabled=false;
+  if(fail)alert(ok+' ok, '+fail+' errors');
+  loadInstances();
 }
 
 async function toggleService(service,action,btn){
