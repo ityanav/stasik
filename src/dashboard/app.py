@@ -691,7 +691,7 @@ class Dashboard:
             data = await request.json()
             service = data.get("service", "")
             action = data.get("action", "")  # "start" or "stop"
-            if not service or action not in ("start", "stop"):
+            if not service or action not in ("start", "stop", "restart"):
                 return web.json_response({"ok": False, "error": "Bad request"}, status=400)
             # Whitelist: only known stasik services
             allowed = {"stasik", "stasik-degen", "stasik-swing", "stasik-tbank-scalp", "stasik-tbank-swing", "stasik-dashboard"}
@@ -1459,21 +1459,28 @@ body.archive-mode .header{background:#fff;border-bottom-color:rgba(245,158,11,0.
 .btn-icon-stop:hover{background:rgba(229,57,53,0.18)}
 .btn-icon-play{background:rgba(22,163,74,0.08);border-color:rgba(22,163,74,0.25);color:#16a34a}
 .btn-icon-play:hover{background:rgba(22,163,74,0.18)}
+.btn-icon-restart{background:rgba(33,150,243,0.08);border-color:rgba(33,150,243,0.25);color:#2196f3}
+.btn-icon-restart:hover{background:rgba(33,150,243,0.18)}
+
+.bulk-actions{display:flex;gap:10px;margin-top:12px;flex-wrap:wrap}
+.btn-bulk{
+  padding:8px 20px;border-radius:10px;font-size:13px;font-weight:600;
+  cursor:pointer;transition:all 0.2s;border:1px solid;
+}
+.btn-bulk:disabled{opacity:0.4;cursor:not-allowed}
+.btn-bulk-restart{background:rgba(33,150,243,0.08);border-color:rgba(33,150,243,0.25);color:#2196f3}
+.btn-bulk-restart:hover{background:rgba(33,150,243,0.18)}
+.btn-bulk-stop{background:rgba(229,57,53,0.08);border-color:rgba(229,57,53,0.25);color:#e53935}
+.btn-bulk-stop:hover{background:rgba(229,57,53,0.18)}
 .btn-icon:disabled{opacity:0.4;cursor:not-allowed}
 
-.btn-close{
-  background:rgba(229,57,53,0.08);border:1px solid rgba(229,57,53,0.25);
-  color:#e53935;padding:5px 14px;border-radius:8px;font-size:12px;font-weight:600;
-  cursor:pointer;transition:all 0.2s;white-space:nowrap;
+.btn-close-x{
+  background:none;border:none;color:#e53935;font-size:20px;font-weight:700;
+  cursor:pointer;transition:all 0.2s;line-height:1;padding:2px 6px;border-radius:50%;
+  opacity:0.5;
 }
-.btn-close:hover{background:rgba(229,57,53,0.18)}
-.btn-close:disabled{opacity:0.4;cursor:not-allowed}
-.btn-x2{
-  background:rgba(33,150,243,0.08);border:1px solid rgba(33,150,243,0.25);
-  color:#2196f3;padding:5px 10px;border-radius:8px;font-size:12px;font-weight:700;
-  cursor:pointer;transition:all 0.2s;white-space:nowrap;margin-right:6px;
-}
-.btn-x2:hover{background:rgba(33,150,243,0.18)}
+.btn-close-x:hover{opacity:1;background:rgba(229,57,53,0.12)}
+.btn-close-x:disabled{opacity:0.2;cursor:not-allowed}
 .btn-x2:disabled{opacity:0.4;cursor:not-allowed}
 .sl-wrap{display:inline-flex;align-items:center;gap:4px}
 .sl-input{width:60px;padding:3px 6px;border:1px solid rgba(229,57,53,0.3);border-radius:6px;font-size:12px;text-align:right;background:rgba(229,57,53,0.04);color:#333;-moz-appearance:textfield}
@@ -1617,6 +1624,10 @@ body.archive-mode .header{background:#fff;border-bottom-color:rgba(245,158,11,0.
   </div>
 
   <div class="instances" id="instances"></div>
+  <div class="bulk-actions" id="bulk-actions">
+    <button class="btn-bulk btn-bulk-restart" onclick="bulkAction('restart')">&#8635; Перезапустить всех</button>
+    <button class="btn-bulk btn-bulk-stop" onclick="bulkAction('stop')">&#9632; Остановить всех</button>
+  </div>
 
   <div class="chart-section">
     <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;flex-wrap:wrap;gap:10px">
@@ -1702,7 +1713,7 @@ body.archive-mode .header{background:#fff;border-bottom-color:rgba(245,158,11,0.
     <h2>📊 Открытые позиции</h2>
     <div class="tbl-wrap">
       <table>
-        <thead><tr><th>Бот</th><th>Пара</th><th>Сторона</th><th>Размер</th><th>Вход</th><th>Сумма</th><th>Тейк-профит</th><th>Стоп-лосс</th><th>Unrealized PnL</th><th></th></tr></thead>
+        <thead><tr><th>Bot</th><th>Pair</th><th>Side</th><th>Size</th><th>Entry</th><th>PS</th><th>TP</th><th>SL</th><th>Gross PnL</th><th>Fee</th><th>Net PnL</th><th></th></tr></thead>
         <tbody id="pos-body"></tbody>
       </table>
     </div>
@@ -1716,7 +1727,7 @@ body.archive-mode .header{background:#fff;border-bottom-color:rgba(245,158,11,0.
     <div class="tbl-wrap">
       <table>
         <thead><tr>
-          <th>Бот</th><th>Пара</th><th>Сторона</th><th>Вход</th><th>Выход</th><th>PnL</th><th>Время</th><th>Статус</th>
+          <th>Bot</th><th>Pair</th><th>Side</th><th>Entry</th><th>Exit</th><th>PnL</th><th>Time</th><th>Status</th>
         </tr></thead>
         <tbody id="tbody"></tbody>
       </table>
@@ -1835,17 +1846,20 @@ function setSource(src){
   const badge=document.getElementById('status-badge');
   const dateNav=document.getElementById('date-nav');
   const instances=document.getElementById('instances');
+  const bulkActs=document.getElementById('bulk-actions');
   if(src==='archive'){
     banner.style.display='';
     badge.style.display='none';
     dateNav.style.display='';
     instances.style.display='none';
+    bulkActs.style.display='none';
     document.body.classList.add('archive-mode');
   }else{
     banner.style.display='none';
     badge.style.display='';
     dateNav.style.display='';
     instances.style.display='';
+    bulkActs.style.display='';
     document.body.classList.remove('archive-mode');
   }
   loadAll();
@@ -1870,6 +1884,8 @@ async function loadInstances(){
       const toggleBtn=svc&&currentSource==='live'?
         (i.running?`<button class="btn-icon btn-icon-stop" onclick="toggleService('${svc}','stop',this)" title="Остановить">&#9632;</button>`
                   :`<button class="btn-icon btn-icon-play" onclick="toggleService('${svc}','start',this)" title="Запустить">&#9654;</button>`):'';
+      const restartBtn=svc&&currentSource==='live'?
+        `<button class="btn-icon btn-icon-restart" onclick="toggleService('${svc}','restart',this)" title="Перезапустить">&#8635;</button>`:'';
       return`<div class="instance-card ${cardCls} fade-in">
         <div class="instance-header">
           <div class="instance-name">
@@ -1877,6 +1893,7 @@ async function loadInstances(){
             <span>${i.name}</span>
           </div>
           <div style="display:flex;align-items:center;gap:8px;flex-shrink:0">
+            ${restartBtn}
             ${toggleBtn}
             <div class="instance-status ${i.running?'on':'off'}">${i.running?'РАБОТАЕТ':'СТОП'}</div>
           </div>
@@ -2280,8 +2297,27 @@ async function loadChart(){
   }catch(e){console.error('chart',e)}
 }
 
+const ALL_SERVICES=['stasik','stasik-degen','stasik-swing','stasik-tbank-scalp','stasik-tbank-swing'];
+async function bulkAction(action){
+  const label=action==='restart'?'Перезапустить':'Остановить';
+  if(!confirm(label+' ВСЕХ ботов ('+ALL_SERVICES.length+')?'))return;
+  const btns=document.querySelectorAll('.btn-bulk');
+  btns.forEach(b=>{b.disabled=true});
+  let ok=0,fail=0;
+  for(const svc of ALL_SERVICES){
+    try{
+      const r=await fetch('/api/toggle-service',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({service:svc,action})});
+      const d=await r.json();
+      if(d.ok)ok++;else fail++;
+    }catch(e){fail++}
+  }
+  btns.forEach(b=>{b.disabled=false});
+  if(fail)alert(label+': '+ok+' ок, '+fail+' ошибок');
+  setTimeout(()=>loadAll(),2000);
+}
+
 async function toggleService(service,action,btn){
-  const label=action==='stop'?'Остановить':'Запустить';
+  const label=action==='stop'?'Остановить':action==='restart'?'Перезапустить':'Запустить';
   if(!confirm(label+' '+service+'?'))return;
   const old=btn.innerHTML;
   btn.disabled=true;btn.innerHTML='&#8987;';
@@ -2299,9 +2335,9 @@ async function closePosition(symbol,instance,btn){
   try{
     const r=await fetch('/api/close-position',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({symbol,instance})});
     const d=await r.json();
-    if(d.ok){btn.textContent='OK';setTimeout(()=>loadAll(),1500)}
-    else{alert(d.error||'Ошибка');btn.disabled=false;btn.textContent='Закрыть'}
-  }catch(e){alert('Ошибка: '+e);btn.disabled=false;btn.textContent='Закрыть'}
+    if(d.ok){btn.textContent='&times;';loadAll()}
+    else{alert(d.error||'Ошибка');btn.disabled=false;btn.innerHTML='&times;'}
+  }catch(e){alert('Ошибка: '+e);btn.disabled=false;btn.innerHTML='&times;'}
 }
 async function doublePosition(symbol,side,qty,instance,btn){
   if(!confirm('Удвоить позицию '+symbol+'? (добавить +'+qty+' '+side+')'))return;
@@ -2358,35 +2394,37 @@ async function loadPositions(){
     const body=document.getElementById('pos-body');
     const wrap=document.getElementById('close-all-wrap');
     if(!pos.length){
-      body.innerHTML='<tr><td colspan="10" style="text-align:center;color:#bbb;padding:20px">Нет открытых позиций</td></tr>';
+      body.innerHTML='<tr><td colspan="12" style="text-align:center;color:#bbb;padding:20px">Нет открытых позиций</td></tr>';
       wrap.style.display='none';return;
     }
     wrap.style.display=currentSource==='live'?'':'none';
     body.innerHTML=pos.map(p=>{
-      const pnl=parseFloat(p.unrealised_pnl)||0;
+      const grossPnl=parseFloat(p.unrealised_pnl)||0;
       const inst=(p.instance||'').toUpperCase();
       const isCls=inst.includes('TBANK')?'inst-tbank':inst.includes('DEGEN')?'inst-degen':inst.includes('SCALP')?'inst-scalp':'inst-swing';
       const iLabel=inst.includes('TBANK-SCALP')?'TB-SCALP':inst.includes('TBANK-SWING')?'TB-SWING':inst.includes('DEGEN')?'DEGEN':inst.includes('SCALP')?'SCALP':'SWING';
       const cur=inst.includes('TBANK')?'RUB':'USDT';
-      const closeBtn=currentSource==='live'?`<button class="btn-close" onclick="closePosition('${p.symbol}','${p.instance||''}',this)">Закрыть</button>`:'';
-      const x2Btn=currentSource==='live'&&!inst.includes('TBANK')?`<button class="btn-x2" onclick="doublePosition('${p.symbol}','${p.side}',${p.size},'${p.instance||''}',this)">X2</button>`:'';
+      const closeBtn=currentSource==='live'?`<button class="btn-close-x" onclick="closePosition('${p.symbol}','${p.instance||''}',this)" title="Закрыть позицию">&times;</button>`:'';
       const entryAmt=parseFloat(p.entry_amount)||0;
+      const feeRate=inst.includes('TBANK')?0.0004:0.00055;
+      const fee=Math.round(entryAmt*feeRate*2);
+      const pnl=grossPnl-fee;
       const tpPnl=p.tp_pnl!=null?p.tp_pnl:null;
-      const tpVal=tpPnl!=null?Math.abs(Math.round(tpPnl)):'';
-      const tpInput=currentSource==='live'&&!inst.includes('TBANK')?`<span class="tp-wrap"><input class="tp-input" type="number" value="${tpVal}" placeholder="100" onfocus="slEditing=true" onblur="setTimeout(()=>{if(!document.querySelector('.tp-input:focus,.sl-input:focus'))slEditing=false},300)"><button class="btn-tp" onclick="setTP('${p.symbol}','${p.side}',${p.entry_price},${p.size},'${p.instance||''}',this)">OK</button></span>`:(tpPnl!=null?`<strong class="g">${fmt(tpPnl)} ${cur}</strong>`:'—');
+      const tpTxt=tpPnl!=null?`<strong class="g">${fmt(tpPnl)}</strong>`:'—';
       const slPnl=p.sl_pnl!=null?p.sl_pnl:null;
-      const slVal=slPnl!=null?Math.abs(Math.round(slPnl)):'';
-      const slInput=currentSource==='live'&&!inst.includes('TBANK')?`<span class="sl-wrap"><input class="sl-input" type="number" value="${slVal}" placeholder="100" onfocus="slEditing=true" onblur="setTimeout(()=>{if(!document.querySelector('.sl-input:focus,.tp-input:focus'))slEditing=false},300)"><button class="btn-sl" onclick="setSL('${p.symbol}','${p.side}',${p.entry_price},${p.size},'${p.instance||''}',this)">OK</button></span>`:(slPnl!=null?`<strong class="r">${fmt(slPnl)} ${cur}</strong>`:'—');
+      const slTxt=slPnl!=null?`<strong class="r">${fmt(slPnl)}</strong>`:'—';
       return`<tr class="fade-in">
         <td><span class="inst-tag ${isCls}">${iLabel}</span></td>
         <td><strong>${p.symbol}</strong></td>
-        <td class="${p.side==='Buy'?'side-long':'side-short'}">${p.side==='Buy'?'ЛОНГ':'ШОРТ'}</td>
+        <td class="${p.side==='Buy'?'side-long':'side-short'}">${p.side==='Buy'?'LONG':'SHORT'}</td>
         <td>${p.size}</td><td>${parseFloat(p.entry_price).toFixed(2)}</td>
-        <td>${Math.round(entryAmt).toLocaleString()} ${cur}</td>
-        <td>${tpInput}</td>
-        <td>${slInput}</td>
-        <td class="${cls(pnl)}"><strong>${fmt(pnl)} ${cur}</strong></td>
-        <td>${x2Btn} ${closeBtn}</td></tr>`;
+        <td>${Math.round(entryAmt).toLocaleString()}</td>
+        <td>${tpTxt}</td>
+        <td>${slTxt}</td>
+        <td class="${cls(grossPnl)}"><strong>${fmt(grossPnl)}</strong></td>
+        <td style="color:#ff9800">${fee.toLocaleString()}</td>
+        <td class="${cls(pnl)}"><strong>${fmt(pnl)}</strong></td>
+        <td>${closeBtn}</td></tr>`;
     }).join('');
   }catch(e){console.error('positions',e)}
 }
@@ -2399,7 +2437,7 @@ async function loadTrades(page){
     currentPage=r.page;hasNext=r.has_next;
     document.getElementById('prev-btn').disabled=currentPage<=1;
     document.getElementById('next-btn').disabled=!hasNext;
-    document.getElementById('page-info').textContent='Стр. '+currentPage;
+    document.getElementById('page-info').textContent='Page '+currentPage;
     document.getElementById('tbody').innerHTML=r.trades.map(t=>{
       const p=t.pnl||0;
       const inst=(t.instance||'').toUpperCase();
@@ -2410,11 +2448,11 @@ async function loadTrades(page){
       return`<tr class="fade-in">
         <td><span class="inst-tag ${isCls}">${iLabel}</span></td>
         <td><strong>${t.symbol}</strong></td>
-        <td class="${t.side==='Buy'?'side-long':'side-short'}">${t.side==='Buy'?'ЛОНГ':'ШОРТ'}</td>
+        <td class="${t.side==='Buy'?'side-long':'side-short'}">${t.side==='Buy'?'LONG':'SHORT'}</td>
         <td>${t.entry_price||'-'}</td><td>${t.exit_price||'-'}</td>
         <td class="${cls(p)}"><strong>${p?p.toFixed(2):'-'}</strong></td>
         <td style="color:var(--muted);font-size:12px">${tFmt}</td>
-        <td class="${t.status==='closed'?'status-closed':'status-open'}">${t.status}</td></tr>`;
+        <td class="${t.status==='closed'?'status-closed':'status-open'}">${t.status==='closed'?'Closed':'Open'}</td></tr>`;
     }).join('');
   }catch(e){console.error('trades',e)}
 }

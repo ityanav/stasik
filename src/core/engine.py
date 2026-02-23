@@ -468,12 +468,7 @@ class TradingEngine:
                         break
                     sl = trade.get("stop_loss") or 0
                     tp = trade.get("take_profit") or 0
-                    # Dynamic SL tighten: when loss approaches TP amount, cap SL to TP
-                    if sl > 0 and tp > 0:
-                        try:
-                            await self._dynamic_sl_tighten(trade)
-                        except Exception:
-                            logger.exception("Dynamic SL error %s", trade.get("symbol"))
+                    # Dynamic SL: отключён — предсказуемый SL (Котегава/ATR)
                     if sl > 0:
                         try:
                             await self._check_db_stop_loss(trade)
@@ -689,8 +684,8 @@ class TradingEngine:
         if result.signal == Signal.HOLD:
             return
 
-        # HTF trend + ADX filter
-        htf_trend, adx = self._get_htf_data(symbol, category)
+        # HTF trend + ADX + SMA deviation filter
+        htf_trend, adx, htf_sma_dev = self._get_htf_data(symbol, category)
 
         # ADX filter: skip if market is ranging (no clear trend)
         if adx < self._adx_min:
@@ -698,14 +693,29 @@ class TradingEngine:
                         result.signal.value, symbol, adx, self._adx_min)
             return
 
-        # HTF trend filter: block counter-trend trades unless signal is strong (score >= 2)
-        # Skip HTF filter if disabled in config (for aggressive meme trading)
-        if self.config.get("strategy", {}).get("htf_filter", True):
-            if htf_trend == Trend.BEARISH and result.signal == Signal.BUY and abs(result.score) < 2:
-                logger.info("HTF фильтр: отклонён BUY %s (тренд HTF медвежий, score=%d)", symbol, result.score)
+        # HTF SMA deviation filter: отклонение должно быть видно и на старшем TF
+        htf_min_dev = self.config.get("strategy", {}).get("htf_min_sma_dev", 0)
+        if htf_min_dev > 0:
+            # BUY: HTF должен показывать отклонение вниз (dev < 0)
+            if result.signal == Signal.BUY and htf_sma_dev > -htf_min_dev:
+                logger.info("HTF SMA фильтр: отклонён BUY %s (HTF dev=%.2f%%, нужно ≤ -%.1f%%)",
+                            symbol, htf_sma_dev, htf_min_dev)
                 return
-            if htf_trend == Trend.BULLISH and result.signal == Signal.SELL and abs(result.score) < 2:
-                logger.info("HTF фильтр: отклонён SELL %s (тренд HTF бычий, score=%d)", symbol, result.score)
+            # SELL: HTF должен показывать отклонение вверх (dev > 0)
+            if result.signal == Signal.SELL and htf_sma_dev < htf_min_dev:
+                logger.info("HTF SMA фильтр: отклонён SELL %s (HTF dev=%.2f%%, нужно ≥ +%.1f%%)",
+                            symbol, htf_sma_dev, htf_min_dev)
+                return
+
+        # HTF trend filter: block counter-trend trades unless signal is very strong
+        # Котегава: контр-тренд требует полного набора подтверждений
+        htf_score_min = self.config.get("strategy", {}).get("htf_score_min", 3)
+        if self.config.get("strategy", {}).get("htf_filter", True):
+            if htf_trend == Trend.BEARISH and result.signal == Signal.BUY and abs(result.score) < htf_score_min:
+                logger.info("HTF фильтр: отклонён BUY %s (тренд HTF медвежий, score=%d < %d)", symbol, result.score, htf_score_min)
+                return
+            if htf_trend == Trend.BULLISH and result.signal == Signal.SELL and abs(result.score) < htf_score_min:
+                logger.info("HTF фильтр: отклонён SELL %s (тренд HTF бычий, score=%d < %d)", symbol, result.score, htf_score_min)
                 return
 
         # Fear & Greed Index filter (crypto only)
@@ -999,32 +1009,22 @@ class TradingEngine:
         else:
             tp = self.risk.calculate_sl_tp(price, side)[1]
 
-        # Take early TP: close at tp_take_pct% of calculated TP (e.g. 0.12 = 12%)
-        tp_take_pct = self.config.get("risk", {}).get("tp_take_pct", 0)
-        if tp_take_pct > 0 and qty > 0:
-            full_tp_profit = abs(tp - price) * qty
-            tp_dist = abs(tp - price) * tp_take_pct
-            if side == "Buy":
-                tp = round(price + tp_dist, 6)
-            else:
-                tp = round(price - tp_dist, 6)
-            actual_tp_profit = abs(tp - price) * qty
-            tp_source += f"→{tp_take_pct*100:.0f}%"
-            logger.info("TP reduced: %s $%.0f → $%.0f (%.0f%% of target)", symbol, full_tp_profit, actual_tp_profit, tp_take_pct * 100)
-
-        # Clamp SL ≤ 60% of TP
-        if sl and tp and qty > 0:
-            sl_usd = abs(sl - price) * qty
-            tp_usd = abs(tp - price) * qty
-            max_sl_usd = tp_usd * 0.6
-            if tp_usd > 0 and sl_usd > max_sl_usd:
-                new_sl_dist = abs(tp - price) * 0.6
+        # TP с учётом комиссии: чистая прибыль >= min_tp_net после round-trip fee
+        min_tp_net = self.config.get("risk", {}).get("min_tp_net", 0)
+        if min_tp_net > 0 and qty > 0:
+            position_value = price * qty
+            round_trip_fee = position_value * self.risk.commission_rate * 2
+            min_gross_profit = min_tp_net + round_trip_fee
+            current_tp_profit = abs(tp - price) * qty
+            if current_tp_profit < min_gross_profit:
+                min_tp_dist = min_gross_profit / qty
                 if side == "Buy":
-                    sl = round(price - new_sl_dist, 6)
+                    tp = round(price + min_tp_dist, 6)
                 else:
-                    sl = round(price + new_sl_dist, 6)
-                sl_source += "→60%TP"
-                logger.info("SL clamped to 60%% TP: %s $%.0f → $%.0f (TP $%.0f)", symbol, sl_usd, max_sl_usd, tp_usd)
+                    tp = round(price - min_tp_dist, 6)
+                tp_source += f"→min${min_tp_net}"
+                logger.info("TP adjusted for commission: %s $%.0f → $%.0f (net=$%.0f + fee=$%.2f)",
+                            symbol, current_tp_profit, min_gross_profit, min_tp_net, round_trip_fee)
 
         # Place order with retry on qty rejection
         order = None
@@ -2047,13 +2047,13 @@ class TradingEngine:
         self._funding_cache[symbol] = (rate, now)
         return rate
 
-    def _get_htf_data(self, symbol: str, category: str) -> tuple[Trend, float]:
-        """Get higher timeframe trend + ADX, cached for 5 minutes."""
-        from src.strategy.indicators import calculate_adx
+    def _get_htf_data(self, symbol: str, category: str) -> tuple[Trend, float, float]:
+        """Get higher timeframe trend + ADX + SMA deviation, cached for 5 minutes."""
+        from src.strategy.indicators import calculate_adx, calculate_sma_deviation
         now = time.time()
         cached = self._htf_cache.get(symbol)
-        if cached and now - cached[2] < 300:  # 5 min cache
-            return cached[0], cached[1]
+        if cached and now - cached[3] < 300:  # 5 min cache
+            return cached[0], cached[1], cached[2]
 
         try:
             htf_df = self.client.get_klines(
@@ -2062,13 +2062,15 @@ class TradingEngine:
             htf_df.attrs["symbol"] = symbol
             trend = self.signal_gen.get_htf_trend(htf_df)
             adx = calculate_adx(htf_df, self._adx_period)
+            htf_sma_dev = calculate_sma_deviation(htf_df, 25)
         except Exception:
             logger.warning("Failed to get HTF data for %s, allowing trade", symbol)
             trend = Trend.NEUTRAL
             adx = 25.0  # default: allow trading
+            htf_sma_dev = 0.0
 
-        self._htf_cache[symbol] = (trend, adx, now)
-        return trend, adx
+        self._htf_cache[symbol] = (trend, adx, htf_sma_dev, now)
+        return trend, adx, htf_sma_dev
 
     def _get_instrument_info(self, symbol: str, category: str) -> dict:
         key = f"{symbol}_{category}"
