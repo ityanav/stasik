@@ -1798,6 +1798,7 @@ class TradingEngine:
                 total_pnl = (entry - cur_price) * qty
             try:
                 balance = self.client.get_balance()
+                await self.db.mark_scale_out(trade["id"], new_stage, 0)
                 await self.db.close_trade(trade["id"], cur_price, total_pnl)
                 await self.db.update_daily_pnl(total_pnl)
                 await self._record_pnl(total_pnl, balance)

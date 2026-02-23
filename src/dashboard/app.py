@@ -552,7 +552,7 @@ class Dashboard:
                     async with aiosqlite.connect(main_archive) as db:
                         db.row_factory = aiosqlite.Row
                         cur = await db.execute(
-                            "SELECT symbol, side, entry_price, qty, stop_loss, take_profit FROM trades WHERE status = 'open'"
+                            "SELECT symbol, side, entry_price, qty, stop_loss, take_profit, partial_closed FROM trades WHERE status = 'open'"
                         )
                         rows = await cur.fetchall()
                         for r in rows:
@@ -565,6 +565,7 @@ class Dashboard:
                                 "take_profit": float(r["take_profit"] if r["take_profit"] else 0),
                                 "unrealised_pnl": 0.0,
                                 "instance": instance_name,
+                                "partial_closed": int(r["partial_closed"] or 0),
                             })
                 except Exception:
                     logger.warning("Failed to read archive positions from %s", main_archive)
@@ -581,6 +582,7 @@ class Dashboard:
                     "take_profit": float(t.get("take_profit") or 0),
                     "unrealised_pnl": 0.0,
                     "instance": instance_name,
+                    "partial_closed": t.get("partial_closed", 0) or 0,
                 })
 
         # Other instances — open trades from DB
@@ -592,7 +594,7 @@ class Dashboard:
                     async with aiosqlite.connect(db_path) as db:
                         db.row_factory = aiosqlite.Row
                         cur = await db.execute(
-                            "SELECT symbol, side, entry_price, qty, stop_loss, take_profit FROM trades WHERE status = 'open'"
+                            "SELECT symbol, side, entry_price, qty, stop_loss, take_profit, partial_closed FROM trades WHERE status = 'open'"
                         )
                         rows = await cur.fetchall()
                         for r in rows:
@@ -605,6 +607,7 @@ class Dashboard:
                                 "take_profit": float(r["take_profit"] if r["take_profit"] else 0),
                                 "unrealised_pnl": 0.0,
                                 "instance": inst_name,
+                                "partial_closed": int(r["partial_closed"] or 0),
                             })
                 except Exception:
                     logger.warning("Failed to read positions from %s", inst_name)
@@ -1296,7 +1299,7 @@ body{font-family:'Segoe UI',-apple-system,sans-serif;background:var(--bg);color:
 
 .chart-section{
   background:#fff;border:1px solid var(--border);border-radius:12px;
-  padding:24px;margin-bottom:24px;box-shadow:0 1px 4px rgba(0,0,0,0.06);
+  padding:24px;margin-top:32px;margin-bottom:24px;box-shadow:0 1px 4px rgba(0,0,0,0.06);
 }
 .chart-section h2{font-size:16px;color:#333;margin-bottom:16px;display:flex;align-items:center;gap:8px}
 
@@ -1320,6 +1323,7 @@ tr:hover{background:rgba(99,102,241,0.04)}
 .inst-swing{background:rgba(245,158,11,0.1);color:#d97706}
 .inst-degen{background:rgba(236,72,153,0.1);color:#db2777}
 .inst-tbank{background:rgba(16,185,129,0.1);color:#059669}
+.so-badge{font-size:9px;padding:1px 5px;border-radius:6px;font-weight:700;background:rgba(251,191,36,0.15);color:#d97706;border:1px solid rgba(251,191,36,0.3);margin-left:4px;vertical-align:middle}
 .tbl-wrap{overflow-x:auto}
 
 .pagination{display:flex;align-items:center;justify-content:center;gap:12px;margin-top:14px}
@@ -1625,8 +1629,8 @@ body.archive-mode .header{background:#fff;border-bottom-color:rgba(245,158,11,0.
 
   <div class="instances" id="instances"></div>
   <div class="bulk-actions" id="bulk-actions">
-    <button class="btn-bulk btn-bulk-restart" onclick="bulkAction('restart')">&#8635; Перезапустить всех</button>
-    <button class="btn-bulk btn-bulk-stop" onclick="bulkAction('stop')">&#9632; Остановить всех</button>
+    <button class="btn-bulk btn-bulk-restart" onclick="bulkAction('restart')">&#8635; Restart All</button>
+    <button class="btn-bulk btn-bulk-stop" onclick="bulkAction('stop')">&#9632; Kill All</button>
   </div>
 
   <div class="chart-section">
@@ -1718,7 +1722,7 @@ body.archive-mode .header{background:#fff;border-bottom-color:rgba(245,158,11,0.
       </table>
     </div>
     <div id="close-all-wrap" style="display:none;margin-top:14px;text-align:right">
-      <button class="btn-close-all" onclick="closeAllPositions()">Закрыть все позиции</button>
+      <button class="btn-close-all" onclick="closeAllPositions()">Flatten All</button>
     </div>
   </div>
 
@@ -2350,14 +2354,14 @@ async function doublePosition(symbol,side,qty,instance,btn){
   }catch(e){alert('Ошибка: '+e);btn.disabled=false;btn.textContent='X2'}
 }
 async function closeAllPositions(){
-  if(!confirm('Закрыть ВСЕ позиции?'))return;
+  if(!confirm('Flatten all positions?'))return;
   const btn=document.querySelector('.btn-close-all');
-  btn.disabled=true;btn.textContent='Закрываю...';
+  btn.disabled=true;btn.textContent='Closing...';
   try{
     const r=await fetch('/api/close-all',{method:'POST',headers:{'Content-Type':'application/json'}});
     const d=await r.json();
-    if(d.ok){btn.textContent='Готово';setTimeout(()=>loadAll(),1500)}
-    else{alert(d.error||'Ошибка');btn.disabled=false;btn.textContent='Закрыть все позиции'}
+    if(d.ok){btn.textContent='Done';loadAll()}
+    else{alert(d.error||'Error');btn.disabled=false;btn.textContent='Flatten All'}
   }catch(e){alert('Ошибка: '+e);btn.disabled=false;btn.textContent='Закрыть все позиции'}
 }
 
@@ -2413,9 +2417,11 @@ async function loadPositions(){
       const tpTxt=tpPnl!=null?`<strong class="g">${fmt(tpPnl)}</strong>`:'—';
       const slPnl=p.sl_pnl!=null?p.sl_pnl:null;
       const slTxt=slPnl!=null?`<strong class="r">${fmt(slPnl)}</strong>`:'—';
+      const pc=p.partial_closed||0;
+      const soBadge=pc>0?` <span class="so-badge">${pc}/3</span>`:'';
       return`<tr class="fade-in">
         <td><span class="inst-tag ${isCls}">${iLabel}</span></td>
-        <td><strong>${p.symbol}</strong></td>
+        <td><strong>${p.symbol}</strong>${soBadge}</td>
         <td class="${p.side==='Buy'?'side-long':'side-short'}">${p.side==='Buy'?'LONG':'SHORT'}</td>
         <td>${p.size}</td><td>${parseFloat(p.entry_price).toFixed(2)}</td>
         <td>${Math.round(entryAmt).toLocaleString()}</td>
@@ -2445,9 +2451,11 @@ async function loadTrades(page){
       const iLabel=inst.includes('TBANK-SCALP')?'TB-SCALP':inst.includes('TBANK-SWING')?'TB-SWING':inst.includes('DEGEN')?'DEGEN':inst.includes('SCALP')?'SCALP':'SWING';
       const tTime=t.closed_at||t.opened_at||'';
       const tFmt=tTime?tTime.replace('T',' ').slice(5,16):'—';
+      const tpc=t.partial_closed||0;
+      const tSoBadge=tpc>0?` <span class="so-badge">${tpc}/3</span>`:'';
       return`<tr class="fade-in">
         <td><span class="inst-tag ${isCls}">${iLabel}</span></td>
-        <td><strong>${t.symbol}</strong></td>
+        <td><strong>${t.symbol}</strong>${tSoBadge}</td>
         <td class="${t.side==='Buy'?'side-long':'side-short'}">${t.side==='Buy'?'LONG':'SHORT'}</td>
         <td>${t.entry_price||'-'}</td><td>${t.exit_price||'-'}</td>
         <td class="${cls(p)}"><strong>${p?p.toFixed(2):'-'}</strong></td>
