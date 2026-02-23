@@ -130,6 +130,31 @@ class Database:
         )
         await self._db.commit()
 
+    async def insert_partial_close(
+        self,
+        symbol: str,
+        side: str,
+        category: str,
+        qty: float,
+        entry_price: float,
+        exit_price: float,
+        pnl: float,
+        stage: int,
+        opened_at: str,
+    ) -> int:
+        """Insert a closed trade record for a scale-out partial close."""
+        cursor = await self._db.execute(
+            """INSERT INTO trades
+               (symbol, side, category, qty, entry_price, exit_price, pnl,
+                stop_loss, take_profit, order_id, status, opened_at, closed_at,
+                partial_closed, instance)
+               VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, '', 'closed', ?, ?, ?, ?)""",
+            (symbol, side, category, qty, entry_price, exit_price, pnl,
+             opened_at, datetime.utcnow().isoformat(), stage, self.instance_name),
+        )
+        await self._db.commit()
+        return cursor.lastrowid
+
     async def update_trade(self, trade_id: int, **kwargs):
         """Update fields of an open trade (e.g., stop_loss, take_profit)."""
         if not kwargs:

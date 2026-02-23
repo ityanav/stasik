@@ -1789,29 +1789,34 @@ class TradingEngine:
             partial_pnl = (entry - cur_price) * close_qty
 
         new_stage = current_stage + 1
+        opened_at = trade.get("opened_at", datetime.utcnow().isoformat())
 
         if is_last_stage or remaining_qty <= 0:
-            # Full close
-            if side == "Buy":
-                total_pnl = (cur_price - entry) * qty
-            else:
-                total_pnl = (entry - cur_price) * qty
+            # Final stage — close the original trade with only the remaining portion's PnL
             try:
                 balance = self.client.get_balance()
                 await self.db.mark_scale_out(trade["id"], new_stage, 0)
-                await self.db.close_trade(trade["id"], cur_price, total_pnl)
-                await self.db.update_daily_pnl(total_pnl)
-                await self._record_pnl(total_pnl, balance)
+                await self.db.close_trade(trade["id"], cur_price, partial_pnl)
+                await self.db.update_daily_pnl(partial_pnl)
+                await self._record_pnl(partial_pnl, balance)
             except Exception:
                 logger.exception("Scale-out final: DB update failed for %s", symbol)
 
-            if total_pnl < 0 and self._cooldown_seconds > 0:
+            if partial_pnl < 0 and self._cooldown_seconds > 0:
                 self._cooldowns[symbol] = time.time() + self._cooldown_seconds
             self._scaled_in.discard(symbol)
         else:
-            # Partial close — update DB with new stage and remaining qty
+            # Intermediate stage — insert separate closed trade for this partial
             try:
+                balance = self.client.get_balance()
+                await self.db.insert_partial_close(
+                    symbol=symbol, side=side, category=category,
+                    qty=close_qty, entry_price=entry, exit_price=cur_price,
+                    pnl=partial_pnl, stage=new_stage, opened_at=opened_at,
+                )
                 await self.db.mark_scale_out(trade["id"], new_stage, remaining_qty)
+                await self.db.update_daily_pnl(partial_pnl)
+                await self._record_pnl(partial_pnl, balance)
             except Exception:
                 logger.exception("Scale-out stage %d: DB update failed for %s", new_stage, symbol)
 
