@@ -2005,7 +2005,7 @@ async function loadInstances(){
           ${(!isTbank&&currentSource==='live')?(()=>{
             const levOpts=[1,2,3,5,10,15,20];
             const curLev=parseInt(String(i.leverage))||1;
-            return '<span>⚡ <select class="lev-select" onchange="setInstanceLeverage(\''+i.name+'\',this.value,this)" data-prev="'+curLev+'">'+levOpts.map(l=>'<option value="'+l+'"'+(l===curLev?' selected':'')+'>'+l+'x</option>').join('')+'</select></span>';
+            return '<span>⚡ <select class="lev-select" onchange="setInstanceLeverage(\\''+i.name+'\\',this.value,this)" data-prev="'+curLev+'">'+levOpts.map(l=>'<option value="'+l+'"'+(l===curLev?' selected':'')+'>'+l+'x</option>').join('')+'</select></span>';
           })():'<span>⚡ '+i.leverage+'x</span>'}
         </div>
       </div>`;
