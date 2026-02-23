@@ -1210,10 +1210,8 @@ class TradingEngine:
                 await self._check_db_stop_loss(trade)
                 await self._check_db_take_profit(trade)
                 await self._check_breakeven(trade)
-                if not trade.get("partial_closed"):
-                    await self._check_partial_close(trade)
                 await self._check_smart_exit(trade)
-                await self._check_kotegawa_exit(trade)
+                await self._check_kotegawa_scale_out(trade)
                 await self._check_profit_target(trade)
                 await self._check_loss_target(trade)
                 await self._check_close_at_profit(trade)
@@ -1677,18 +1675,213 @@ class TradingEngine:
             f"PnL: {upnl:+,.2f}"
         )
 
-    async def _check_kotegawa_exit(self, trade: dict):
-        """Close position when price reverts toward SMA (Kotegawa mean-reversion exit).
+    async def _check_kotegawa_scale_out(self, trade: dict):
+        """Kotegawa scale-out: close position in stages as price reverts toward SMA.
 
-        Closes at kotegawa_exit_ratio (default 0.8 = 80%) of the way from entry to SMA.
-        Smaller target = higher probability of hitting it.
+        3-stage progressive close (default 35/35/30%) at increasing distances toward SMA.
+        After each stage, SL is moved to lock in profit.
 
         Config (strategy section):
-          kotegawa_exit_ratio: 0.8  # close at 80% of distance from entry to SMA
+          scale_out_enabled: true
+          scale_out_stages: [0.30, 0.60, 0.90]   # % distance entry→SMA for each stage
+          scale_out_sizes: [0.35, 0.35, 0.30]     # % of original position per stage
+          kotegawa_exit_ratio: 0.8                 # fallback single-exit ratio
         """
         if not isinstance(self.signal_gen, KotegawaGenerator):
             return
 
+        strat = self.config.get("strategy", {})
+
+        if not strat.get("scale_out_enabled", False):
+            # Fallback: old single-exit behavior
+            return await self._check_kotegawa_exit_single(trade)
+
+        symbol = trade["symbol"]
+        side = trade["side"]
+        entry = trade["entry_price"]
+        qty = trade["qty"]
+        category = trade["category"]
+
+        stages = strat.get("scale_out_stages", [0.30, 0.60, 0.90])
+        sizes = strat.get("scale_out_sizes", [0.35, 0.35, 0.30])
+        current_stage = trade.get("partial_closed", 0) or 0
+
+        if current_stage >= len(stages):
+            return  # all stages done
+
+        try:
+            df = self.client.get_klines(symbol, self.timeframe, limit=100, category=category)
+            if df is None or df.empty:
+                return
+        except Exception:
+            return
+
+        from src.strategy.indicators import calculate_sma
+        sma = calculate_sma(df, self.signal_gen.sma_period)
+        sma_val = sma.iloc[-1]
+        if not sma_val or sma_val <= 0:
+            return
+
+        # Target = entry + stages[current_stage] * (sma - entry)
+        target_price = entry + stages[current_stage] * (sma_val - entry)
+
+        try:
+            if self.exchange_type == "tbank":
+                cur_price = self.client.get_last_price(symbol)
+            else:
+                cur_price = self.client.get_last_price(symbol, category="linear")
+        except Exception:
+            return
+
+        # Buy: close when price >= target (price rose toward SMA)
+        if side == "Buy" and cur_price < target_price:
+            return
+        # Sell: close when price <= target (price fell toward SMA)
+        if side == "Sell" and cur_price > target_price:
+            return
+
+        is_last_stage = current_stage == len(stages) - 1
+
+        if is_last_stage:
+            # Last stage: close everything remaining
+            close_qty = qty
+        else:
+            # Calculate fraction of CURRENT remaining qty
+            remaining_sizes = sum(sizes[current_stage:])
+            if remaining_sizes <= 0:
+                close_qty = qty
+            else:
+                close_qty = qty * sizes[current_stage] / remaining_sizes
+
+        # Round to exchange step, check min_qty
+        cat = "tbank" if self.exchange_type == "tbank" else "linear"
+        info = self._get_instrument_info(symbol, cat)
+        close_qty = math.floor(close_qty / info["qty_step"]) * info["qty_step"]
+        close_qty = round(close_qty, 8)
+
+        if close_qty < info["min_qty"]:
+            # Can't close partial — close everything
+            close_qty = qty
+            is_last_stage = True
+
+        remaining_qty = round(qty - close_qty, 8)
+        if remaining_qty < info["min_qty"]:
+            # Remainder too small — close everything
+            close_qty = qty
+            remaining_qty = 0
+            is_last_stage = True
+
+        # Place close order
+        close_side = "Sell" if side == "Buy" else "Buy"
+        try:
+            if self.exchange_type == "tbank":
+                self.client.place_order(symbol=symbol, side=close_side, qty=close_qty)
+            else:
+                self.client.place_order(symbol=symbol, side=close_side, qty=close_qty, category=category)
+        except Exception:
+            logger.exception("Scale-out stage %d: failed to close %s", current_stage + 1, symbol)
+            return
+
+        # Calculate PnL for this partial
+        if side == "Buy":
+            partial_pnl = (cur_price - entry) * close_qty
+        else:
+            partial_pnl = (entry - cur_price) * close_qty
+
+        new_stage = current_stage + 1
+
+        if is_last_stage or remaining_qty <= 0:
+            # Full close
+            if side == "Buy":
+                total_pnl = (cur_price - entry) * qty
+            else:
+                total_pnl = (entry - cur_price) * qty
+            try:
+                balance = self.client.get_balance()
+                await self.db.close_trade(trade["id"], cur_price, total_pnl)
+                await self.db.update_daily_pnl(total_pnl)
+                await self._record_pnl(total_pnl, balance)
+            except Exception:
+                logger.exception("Scale-out final: DB update failed for %s", symbol)
+
+            if total_pnl < 0 and self._cooldown_seconds > 0:
+                self._cooldowns[symbol] = time.time() + self._cooldown_seconds
+            self._scaled_in.discard(symbol)
+        else:
+            # Partial close — update DB with new stage and remaining qty
+            try:
+                await self.db.mark_scale_out(trade["id"], new_stage, remaining_qty)
+            except Exception:
+                logger.exception("Scale-out stage %d: DB update failed for %s", new_stage, symbol)
+
+            # Move SL after each stage
+            await self._move_sl_after_scale_out(symbol, side, entry, stages, current_stage, sma_val, trade["id"])
+
+        # Notify
+        dev = calculate_sma_deviation(df, self.signal_gen.sma_period)
+        direction = "LONG" if side == "Buy" else "SHORT"
+        stage_pct = int(stages[current_stage] * 100)
+
+        if is_last_stage or remaining_qty <= 0:
+            emoji = "🎯" if partial_pnl >= 0 else "📉"
+            logger.info(
+                "%s Scale-out FINAL (%d/%d): %s %s — %d%% to SMA (dev=%.1f%%, PnL=%.2f)",
+                emoji, new_stage, len(stages), direction, symbol, stage_pct, dev, partial_pnl,
+            )
+            await self._notify(
+                f"{emoji} Scale-out закрытие: {direction} {symbol}\n"
+                f"Стадия {new_stage}/{len(stages)} (финал)\n"
+                f"PnL: {partial_pnl:+,.2f}"
+            )
+        else:
+            logger.info(
+                "✂️ Scale-out %d/%d: %s %s — закрыто %.4f @ %d%% к SMA (dev=%.1f%%, PnL=+%.2f), осталось %.4f",
+                new_stage, len(stages), direction, symbol, close_qty, stage_pct, dev, partial_pnl, remaining_qty,
+            )
+            await self._notify(
+                f"✂️ Scale-out {new_stage}/{len(stages)}: {direction} {symbol}\n"
+                f"Закрыто: {close_qty} ({int(sizes[current_stage]*100)}%)\n"
+                f"PnL: {partial_pnl:+,.2f}\n"
+                f"Остаток: {remaining_qty}"
+            )
+
+    async def _move_sl_after_scale_out(self, symbol: str, side: str, entry: float,
+                                       stages: list, completed_stage: int, sma_val: float,
+                                       trade_id: int):
+        """Move SL after scale-out stage to lock in profit.
+
+        After stage 0 (first close): SL → entry (breakeven)
+        After stage 1 (second close): SL → stage 0 target price (lock profit)
+        """
+        if completed_stage == 0:
+            # After first partial: move SL to breakeven (entry)
+            new_sl = entry
+        elif completed_stage >= 1:
+            # After second partial: move SL to stage 0 target (lock profit from first stage)
+            new_sl = entry + stages[0] * (sma_val - entry)
+        else:
+            return
+
+        try:
+            if self.exchange_type == "bybit":
+                self.client.session.set_trading_stop(
+                    category="linear", symbol=symbol,
+                    stopLoss=str(round(new_sl, 6)), positionIdx=0,
+                )
+                logger.info("Scale-out SL moved for %s: → %.6f (stage %d done)", symbol, new_sl, completed_stage + 1)
+            else:
+                logger.info("Scale-out SL for %s: tbank does not support SL move, tracking in DB", symbol)
+        except Exception:
+            logger.warning("Failed to move SL after scale-out for %s", symbol)
+
+        # Update SL in DB for dashboard monitoring
+        try:
+            await self.db.update_trade(trade_id, stop_loss=new_sl)
+        except Exception:
+            logger.warning("Failed to update SL in DB after scale-out for %s", symbol)
+
+    async def _check_kotegawa_exit_single(self, trade: dict):
+        """Fallback: single Kotegawa exit (original behavior when scale_out_enabled=false)."""
         symbol = trade["symbol"]
         side = trade["side"]
         entry = trade["entry_price"]
@@ -1710,7 +1903,6 @@ class TradingEngine:
         if not sma_val or sma_val <= 0:
             return
 
-        # Target = entry + ratio * (sma - entry)
         target_price = entry + exit_ratio * (sma_val - entry)
 
         try:
@@ -1721,20 +1913,9 @@ class TradingEngine:
         except Exception:
             return
 
-        # Buy: close when price >= target (price rose toward SMA)
         if side == "Buy" and cur_price < target_price:
             return
-        # Sell: close when price <= target (price fell toward SMA)
         if side == "Sell" and cur_price > target_price:
-            return
-
-        # Price reached target — close position
-        try:
-            if self.exchange_type == "tbank":
-                cur_price = self.client.get_last_price(symbol)
-            else:
-                cur_price = self.client.get_last_price(symbol, category="linear")
-        except Exception:
             return
 
         if side == "Buy":
@@ -1766,7 +1947,7 @@ class TradingEngine:
         self._scaled_in.discard(symbol)
 
         dev = calculate_sma_deviation(df, self.signal_gen.sma_period)
-        direction = "ЛОНГ" if side == "Buy" else "ШОРТ"
+        direction = "LONG" if side == "Buy" else "SHORT"
         emoji = "🎯" if upnl >= 0 else "📉"
         ratio_pct = int(exit_ratio * 100)
         logger.info(
@@ -1910,88 +2091,6 @@ class TradingEngine:
         msg = (
             f"🛡️ Безубыток {symbol}\n"
             f"Прибыль: {profit_pct*100:.2f}% → SL перенесён на вход ({entry})"
-        )
-        logger.info(msg)
-        await self._notify(msg)
-
-    async def _check_partial_close(self, trade: dict):
-        """Close 50% of position when price reaches 50% of TP distance."""
-        if not self.config["risk"].get("partial_close_enabled", True):
-            return
-
-        partial_pct = self.config["risk"].get("partial_close_pct", 50) / 100
-        partial_trigger = self.config["risk"].get("partial_close_trigger", 50) / 100
-
-        symbol = trade["symbol"]
-        entry = trade["entry_price"]
-        tp = trade["take_profit"]
-        side = trade["side"]
-        qty = trade["qty"]
-
-        if self.exchange_type == "tbank":
-            current_price = self.client.get_last_price(symbol)
-        else:
-            current_price = self.client.get_last_price(symbol, category="linear")
-
-        if side == "Buy":
-            tp_distance = tp - entry
-            current_progress = current_price - entry
-        else:
-            tp_distance = entry - tp
-            current_progress = entry - current_price
-
-        if tp_distance <= 0:
-            return
-
-        progress_ratio = current_progress / tp_distance
-        if progress_ratio < partial_trigger:
-            return
-
-        # Close partial position
-        close_qty = qty * partial_pct
-        category = "tbank" if self.exchange_type == "tbank" else "linear"
-        info = self._get_instrument_info(symbol, category)
-        close_qty = math.floor(close_qty / info["qty_step"]) * info["qty_step"]
-        close_qty = round(close_qty, 8)
-
-        if close_qty < info["min_qty"]:
-            return
-
-        remaining_qty = round(qty - close_qty, 8)
-        close_side = "Sell" if side == "Buy" else "Buy"
-
-        try:
-            if self.exchange_type == "tbank":
-                self.client.place_order(symbol=symbol, side=close_side, qty=close_qty)
-            else:
-                self.client.place_order(symbol=symbol, side=close_side, qty=close_qty, category="linear")
-        except Exception:
-            logger.exception("Failed to partial close %s", symbol)
-            return
-
-        # Move SL to breakeven
-        try:
-            if self.exchange_type == "bybit":
-                self.client.session.set_trading_stop(
-                    category="linear", symbol=symbol,
-                    stopLoss=str(round(entry, 6)), positionIdx=0,
-                )
-        except Exception:
-            logger.warning("Failed to move SL to breakeven for %s", symbol)
-
-        await self.db.mark_partial_close(trade["id"], remaining_qty)
-
-        if side == "Buy":
-            partial_pnl = (current_price - entry) * close_qty
-        else:
-            partial_pnl = (entry - current_price) * close_qty
-
-        msg = (
-            f"✂️ Частичное закрытие {symbol}\n"
-            f"Закрыто: {close_qty} из {qty} ({partial_pct*100:.0f}%)\n"
-            f"Прибыль: +{partial_pnl:,.2f} USDT\n"
-            f"SL → безубыток ({entry})\n"
-            f"Остаток: {remaining_qty} — бежит к TP"
         )
         logger.info(msg)
         await self._notify(msg)

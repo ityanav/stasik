@@ -122,6 +122,14 @@ class Database:
         )
         await self._db.commit()
 
+    async def mark_scale_out(self, trade_id: int, stage: int, new_qty: float):
+        """Update scale-out stage and remaining quantity after partial close."""
+        await self._db.execute(
+            "UPDATE trades SET partial_closed = ?, qty = ? WHERE id = ?",
+            (stage, new_qty, trade_id),
+        )
+        await self._db.commit()
+
     async def update_trade(self, trade_id: int, **kwargs):
         """Update fields of an open trade (e.g., stop_loss, take_profit)."""
         if not kwargs:

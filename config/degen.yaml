@@ -11,99 +11,101 @@ database:
   path: "/root/stasik/data/degen.db"
 
 trading:
-  pairs: ["DOGEUSDT", "TRUMPUSDT", "WIFUSDT", "1000PEPEUSDT", "SHIB1000USDT", "1000BONKUSDT", "1000FLOKIUSDT", "FARTCOINUSDT", "PNUTUSDT", "ACTUSDT", "POPCATUSDT", "MEMEUSDT", "PENGUUSDT", "BRETTUSDT", "NOTUSDT", "GOATUSDT", "MOODENGUSDT", "VINEUSDT", "MELANIAUSDT", "VIRTUALUSDT"]
+  pairs: ["DOGEUSDT", "TRUMPUSDT", "WIFUSDT", "1000PEPEUSDT", "SHIB1000USDT", "1000BONKUSDT", "FARTCOINUSDT", "POPCATUSDT", "MOODENGUSDT", "VIRTUALUSDT"]
   market_type: "futures"
-  timeframe: "5"                    # 5 мин как у SCALP
+  timeframe: "5"                    # 5 мин
   tick_interval: 10                 # проверка каждые 10 сек
-  htf_timeframe: "60"               # 1H HTF
+  htf_timeframe: "60"               # 1H HTF — скачок должен быть виден на часовке
   leverage: 10                      # 10x
   trading_hours: [0, 24]            # 24/7
 
 strategy:
-  strategy_mode: "kotegawa"           # Котегава — покупай просадки мемов, продавай пампы
-  # SMA deviation — шире чем у SCALP (мемы волатильнее)
+  strategy_mode: "kotegawa"           # Котегава — покупай крэш мемов, продавай пампы
+  # SMA deviation — ШИРОКИЕ пороги: мемы двигаются на 3-15%, ждём реальные скачки
   sma_period: 25
-  sma_deviation_mild: 1.5            # 1.5% отклонение → score +-1 (было 2% — мало входов)
-  sma_deviation_extreme: 6.0         # 6% отклонение → score +-2 (у SCALP 2.5%)
-  # RSI
+  sma_deviation_mild: 3.0            # 3% отклонение → score +-1 (было 1.5% — входил на шуме)
+  sma_deviation_extreme: 8.0         # 8% отклонение → score +-2 (реальный крэш/памп)
+  # RSI — только экстремумы
   rsi_period: 14
-  rsi_overbought: 75
-  rsi_oversold: 25
-  rsi_extreme_low: 15
-  rsi_extreme_high: 85
+  rsi_overbought: 78                 # выше чем у SCALP — мемы часто overbought
+  rsi_oversold: 22                   # ниже чем у SCALP — ждём настоящую панику
+  rsi_extreme_low: 12                # экстремальная паника
+  rsi_extreme_high: 88               # экстремальная эйфория
   # EMA для HTF
   ema_fast: 12
   ema_slow: 26
-  # MACD (для AI)
+  # MACD
   macd_fast: 8
   macd_slow: 17
   macd_signal: 9
   # Bollinger Bands
   bb_period: 20
   bb_std: 2.0
-  # Volume
+  # Volume — скачок должен быть на объёме
   vol_period: 14
-  vol_threshold: 1.2
-  # Scoring
-  min_score: 2                        # 2 из 6 — ослаблен порог входа (было 3)
+  vol_threshold: 1.5                 # 1.5x объём (было 1.2 — слишком мягко)
+  # Scoring — СТРОГИЙ
+  min_score: 4                       # 4 из 8 — только высокая конвикция (было 2!)
   adx_period: 14
-  adx_min: 8
-  fng_extreme_greed: 100              # отключён — Котегава продаёт при жадности
-  fng_extreme_fear: 0                 # отключён — Котегава покупает при страхе
-  funding_rate_max: 999               # отключён — Котегава контр-тренд
+  adx_min: 18                        # 18 — только чёткие движения (было 8)
+  fng_extreme_greed: 100
+  fng_extreme_fear: 0
+  funding_rate_max: 999
   patterns_enabled: true
   orderbook_enabled: true
-  market_bias: false                  # отключён — Котегава контр-тренд
-  bias_block_bearish: false           # отключён — Котегава покупает в bearish!
-  htf_filter: false                   # отключён — не мешать контр-тренду
-  kotegawa_exit_ratio: 0.65           # 65% — выход на 65% пути к SMA (было 40%)
-  # Liquidity filter — оставляем, неликвид опасен
-  min_24h_turnover: 2000000           # минимум $2M 24h оборот
-  max_spread_pct: 0.05                # макс спред 0.05%
-  # Anti-pump filter — оставляем
+  market_bias: false
+  htf_filter: true                   # ВКЛЮЧЁН — скачок должен подтверждаться на 1H (было false!)
+  htf_score_min: 4                   # контр-тренд: нужен score >= 4
+  htf_min_sma_dev: 1.0              # HTF (1H) должен показывать отклонение >= 1%
+  kotegawa_exit_ratio: 0.5           # 50% — фолбэк если scale_out выключен
+  scale_out_enabled: true
+  scale_out_stages: [0.20, 0.40, 0.50]   # memes spike fast — quick locks
+  scale_out_sizes: [0.35, 0.35, 0.30]
+  # Liquidity filter
+  min_24h_turnover: 5000000          # минимум $5M оборот (было $2M — неликвид опасен)
+  max_spread_pct: 0.05
+  # Anti-pump filter
   pump_filter: true
   pump_candle_pct: 5.0
   pump_vol_spike: 3.0
   pump_min_steps: 2
 
 risk:
-  risk_per_trade: 0.5                # 0.5% — чуть агрессивнее (было 0.3%)
-  max_risk_per_trade: 200             # макс $200 убыток на позицию
-  tp_take_pct: 0.25                   # TP = 25% от рассчитанного (хотел $1000 → закроет на $250)
-  stop_loss: 1.5
-  take_profit: 3.0
-  max_open_positions: 10
+  risk_per_trade: 0.5
+  max_risk_per_trade: 200
+  stop_loss: 2.0                     # фолбэк SL 2%
+  take_profit: 4.0                   # фолбэк TP 4%
+  max_open_positions: 5              # макс 5 позиций (было 10 — слишком много)
   max_daily_loss: 5.0
-  daily_drawdown_from_profit: 50      # если потерял 50% дневной прибыли — стоп
-  trailing_stop: 0.8
-  trailing_activation: 1.5            # активация trailing после 1.5% (было 1.0%)
-  partial_close_enabled: false         # отключён — Котегава ждёт возврат к SMA
+  daily_drawdown_from_profit: 50
+  trailing_stop: 1.0
+  trailing_activation: 2.0
+  partial_close_enabled: false
   # ATR-based dynamic SL/TP
   atr_period: 14
   atr_sl_multiplier: 2.0
-  atr_tp_multiplier: 4.0              # 4x ATR как у SCALP (было 3x)
+  atr_tp_multiplier: 4.0
   atr_trailing_multiplier: 1.5
   # ATR clamp — шире для мемов
-  atr_sl_min: 0.8
-  atr_sl_max: 3.0                     # макс SL 3% (было 2.5%)
-  atr_tp_min: 2.0                     # мин TP 2% (было 1.5%)
-  atr_tp_max: 6.0                     # макс TP 6% (было 5%)
-  atr_trail_min: 0.6
-  atr_trail_max: 2.0
+  atr_sl_min: 1.0                    # мин SL 1% (было 0.8%)
+  atr_sl_max: 4.0                    # макс SL 4% (было 3%)
+  atr_tp_min: 2.0
+  atr_tp_max: 8.0                    # макс TP 8% (было 6%)
+  atr_trail_min: 0.8
+  atr_trail_max: 3.0
   # Cooldown
-  cooldown_after_loss: 10             # 10 мин (было 15 — слишком долго спал)
-  breakeven_activation: 0             # отключён
-  profit_target_usd: 0
-  loss_target_usd: 0
-  smart_exit_min: 0                   # отключён
+  cooldown_after_loss: 30            # 30 мин после убытка (было 10 — влетал обратно)
+  breakeven_activation: 0
+  # Commission-aware TP
+  commission_rate: 0.055              # Bybit taker worst case
+  min_tp_net: 500                    # TP = чистая прибыль >= 500 USDT после комиссии
   # Correlation
-  max_per_group: 3                    # 3 мема из одной группы (было 4)
+  max_per_group: 2                    # макс 2 мема из одной группы (было 3)
   correlation_groups:
-    dog_memes: ["DOGEUSDT", "SHIB1000USDT", "1000FLOKIUSDT", "1000BONKUSDT"]
-    political: ["TRUMPUSDT", "ACTUSDT", "MELANIAUSDT", "VINEUSDT"]
-    sol_memes: ["WIFUSDT", "POPCATUSDT", "BRETTUSDT", "MOODENGUSDT", "GOATUSDT"]
-    degen: ["1000PEPEUSDT", "FARTCOINUSDT", "PNUTUSDT", "MEMEUSDT"]
-    tg_gaming: ["NOTUSDT", "PENGUUSDT"]
+    dog_memes: ["DOGEUSDT", "SHIB1000USDT", "1000BONKUSDT"]
+    sol_memes: ["WIFUSDT", "POPCATUSDT", "MOODENGUSDT"]
+    degen: ["1000PEPEUSDT", "FARTCOINUSDT"]
+    political: ["TRUMPUSDT"]
     ai_agents: ["VIRTUALUSDT"]
 
 ai:
@@ -111,10 +113,10 @@ ai:
   provider: "deepseek"
   api_key: "sk-2dec36c8752d48b6b2cfdedd21337126"
   model: "deepseek-chat"
-  style: "kotegawa"                    # AI по стратегии Котегавы
-  min_confidence: 3                    # 3 — ослаблен (было 4 — мало входов)
-  timeout: 10                          # 10 сек (было 5 — таймаутился)
-  review_interval: 0                     # отключён — AI ужесточал параметры, блокируя входы
+  style: "kotegawa"
+  min_confidence: 6                   # 6 — только уверенные входы (было 3!)
+  timeout: 10
+  review_interval: 0
   extra_timeframes: ["5", "15", "60"]
 
 other_instances:
@@ -123,7 +125,7 @@ other_instances:
     service: "stasik"
     timeframe: "5м"
     leverage: "10x"
-    pairs: ["BTCUSDT", "ETHUSDT", "XRPUSDT", "ADAUSDT", "AVAXUSDT", "LINKUSDT", "NEARUSDT", "SUIUSDT", "APTUSDT", "TRUMPUSDT", "WIFUSDT", "1000PEPEUSDT", "SHIB1000USDT"]
+    pairs: ["BTCUSDT", "ETHUSDT", "XRPUSDT", "ADAUSDT", "AVAXUSDT", "LINKUSDT", "NEARUSDT", "SUIUSDT", "APTUSDT"]
   - name: "SWING"
     db_path: "/root/stasik/data/swing.db"
     service: "stasik-swing"
