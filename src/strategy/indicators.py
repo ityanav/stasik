@@ -250,3 +250,101 @@ def detect_candlestick_patterns(df: pd.DataFrame) -> dict:
     total = sum(patterns.values())
     score = max(-1, min(1, total))
     return {"score": score, "patterns": patterns}
+
+
+def detect_order_blocks(
+    df: pd.DataFrame,
+    lookback: int = 50,
+    proximity_pct: float = 1.0,
+    displacement_pct: float = 1.5,
+) -> dict:
+    """Detect ICT Order Blocks — institutional supply/demand zones.
+
+    Bullish OB: last bearish candle before impulsive move up (displacement).
+    Bearish OB: last bullish candle before impulsive move down.
+    Mitigated blocks (price already passed through zone) are skipped.
+
+    Returns {"score": -1/0/+1, "blocks": [...], "nearest": dict|None}
+    """
+    empty = {"score": 0, "blocks": [], "nearest": None}
+    if len(df) < lookback + 3:
+        return empty
+
+    close = df["close"].iloc[-1]
+    recent = df.iloc[-(lookback + 3):]
+    blocks: list[dict] = []
+
+    for i in range(len(recent) - 2):
+        candle = recent.iloc[i]
+        c_open, c_close = candle["open"], candle["close"]
+        c_high, c_low = candle["high"], candle["low"]
+        body = abs(c_close - c_open)
+        if body == 0:
+            continue
+
+        is_bearish = c_close < c_open
+        is_bullish = c_close > c_open
+
+        # Check displacement over next 1-2 candles
+        next1 = recent.iloc[i + 1]
+        next2 = recent.iloc[i + 2] if i + 2 < len(recent) else None
+
+        if is_bearish:
+            # Bullish OB: bearish candle → impulsive move UP
+            max_close = next1["close"]
+            if next2 is not None:
+                max_close = max(max_close, next2["close"])
+            displacement = (max_close - c_high) / c_high * 100
+            if displacement >= displacement_pct and max_close > c_high:
+                zone_low = min(c_open, c_close)
+                zone_high = max(c_open, c_close)
+                # Check mitigation: if price later closed below zone_low, it's mitigated
+                subsequent = recent.iloc[i + 2:]
+                mitigated = (subsequent["close"] < zone_low).any()
+                if not mitigated:
+                    blocks.append({
+                        "type": "bullish",
+                        "zone_low": zone_low,
+                        "zone_high": zone_high,
+                        "age": len(recent) - i - 1,
+                    })
+
+        elif is_bullish:
+            # Bearish OB: bullish candle → impulsive move DOWN
+            min_close = next1["close"]
+            if next2 is not None:
+                min_close = min(min_close, next2["close"])
+            displacement = (c_low - min_close) / c_low * 100
+            if displacement >= displacement_pct and min_close < c_low:
+                zone_low = min(c_open, c_close)
+                zone_high = max(c_open, c_close)
+                # Mitigated if price later closed above zone_high
+                subsequent = recent.iloc[i + 2:]
+                mitigated = (subsequent["close"] > zone_high).any()
+                if not mitigated:
+                    blocks.append({
+                        "type": "bearish",
+                        "zone_low": zone_low,
+                        "zone_high": zone_high,
+                        "age": len(recent) - i - 1,
+                    })
+
+    if not blocks:
+        return empty
+
+    # Find nearest block to current price
+    def distance(b: dict) -> float:
+        mid = (b["zone_low"] + b["zone_high"]) / 2
+        return abs(close - mid)
+
+    nearest = min(blocks, key=distance)
+    prox = close * proximity_pct / 100
+
+    # Score: is current price near a block?
+    score = 0
+    if nearest["type"] == "bullish" and nearest["zone_low"] - prox <= close <= nearest["zone_high"] + prox:
+        score = 1  # price at bullish support → confirms BUY
+    elif nearest["type"] == "bearish" and nearest["zone_low"] - prox <= close <= nearest["zone_high"] + prox:
+        score = -1  # price at bearish resistance → confirms SELL
+
+    return {"score": score, "blocks": blocks, "nearest": nearest}

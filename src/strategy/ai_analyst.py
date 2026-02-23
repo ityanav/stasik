@@ -13,6 +13,7 @@ from src.strategy.indicators import (
     calculate_sma_deviation,
     calculate_volume_signal,
     detect_candlestick_patterns,
+    detect_order_blocks,
 )
 
 logger = logging.getLogger(__name__)
@@ -568,6 +569,17 @@ def extract_indicator_values(df: pd.DataFrame, config: dict) -> str:
         lines.append(f"Свечные паттерны: {pat_names} (итого: {pat['score']:+d})")
     else:
         lines.append("Свечные паттерны: не обнаружены")
+
+    ob = detect_order_blocks(df)
+    if ob["nearest"]:
+        b = ob["nearest"]
+        lines.append(
+            f"Order Block: {b['type'].upper()} zone "
+            f"{b['zone_low']:.4f}-{b['zone_high']:.4f} "
+            f"(age={b['age']} candles, score={ob['score']:+d})"
+        )
+    else:
+        lines.append("Order Blocks: none nearby")
 
     return "\n".join(lines)
 

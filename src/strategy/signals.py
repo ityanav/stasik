@@ -13,6 +13,7 @@ from src.strategy.indicators import (
     calculate_sma_deviation,
     calculate_volume_signal,
     detect_candlestick_patterns,
+    detect_order_blocks,
     detect_rsi_divergence,
 )
 
@@ -146,6 +147,13 @@ class SignalGenerator:
             scores["pattern"] = pat_result["score"]
         else:
             scores["pattern"] = 0
+
+        # ── Order blocks (ICT) ──────────────────────────────
+        if self.patterns_enabled:
+            ob_blocks = detect_order_blocks(df)
+            scores["order_block"] = ob_blocks["score"]
+        else:
+            scores["order_block"] = 0
 
         # ── Order book imbalance ─────────────────────────────
         if orderbook and (orderbook.get("bids") or orderbook.get("asks")):
@@ -301,6 +309,13 @@ class KotegawaGenerator:
             scores["pattern"] = pat_result["score"]
         else:
             scores["pattern"] = 0
+
+        # ── Order blocks (ICT) ──────────────────────────────
+        if self.patterns_enabled:
+            ob_blocks = detect_order_blocks(df)
+            scores["order_block"] = ob_blocks["score"]
+        else:
+            scores["order_block"] = 0
 
         # ── Order book (contrarian) ──────────────────────────
         if orderbook and (orderbook.get("bids") or orderbook.get("asks")):
