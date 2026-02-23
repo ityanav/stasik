@@ -1860,7 +1860,7 @@ body.archive-mode .header{background:#fff;border-bottom-color:rgba(245,158,11,0.
     <div class="tbl-wrap">
       <table>
         <thead><tr>
-          <th>Bot</th><th>Pair</th><th>Side</th><th>Entry</th><th>Exit</th><th>Gross PnL</th><th>Net PnL</th><th>Time</th><th>Status</th>
+          <th>Bot</th><th>Pair</th><th>Side</th><th>Size</th><th>Entry</th><th>Exit</th><th>PS</th><th>Gross PnL</th><th>Net PnL</th><th>Time</th><th>Status</th>
         </tr></thead>
         <tbody id="tbody"></tbody>
       </table>
@@ -2657,11 +2657,16 @@ async function loadTrades(page){
       const entryAmt=(t.entry_price||0)*(t.qty||0);
       const fee=entryAmt*feeRate*2;
       const netPnl=p-fee;
+      const qty=t.qty||0;
+      const ps=entryAmt;
+      const psFmt=ps>=1000?(ps/1000).toFixed(1)+'k':ps.toFixed(0);
       return`<tr class="fade-in">
         <td><span class="inst-tag ${isCls}">${iLabel}</span></td>
         <td><strong>${t.symbol}</strong>${tSoBadge}</td>
         <td class="${t.side==='Buy'?'side-long':'side-short'}">${t.side==='Buy'?'LONG':'SHORT'}</td>
+        <td style="font-size:12px">${qty}</td>
         <td>${t.entry_price||'-'}</td><td>${t.exit_price||'-'}</td>
+        <td style="font-size:12px;color:var(--muted)">$${psFmt}</td>
         <td class="${cls(p)}"><strong>${p?p.toFixed(2):'-'}</strong></td>
         <td class="${cls(netPnl)}"><strong>${p?netPnl.toFixed(2):'-'}</strong></td>
         <td style="color:var(--muted);font-size:12px">${tFmt}</td>
