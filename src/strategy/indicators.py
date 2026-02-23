@@ -80,6 +80,55 @@ def calculate_volume_signal(df: pd.DataFrame, period: int = 20) -> tuple[pd.Seri
     return vol_sma, ratio
 
 
+def detect_rsi_divergence(df: pd.DataFrame, rsi_period: int = 14, lookback: int = 20) -> int:
+    """Detect RSI divergence (price vs RSI disagreement).
+
+    Returns:
+        +1 = bullish divergence (price lower low, RSI higher low → reversal up)
+        -1 = bearish divergence (price higher high, RSI lower high → reversal down)
+         0 = no divergence
+    """
+    if len(df) < lookback + rsi_period:
+        return 0
+
+    rsi = calculate_rsi(df, rsi_period)
+    recent = df.tail(lookback)
+    rsi_recent = rsi.tail(lookback)
+
+    if rsi_recent.isna().any():
+        return 0
+
+    prices = recent["close"].values
+    rsi_vals = rsi_recent.values
+
+    # Split into two halves: first half vs second half
+    mid = lookback // 2
+    first_prices = prices[:mid]
+    second_prices = prices[mid:]
+    first_rsi = rsi_vals[:mid]
+    second_rsi = rsi_vals[mid:]
+
+    price_low1 = first_prices.min()
+    price_low2 = second_prices.min()
+    rsi_low1 = first_rsi.min()
+    rsi_low2 = second_rsi.min()
+
+    price_high1 = first_prices.max()
+    price_high2 = second_prices.max()
+    rsi_high1 = first_rsi.max()
+    rsi_high2 = second_rsi.max()
+
+    # Bullish divergence: price makes lower low, RSI makes higher low
+    if price_low2 < price_low1 and rsi_low2 > rsi_low1 + 2:
+        return 1
+
+    # Bearish divergence: price makes higher high, RSI makes lower high
+    if price_high2 > price_high1 and rsi_high2 < rsi_high1 - 2:
+        return -1
+
+    return 0
+
+
 def analyze_orderbook(orderbook: dict, depth_pct: float = 0.5) -> dict:
     """Analyze order book imbalance and walls.
 

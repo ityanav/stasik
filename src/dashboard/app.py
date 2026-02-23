@@ -112,6 +112,7 @@ class Dashboard:
         self.app.router.add_post("/api/set-sl", self._api_set_sl)
         self.app.router.add_post("/api/set-tp", self._api_set_tp)
         self.app.router.add_get("/api/instances", self._api_instances)
+        self.app.router.add_post("/api/set-leverage", self._api_set_leverage)
 
     async def start(self):
         self._runner = web.AppRunner(self.app)
@@ -621,11 +622,14 @@ class Dashboard:
                 else:
                     raw = self._get_client().get_positions(category="linear")
                 live_mark = {p["symbol"]: p.get("mark_price", 0) for p in raw}
+                live_leverage = {p["symbol"]: p.get("leverage", "?") for p in raw}
                 for pos in positions:
                     sym = pos["symbol"]
                     inst = (pos.get("instance") or "").upper()
                     if "TBANK" in inst:
+                        pos["leverage"] = "1"
                         continue
+                    pos["leverage"] = live_leverage.get(sym, "?")
                     mark = 0
                     if sym in live_mark and live_mark[sym]:
                         mark = float(live_mark[sym])
@@ -742,7 +746,7 @@ class Dashboard:
                 for p in positions:
                     if p["symbol"] == symbol and p["size"] > 0:
                         close_side = "Sell" if p["side"] == "Buy" else "Buy"
-                        client.place_order(symbol=symbol, side=close_side, qty=p["size"], category="linear")
+                        client.place_order(symbol=symbol, side=close_side, qty=p["size"], category="linear", reduce_only=True)
                         exchange_closed = True
             except Exception:
                 logger.warning("Failed to close %s on exchange", symbol)
@@ -816,7 +820,7 @@ class Dashboard:
             for p in positions:
                 if p["size"] > 0:
                     close_side = "Sell" if p["side"] == "Buy" else "Buy"
-                    client.place_order(symbol=p["symbol"], side=close_side, qty=p["size"], category="linear")
+                    client.place_order(symbol=p["symbol"], side=close_side, qty=p["size"], category="linear", reduce_only=True)
                     count += 1
             return web.json_response({"ok": True, "message": f"Закрыто {count} позиций"})
         except Exception as e:
@@ -984,6 +988,71 @@ class Dashboard:
                 return inst.get("db_path", "")
         return None
 
+    _ALLOWED_LEVERAGE = {1, 2, 3, 5, 10, 15, 20}
+
+    def _get_instance_pairs(self, instance: str) -> list[str]:
+        instance_upper = (instance or "").upper()
+        main_name = self.config.get("instance_name", "SCALP").upper()
+        if instance_upper == main_name:
+            return self.config.get("trading", {}).get("pairs", [])
+        for inst in self.config.get("other_instances", []):
+            if inst.get("name", "").upper() == instance_upper:
+                return inst.get("pairs", [])
+        return []
+
+    async def _api_set_leverage(self, request: web.Request) -> web.Response:
+        client = self._get_client()
+        if not client:
+            return web.json_response({"ok": False, "error": "No client"}, status=503)
+        try:
+            data = await request.json()
+            leverage = int(data.get("leverage", 0))
+            symbol = data.get("symbol", "")
+            instance = data.get("instance", "")
+
+            if leverage not in self._ALLOWED_LEVERAGE:
+                return web.json_response(
+                    {"ok": False, "error": f"Invalid leverage: {leverage}"},
+                    status=400,
+                )
+
+            results = {"ok": [], "failed": []}
+
+            if symbol:
+                try:
+                    client.set_leverage(symbol, leverage, category="linear")
+                    results["ok"].append(symbol)
+                except Exception as e:
+                    results["failed"].append({"symbol": symbol, "error": str(e)})
+            elif instance:
+                pairs = self._get_instance_pairs(instance)
+                if not pairs:
+                    return web.json_response(
+                        {"ok": False, "error": f"Unknown instance: {instance}"},
+                        status=400,
+                    )
+                for pair in pairs:
+                    try:
+                        client.set_leverage(pair, leverage, category="linear")
+                        results["ok"].append(pair)
+                    except Exception as e:
+                        if "leverage not modified" not in str(e).lower():
+                            results["failed"].append({"symbol": pair, "error": str(e)})
+                        else:
+                            results["ok"].append(pair)
+            else:
+                return web.json_response(
+                    {"ok": False, "error": "Provide 'symbol' or 'instance'"},
+                    status=400,
+                )
+
+            success = len(results["failed"]) == 0
+            logger.info("set-leverage: %sx, ok=%s, failed=%s", leverage, results["ok"], results["failed"])
+            return web.json_response({"ok": success, "leverage": leverage, "results": results})
+        except Exception as e:
+            logger.exception("set-leverage error")
+            return web.json_response({"ok": False, "error": str(e)}, status=500)
+
     async def _api_instances(self, request: web.Request) -> web.Response:
         source = request.query.get("source", "live")
         is_archive = source == "archive"
@@ -1068,6 +1137,20 @@ class Dashboard:
         for inst in self.config.get("other_instances", []):
             data = await self._read_instance_data(inst, source)
             instances.append(data)
+
+        # Enrich with live leverage from exchange
+        if not is_archive and self._get_client():
+            try:
+                lev_map = self._get_client().get_all_leverage(category="linear")
+                for inst_data in instances:
+                    if "TBANK" in inst_data["name"].upper():
+                        continue
+                    pairs = inst_data.get("pairs", [])
+                    pair_levs = [lev_map.get(p) for p in pairs if p in lev_map]
+                    if pair_levs:
+                        inst_data["leverage"] = pair_levs[0]
+            except Exception:
+                pass
 
         return web.json_response(instances)
 
@@ -1365,7 +1448,15 @@ tr:hover{background:rgba(99,102,241,0.04)}
 .instance-stats{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}
 .instance-stat h4{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:1px;margin-bottom:4px}
 .instance-stat .val{font-size:20px;font-weight:700}
-.instance-meta{margin-top:12px;font-size:11px;color:var(--muted);display:flex;gap:14px;flex-wrap:wrap}
+.instance-meta{margin-top:12px;font-size:11px;color:var(--muted);display:flex;gap:14px;flex-wrap:wrap;align-items:center}
+.lev-select{
+  background:#f8f8fc;border:1px solid #e0e0e6;border-radius:6px;
+  padding:2px 6px;font-size:11px;font-weight:600;color:#333;
+  cursor:pointer;outline:none;min-width:52px;
+}
+.lev-select:hover{border-color:#6366f1}
+.lev-select:focus{border-color:#6366f1;box-shadow:0 0 0 2px rgba(99,102,241,0.15)}
+.lev-select:disabled{opacity:0.5;cursor:not-allowed}
 
 @keyframes fadeIn{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:translateY(0)}}
 .fade-in{animation:fadeIn 0.4s ease}
@@ -1717,7 +1808,7 @@ body.archive-mode .header{background:#fff;border-bottom-color:rgba(245,158,11,0.
     <h2>📊 Открытые позиции</h2>
     <div class="tbl-wrap">
       <table>
-        <thead><tr><th>Bot</th><th>Pair</th><th>Side</th><th>Size</th><th>Entry</th><th>PS</th><th>TP</th><th>SL</th><th>Gross PnL</th><th>Fee</th><th>Net PnL</th><th></th></tr></thead>
+        <thead><tr><th>Bot</th><th>Lev</th><th>Pair</th><th>Side</th><th>Size</th><th>Entry</th><th>PS</th><th>TP</th><th>SL</th><th>Gross PnL</th><th>Fee</th><th>Net PnL</th><th></th></tr></thead>
         <tbody id="pos-body"></tbody>
       </table>
     </div>
@@ -1731,7 +1822,7 @@ body.archive-mode .header{background:#fff;border-bottom-color:rgba(245,158,11,0.
     <div class="tbl-wrap">
       <table>
         <thead><tr>
-          <th>Bot</th><th>Pair</th><th>Side</th><th>Entry</th><th>Exit</th><th>PnL</th><th>Time</th><th>Status</th>
+          <th>Bot</th><th>Pair</th><th>Side</th><th>Entry</th><th>Exit</th><th>Gross PnL</th><th>Net PnL</th><th>Time</th><th>Status</th>
         </tr></thead>
         <tbody id="tbody"></tbody>
       </table>
@@ -1911,6 +2002,11 @@ async function loadInstances(){
           <span>📊 Позиции: ${i.open_positions}</span>
           <span>🔢 Сделок: ${i.total_trades} (${i.wins}W / ${i.losses}L)</span>
           <span>🪙 ${i.pairs.length} пар</span>
+          ${(!isTbank&&currentSource==='live')?(()=>{
+            const levOpts=[1,2,3,5,10,15,20];
+            const curLev=parseInt(String(i.leverage))||1;
+            return '<span>⚡ <select class="lev-select" onchange="setInstanceLeverage(\''+i.name+'\',this.value,this)" data-prev="'+curLev+'">'+levOpts.map(l=>'<option value="'+l+'"'+(l===curLev?' selected':'')+'>'+l+'x</option>').join('')+'</select></span>';
+          })():'<span>⚡ '+i.leverage+'x</span>'}
         </div>
       </div>`;
     }).join('');
@@ -2333,6 +2429,33 @@ async function toggleService(service,action,btn){
   }catch(e){alert('Ошибка: '+e);btn.disabled=false;btn.innerHTML=old}
 }
 
+async function setInstanceLeverage(instance,leverage,sel){
+  leverage=parseInt(leverage);
+  if(!confirm('Set leverage '+leverage+'x for ALL pairs in '+instance+'?')){
+    sel.value=sel.dataset.prev||sel.value;return;
+  }
+  sel.disabled=true;
+  try{
+    const r=await fetch('/api/set-leverage',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({instance,leverage})});
+    const d=await r.json();
+    if(d.ok){sel.dataset.prev=String(leverage);sel.disabled=false;loadInstances()}
+    else{alert(d.error||'Error');sel.disabled=false;sel.value=sel.dataset.prev||sel.value}
+  }catch(e){alert('Error: '+e);sel.disabled=false;sel.value=sel.dataset.prev||sel.value}
+}
+
+async function setPairLeverage(symbol,leverage,sel){
+  leverage=parseInt(leverage);
+  sel.disabled=true;
+  try{
+    const r=await fetch('/api/set-leverage',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({symbol,leverage})});
+    const d=await r.json();
+    if(d.ok){sel.disabled=false}
+    else{alert(d.error||'Error');sel.disabled=false;sel.value=sel.dataset.prev||sel.value}
+  }catch(e){alert('Error: '+e);sel.disabled=false;sel.value=sel.dataset.prev||sel.value}
+}
+
 async function closePosition(symbol,instance,btn){
   if(!confirm('Закрыть позицию '+symbol+'?'))return;
   btn.disabled=true;btn.textContent='...';
@@ -2398,7 +2521,7 @@ async function loadPositions(){
     const body=document.getElementById('pos-body');
     const wrap=document.getElementById('close-all-wrap');
     if(!pos.length){
-      body.innerHTML='<tr><td colspan="12" style="text-align:center;color:#bbb;padding:20px">Нет открытых позиций</td></tr>';
+      body.innerHTML='<tr><td colspan="13" style="text-align:center;color:#bbb;padding:20px">Нет открытых позиций</td></tr>';
       wrap.style.display='none';return;
     }
     wrap.style.display=currentSource==='live'?'':'none';
@@ -2419,8 +2542,14 @@ async function loadPositions(){
       const slTxt=slPnl!=null?`<strong class="r">${fmt(slPnl)}</strong>`:'—';
       const pc=p.partial_closed||0;
       const soBadge=pc>0?` <span class="so-badge">${pc}/3</span>`:'';
+      const isTbankPos=inst.includes('TBANK');
+      const posLev=parseInt(p.leverage)||1;
+      const levCell=(!isTbankPos&&currentSource==='live')?
+        `<td><select class="lev-select" style="min-width:48px;padding:1px 4px;font-size:11px" data-prev="${posLev}" onchange="setPairLeverage('${p.symbol}',this.value,this)">${[1,2,3,5,10,15,20].map(l=>`<option value="${l}"${l===posLev?' selected':''}>${l}x</option>`).join('')}</select></td>`
+        :`<td style="color:var(--muted);font-size:11px">${posLev}x</td>`;
       return`<tr class="fade-in">
         <td><span class="inst-tag ${isCls}">${iLabel}</span></td>
+        ${levCell}
         <td><strong>${p.symbol}</strong>${soBadge}</td>
         <td class="${p.side==='Buy'?'side-long':'side-short'}">${p.side==='Buy'?'LONG':'SHORT'}</td>
         <td>${p.size}</td><td>${parseFloat(p.entry_price).toFixed(2)}</td>
@@ -2453,12 +2582,17 @@ async function loadTrades(page){
       const tFmt=tTime?tTime.replace('T',' ').slice(5,16):'—';
       const tpc=t.partial_closed||0;
       const tSoBadge=tpc>0?` <span class="so-badge">${tpc}/3</span>`:'';
+      const feeRate=inst.includes('TBANK')?0.0004:0.00055;
+      const entryAmt=(t.entry_price||0)*(t.qty||0);
+      const fee=entryAmt*feeRate*2;
+      const netPnl=p-fee;
       return`<tr class="fade-in">
         <td><span class="inst-tag ${isCls}">${iLabel}</span></td>
         <td><strong>${t.symbol}</strong>${tSoBadge}</td>
         <td class="${t.side==='Buy'?'side-long':'side-short'}">${t.side==='Buy'?'LONG':'SHORT'}</td>
         <td>${t.entry_price||'-'}</td><td>${t.exit_price||'-'}</td>
         <td class="${cls(p)}"><strong>${p?p.toFixed(2):'-'}</strong></td>
+        <td class="${cls(netPnl)}"><strong>${p?netPnl.toFixed(2):'-'}</strong></td>
         <td style="color:var(--muted);font-size:12px">${tFmt}</td>
         <td class="${t.status==='closed'?'status-closed':'status-open'}">${t.status==='closed'?'Closed':'Open'}</td></tr>`;
     }).join('');

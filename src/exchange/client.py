@@ -79,6 +79,7 @@ class BybitClient(ExchangeClient):
         order_type: str = "Market",
         stop_loss: Optional[float] = None,
         take_profit: Optional[float] = None,
+        reduce_only: bool = False,
     ) -> dict:
         params: dict = {
             "category": category,
@@ -91,6 +92,8 @@ class BybitClient(ExchangeClient):
             params["stopLoss"] = str(round(stop_loss, 6))
         if take_profit is not None:
             params["takeProfit"] = str(round(take_profit, 6))
+        if reduce_only:
+            params["reduceOnly"] = True
 
         resp = self.session.place_order(**params)
         logger.info(
@@ -134,6 +137,15 @@ class BybitClient(ExchangeClient):
                     }
                 )
         return positions
+
+    def get_all_leverage(self, category: str = "linear") -> dict[str, str]:
+        """Return {symbol: leverage_string} for all pairs (including no open positions)."""
+        try:
+            resp = self.session.get_positions(category=category, settleCoin="USDT")
+            return {p["symbol"]: p["leverage"] for p in resp["result"]["list"]}
+        except Exception:
+            logger.warning("Failed to get leverage map")
+            return {}
 
     def set_leverage(self, symbol: str, leverage: int, category: str = "linear"):
         try:

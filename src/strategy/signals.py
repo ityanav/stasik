@@ -13,6 +13,7 @@ from src.strategy.indicators import (
     calculate_sma_deviation,
     calculate_volume_signal,
     detect_candlestick_patterns,
+    detect_rsi_divergence,
 )
 
 logger = logging.getLogger(__name__)
@@ -202,6 +203,7 @@ class KotegawaGenerator:
     Signals (each -1/0/+1, some give +2/-2 for extreme):
       sma_dev  — % deviation from 25-SMA (main signal, can give +-2)
       rsi      — extreme RSI (can give +-2)
+      rsi_div  — RSI divergence (price vs RSI disagreement, +-1)
       bb       — price vs Bollinger Bands
       vol      — volume spike confirms panic/euphoria
       pattern  — candlestick reversal patterns (hammer, engulfing)
@@ -264,6 +266,10 @@ class KotegawaGenerator:
         else:
             scores["rsi"] = 0
 
+        # ── RSI divergence ──────────────────────────────────
+        rsi_div = detect_rsi_divergence(df, self.rsi_period)
+        scores["rsi_div"] = rsi_div  # +1 bullish, -1 bearish, 0 none
+
         # ── Bollinger Bands ──────────────────────────────────
         upper, middle, lower = calculate_bollinger(df, self.bb_period, self.bb_std)
         close = df["close"].iloc[-1]
@@ -314,8 +320,8 @@ class KotegawaGenerator:
             signal = Signal.HOLD
 
         logger.info(
-            "Котегава %s: %s (score=%d, dev=%.1f%%, rsi=%.1f, vol=%.1fx, details=%s)",
-            symbol, signal.value, total, dev, rsi_val, vol_ratio, scores,
+            "Котегава %s: %s (score=%d, dev=%.1f%%, rsi=%.1f, rsi_div=%d, vol=%.1fx, details=%s)",
+            symbol, signal.value, total, dev, rsi_val, rsi_div, vol_ratio, scores,
         )
         return SignalResult(signal=signal, score=total, details=scores)
 

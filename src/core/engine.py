@@ -1422,7 +1422,7 @@ class TradingEngine:
             if self.exchange_type == "tbank":
                 self.client.place_order(symbol=symbol, side=close_side, qty=qty)
             else:
-                self.client.place_order(symbol=symbol, side=close_side, qty=qty, category="linear")
+                self.client.place_order(symbol=symbol, side=close_side, qty=qty, category="linear", reduce_only=True)
         except Exception:
             logger.exception("Close-at-profit: failed to close %s", symbol)
             return
@@ -1484,7 +1484,7 @@ class TradingEngine:
             if self.exchange_type == "tbank":
                 self.client.place_order(symbol=symbol, side=close_side, qty=qty)
             else:
-                self.client.place_order(symbol=symbol, side=close_side, qty=qty, category="linear")
+                self.client.place_order(symbol=symbol, side=close_side, qty=qty, category="linear", reduce_only=True)
         except Exception:
             logger.exception("Profit target: failed to close %s", symbol)
             return
@@ -1548,7 +1548,7 @@ class TradingEngine:
             if self.exchange_type == "tbank":
                 self.client.place_order(symbol=symbol, side=close_side, qty=qty)
             else:
-                self.client.place_order(symbol=symbol, side=close_side, qty=qty, category="linear")
+                self.client.place_order(symbol=symbol, side=close_side, qty=qty, category="linear", reduce_only=True)
         except Exception:
             logger.exception("Loss target: failed to close %s", symbol)
             return
@@ -1662,7 +1662,7 @@ class TradingEngine:
             if self.exchange_type == "tbank":
                 self.client.place_order(symbol=symbol, side=close_side, qty=qty)
             else:
-                self.client.place_order(symbol=symbol, side=close_side, qty=qty, category="linear")
+                self.client.place_order(symbol=symbol, side=close_side, qty=qty, category="linear", reduce_only=True)
         except Exception:
             logger.warning("DB stop-loss: no position on exchange for %s, closing in DB only", symbol)
 
@@ -1727,7 +1727,7 @@ class TradingEngine:
             if self.exchange_type == "tbank":
                 self.client.place_order(symbol=symbol, side=close_side, qty=qty)
             else:
-                self.client.place_order(symbol=symbol, side=close_side, qty=qty, category="linear")
+                self.client.place_order(symbol=symbol, side=close_side, qty=qty, category="linear", reduce_only=True)
         except Exception:
             logger.warning("DB take-profit: no position on exchange for %s, closing in DB only", symbol)
 
@@ -1850,7 +1850,7 @@ class TradingEngine:
             if self.exchange_type == "tbank":
                 self.client.place_order(symbol=symbol, side=close_side, qty=close_qty)
             else:
-                self.client.place_order(symbol=symbol, side=close_side, qty=close_qty, category=category)
+                self.client.place_order(symbol=symbol, side=close_side, qty=close_qty, category=category, reduce_only=True)
         except Exception:
             logger.exception("Scale-out stage %d: failed to close %s", current_stage + 1, symbol)
             return
@@ -2007,7 +2007,7 @@ class TradingEngine:
             if self.exchange_type == "tbank":
                 self.client.place_order(symbol=symbol, side=close_side, qty=qty)
             else:
-                self.client.place_order(symbol=symbol, side=close_side, qty=qty, category=category)
+                self.client.place_order(symbol=symbol, side=close_side, qty=qty, category=category, reduce_only=True)
         except Exception:
             logger.exception("Kotegawa exit: failed to close %s", symbol)
             return
@@ -2102,7 +2102,7 @@ class TradingEngine:
             if self.exchange_type == "tbank":
                 self.client.place_order(symbol=symbol, side=close_side, qty=qty)
             else:
-                self.client.place_order(symbol=symbol, side=close_side, qty=qty, category="linear")
+                self.client.place_order(symbol=symbol, side=close_side, qty=qty, category="linear", reduce_only=True)
         except Exception:
             logger.exception("Smart exit: failed to close %s", symbol)
             return
@@ -2835,7 +2835,7 @@ class TradingEngine:
                     if is_tbank:
                         self.client.place_order(symbol=symbol, side=close_side, qty=p["size"])
                     else:
-                        self.client.place_order(symbol=symbol, side=close_side, qty=p["size"], category=cat)
+                        self.client.place_order(symbol=symbol, side=close_side, qty=p["size"], category=cat, reduce_only=True)
                     closed = True
         except Exception as e:
             err_str = str(e)
@@ -2963,7 +2963,7 @@ class TradingEngine:
                         if self.exchange_type == "tbank":
                             self.client.place_order(symbol=p["symbol"], side=close_side, qty=p["size"])
                         else:
-                            self.client.place_order(symbol=p["symbol"], side=close_side, qty=p["size"], category=cat)
+                            self.client.place_order(symbol=p["symbol"], side=close_side, qty=p["size"], category=cat, reduce_only=True)
                         closed_count += 1
                     except Exception:
                         logger.exception("Halt close failed: %s", p["symbol"])
@@ -3093,7 +3093,7 @@ class TradingEngine:
                         if is_tbank:
                             other_client.place_order(symbol=symbol, side=close_side, qty=p["size"])
                         else:
-                            other_client.place_order(symbol=symbol, side=close_side, qty=p["size"], category="linear")
+                            other_client.place_order(symbol=symbol, side=close_side, qty=p["size"], category="linear", reduce_only=True)
                         closed.append(f"{symbol} ({p['side']}) [{inst_name}]")
                 except Exception as e:
                     err_str = str(e)
