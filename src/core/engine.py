@@ -1656,6 +1656,17 @@ class TradingEngine:
                     smc_sl = round(sweep_level - atr_buf, 6)
                 else:
                     smc_sl = round(sweep_level + atr_buf, 6)
+                # Enforce minimum SL distance (1 ATR)
+                sl_dist = abs(price - smc_sl)
+                min_sl_dist = atr if atr and atr > 0 else price * 0.005
+                if sl_dist < min_sl_dist:
+                    if side == "Buy":
+                        smc_sl = round(price - min_sl_dist, 6)
+                    else:
+                        smc_sl = round(price + min_sl_dist, 6)
+                    logger.info("SMC SL widened: %s %.6f → %.6f (min 1 ATR=%.6f)",
+                                symbol, sweep_level - atr_buf if side == "Buy" else sweep_level + atr_buf,
+                                smc_sl, min_sl_dist)
             if tp1_level and tp1_level > 0:
                 smc_tp = round(tp1_level, 6)
                 # Cap SMC TP by ATR multiplier so it doesn't overshoot
@@ -1731,10 +1742,14 @@ class TradingEngine:
                 sl_source += f"→cap${max_sl_usd}"
                 logger.info("SL capped: %s $%.0f → $%.0f (max_sl_usd=%d)", symbol, sl_loss, max_sl_usd, max_sl_usd)
 
-        if smc_tp is not None:
+        if smc_tp is not None and not self._smc_graduated_tp_enabled:
             tp = smc_tp
             tp_dist_pct = abs(tp - price) / price * 100
             tp_source = f"SMC:fib_ext({tp_dist_pct:.2f}%)"
+        elif smc_tp is not None and self._smc_graduated_tp_enabled:
+            # Graduated TP manages exits — no DB TP needed
+            tp = 0
+            tp_source = "graduated_tp(no_db_tp)"
         elif ai_tp_pct is not None and 0.5 <= ai_tp_pct <= 10.0:
             tp = price * (1 + ai_tp_pct / 100) if side == "Buy" else price * (1 - ai_tp_pct / 100)
             tp = round(tp, 6)
@@ -1761,6 +1776,15 @@ class TradingEngine:
                 tp_source += f"→min${min_tp_net}"
                 logger.info("TP adjusted for commission: %s $%.0f → $%.0f (net=$%.0f + fee=$%.2f)",
                             symbol, current_tp_profit, min_gross_profit, min_tp_net, round_trip_fee)
+
+        # R:R filter for SMC: reject if SL distance > TP distance (only when DB TP is set)
+        if isinstance(self.signal_gen, SMCGenerator) and tp > 0 and sl > 0:
+            sl_dist = abs(price - sl)
+            tp_dist = abs(tp - price)
+            if tp_dist > 0 and sl_dist / tp_dist > 1.0:
+                logger.info("SMC R:R reject: %s SL=%.2f%% TP=%.2f%% R:R=%.2f (need >= 1.0)",
+                            symbol, sl_dist / price * 100, tp_dist / price * 100, tp_dist / sl_dist)
+                return
 
         # Place order with retry on qty rejection
         order = None
