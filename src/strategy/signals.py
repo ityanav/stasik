@@ -844,14 +844,6 @@ class SMCGenerator:
         if extensions:
             details["tp1_level"] = round(extensions.get(self.tp_extension_1, 0), 6)
             details["tp2_level"] = round(extensions.get(self.tp_extension_2, 0), 6)
-            # Graduated TP stage levels (for engine)
-            tp_stage_levels = []
-            for ext in [1.0, 1.272, 1.618]:
-                level = extensions.get(ext, 0)
-                if level > 0:
-                    tp_stage_levels.append(round(level, 6))
-            if tp_stage_levels:
-                details["tp_stage_levels"] = tp_stage_levels
 
         # Store sweep level for SL calculation in engine
         details["sweep_level"] = sweep["swept_level"]

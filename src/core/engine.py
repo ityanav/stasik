@@ -145,18 +145,6 @@ class TradingEngine:
         self._smc_daily_klines_cache: dict[str, tuple[pd.DataFrame, float]] = {}  # symbol -> (daily_df, ts)
         self._smc_daily_klines_ttl: int = 3600  # 1 hour
 
-        # SMC Graduated TP
-        self._smc_graduated_tp_enabled: bool = smc_cfg.get("graduated_tp", False)
-        self._smc_tp_stages: list[float] = smc_cfg.get("tp_stages", [1.0, 1.272, 1.618])
-        self._smc_tp_sizes: list[float] = smc_cfg.get("tp_sizes", [0.30, 0.30, 0.40])
-
-        # SMC PnL momentum partial close
-        self._smc_partial_enabled: bool = smc_cfg.get("partial_close_enabled", False)
-        self._smc_partial_threshold: float = smc_cfg.get("partial_close_threshold", 100)  # min net PnL $ to start tracking
-        self._smc_partial_pullback: float = smc_cfg.get("partial_close_pullback", 0.3)  # close when PnL drops 30% from peak
-        self._smc_partial_pct: float = smc_cfg.get("partial_close_pct", 50)  # close 50% of position
-        self._smc_pnl_tracker: dict[str, dict] = {}  # symbol -> {peak_pnl, prev_pnl, samples}
-        self._smc_graduated_tracker: dict[str, dict] = {}  # symbol -> {levels: [price], sizes: [float], stage: int}
 
         # Max margin per instance
         self._max_margin_usdt: float = config["risk"].get("max_margin_usdt", 0)
@@ -546,11 +534,6 @@ class TradingEngine:
                             await self._check_db_take_profit(trade)
                         except Exception:
                             logger.exception("TP poll error %s", trade.get("symbol"))
-                # SMC graduated TP (replaces simple partial close when enabled)
-                if self._smc_mode and self._smc_graduated_tp_enabled:
-                    await self._smc_check_graduated_tp(open_trades)
-                elif self._smc_mode and self._smc_partial_enabled:
-                    await self._smc_check_partial_close(open_trades)
                 # Detect manually closed positions (every 6th poll = ~30s)
                 self._reconcile_poll_counter += 1
                 if open_trades and self._reconcile_poll_counter >= 6:
@@ -582,290 +565,12 @@ class TradingEngine:
                 if key not in exch_open:
                     logger.info("Detected externally closed position: %s %s (trade #%d)",
                                 trade["side"], trade["symbol"], trade["id"])
-                    # Clean up graduated TP tracker
-                    self._smc_graduated_tracker.pop(trade["symbol"], None)
-                    self._smc_pnl_tracker.pop(trade["symbol"], None)
                     try:
                         await self._check_trade_closed(trade)
                     except Exception:
                         logger.exception("Failed to process externally closed trade #%d", trade["id"])
         except Exception:
             logger.exception("_detect_closed_positions error")
-
-    async def _smc_check_partial_close(self, open_trades: list[dict]):
-        """Close part of SMC position when PnL momentum fades.
-
-        Logic:
-        - Track unrealized net PnL for each open position
-        - When net PnL > threshold ($100): start tracking peak PnL
-        - When PnL drops by pullback% from peak: close partial_pct% of position
-        - Only fires once per position (uses partial_closed flag)
-        """
-        commission_rate = self.risk.commission_rate
-
-        for trade in open_trades:
-            symbol = trade["symbol"]
-            side = trade["side"]
-            entry = trade["entry_price"]
-            qty = trade["qty"]
-            category = trade["category"]
-
-            # Skip if already partially closed
-            if (trade.get("partial_closed") or 0) > 0:
-                self._smc_pnl_tracker.pop(symbol, None)
-                continue
-
-            # Get current price
-            try:
-                cur_price = self.client.get_last_price(symbol, category=category)
-            except Exception:
-                continue
-
-            # Calculate unrealized net PnL
-            if side == "Buy":
-                gross_pnl = (cur_price - entry) * qty
-            else:
-                gross_pnl = (entry - cur_price) * qty
-            round_trip_fee = entry * qty * commission_rate * 2
-            net_pnl = gross_pnl - round_trip_fee
-
-            tracker = self._smc_pnl_tracker.get(symbol)
-
-            if net_pnl < self._smc_partial_threshold:
-                # Below threshold — reset tracker
-                if tracker:
-                    self._smc_pnl_tracker.pop(symbol, None)
-                continue
-
-            # Above threshold — start/update tracking
-            if not tracker:
-                self._smc_pnl_tracker[symbol] = {
-                    "peak_pnl": net_pnl,
-                    "prev_pnl": net_pnl,
-                    "samples": 1,
-                }
-                logger.info("SMC partial: %s tracking started, net PnL=$%.2f", symbol, net_pnl)
-                continue
-
-            tracker["samples"] += 1
-
-            # Update peak
-            if net_pnl > tracker["peak_pnl"]:
-                tracker["peak_pnl"] = net_pnl
-                tracker["prev_pnl"] = net_pnl
-                return  # still growing, wait
-
-            # Check pullback from peak
-            peak = tracker["peak_pnl"]
-            pullback_ratio = (peak - net_pnl) / peak if peak > 0 else 0
-
-            if pullback_ratio < self._smc_partial_pullback:
-                tracker["prev_pnl"] = net_pnl
-                return  # pullback not deep enough yet
-
-            # ── Pullback triggered: close partial ──
-            logger.info(
-                "SMC partial: %s peak=$%.2f, now=$%.2f, pullback=%.0f%% → closing %.0f%%",
-                symbol, peak, net_pnl, pullback_ratio * 100, self._smc_partial_pct,
-            )
-
-            close_pct = self._smc_partial_pct / 100
-            close_qty = qty * close_pct
-
-            # Round to exchange step
-            info = self._get_instrument_info(symbol, category)
-            close_qty = math.floor(close_qty / info["qty_step"]) * info["qty_step"]
-            close_qty = round(close_qty, 8)
-
-            if close_qty < info["min_qty"]:
-                logger.info("SMC partial: %s close_qty too small, skipping", symbol)
-                self._smc_pnl_tracker.pop(symbol, None)
-                continue
-
-            remaining_qty = round(qty - close_qty, 8)
-            if remaining_qty < info["min_qty"]:
-                # Remainder too small — close everything
-                close_qty = qty
-                remaining_qty = 0
-
-            close_side = "Sell" if side == "Buy" else "Buy"
-            try:
-                self.client.place_order(
-                    symbol=symbol, side=close_side, qty=close_qty,
-                    category=category, reduce_only=True,
-                )
-            except Exception:
-                logger.exception("SMC partial: failed to close %s", symbol)
-                self._smc_pnl_tracker.pop(symbol, None)
-                continue
-
-            # Calculate net PnL for closed part (after commission)
-            partial_pnl = self._calc_net_pnl(side, entry, cur_price, close_qty)
-
-            opened_at = trade.get("opened_at", datetime.utcnow().isoformat())
-
-            if remaining_qty <= 0:
-                # Closed everything
-                try:
-                    balance = self.client.get_balance()
-                    await self.db.close_trade(trade["id"], cur_price, partial_pnl)
-                    await self.db.update_daily_pnl(partial_pnl)
-                    await self._record_pnl(partial_pnl, balance)
-                except Exception:
-                    logger.exception("SMC partial: DB update failed %s", symbol)
-            else:
-                # Partial close — record and update remaining qty
-                try:
-                    balance = self.client.get_balance()
-                    await self.db.insert_partial_close(
-                        symbol=symbol, side=side, category=category,
-                        qty=close_qty, entry_price=entry, exit_price=cur_price,
-                        pnl=partial_pnl, stage=1, opened_at=opened_at,
-                    )
-                    await self.db.mark_scale_out(trade["id"], 1, remaining_qty)
-                    await self.db.update_daily_pnl(partial_pnl)
-                    await self._record_pnl(partial_pnl, balance)
-                except Exception:
-                    logger.exception("SMC partial: DB update failed %s", symbol)
-
-            # Notify
-            direction = "LONG" if side == "Buy" else "SHORT"
-            pct_str = f"{self._smc_partial_pct:.0f}%"
-            msg = (
-                f"📊 SMC Partial Close: {symbol}\n"
-                f"{direction} | Закрыто {pct_str} ({close_qty})\n"
-                f"Peak PnL: ${peak:.2f} → Now: ${net_pnl:.2f}\n"
-                f"Partial PnL: ${partial_pnl:.2f}\n"
-                f"Остаток: {remaining_qty}"
-            )
-            await self._notify(msg)
-
-            self._smc_pnl_tracker.pop(symbol, None)
-
-    async def _smc_check_graduated_tp(self, open_trades: list[dict]):
-        """Graduated TP: close portions at Fib extension levels.
-
-        3 stages by default:
-          Stage 0 → close 30% at Fib 1.0, then move SL to breakeven
-          Stage 1 → close 30% at Fib 1.272
-          Stage 2 → close 40% at Fib 1.618 (or trail)
-        """
-        for trade in open_trades:
-            symbol = trade["symbol"]
-            tracker = self._smc_graduated_tracker.get(symbol)
-            if not tracker:
-                continue
-
-            stage = tracker["stage"]
-            levels = tracker["levels"]
-            sizes = tracker["sizes"]
-            side = tracker["side"]
-            category = trade["category"]
-            entry = trade["entry_price"]
-            qty = trade["qty"]
-
-            if stage >= len(levels) or stage >= len(sizes):
-                self._smc_graduated_tracker.pop(symbol, None)
-                continue
-
-            # Get current price
-            try:
-                cur_price = self.client.get_last_price(symbol, category=category)
-            except Exception:
-                continue
-
-            target = levels[stage]
-            hit = False
-            if side == "Buy" and cur_price >= target:
-                hit = True
-            elif side == "Sell" and cur_price <= target:
-                hit = True
-
-            if not hit:
-                continue
-
-            # Calculate close qty for this stage
-            close_pct = sizes[stage]
-            close_qty = qty * close_pct
-
-            info = self._get_instrument_info(symbol, category)
-            close_qty = math.floor(close_qty / info["qty_step"]) * info["qty_step"]
-            close_qty = round(close_qty, 8)
-
-            if close_qty < info["min_qty"]:
-                # Too small — skip this stage
-                tracker["stage"] += 1
-                continue
-
-            remaining_qty = round(qty - close_qty, 8)
-            is_final = (stage == len(levels) - 1) or remaining_qty < info["min_qty"]
-            if is_final:
-                close_qty = qty
-                remaining_qty = 0
-
-            close_side = "Sell" if side == "Buy" else "Buy"
-            try:
-                self.client.place_order(
-                    symbol=symbol, side=close_side, qty=close_qty,
-                    category=category, reduce_only=True,
-                )
-            except Exception:
-                logger.exception("SMC graduated TP: failed to close %s stage %d", symbol, stage)
-                continue
-
-            # Net PnL for closed portion (after commission)
-            partial_pnl = self._calc_net_pnl(side, entry, cur_price, close_qty)
-
-            opened_at = trade.get("opened_at", datetime.utcnow().isoformat())
-            stage_num = stage + 1
-
-            if is_final:
-                try:
-                    balance = self.client.get_balance()
-                    await self.db.close_trade(trade["id"], cur_price, partial_pnl)
-                    await self.db.update_daily_pnl(partial_pnl)
-                    await self._record_pnl(partial_pnl, balance)
-                except Exception:
-                    logger.exception("SMC graduated TP: DB update failed %s", symbol)
-                self._smc_graduated_tracker.pop(symbol, None)
-            else:
-                try:
-                    balance = self.client.get_balance()
-                    await self.db.insert_partial_close(
-                        symbol=symbol, side=side, category=category,
-                        qty=close_qty, entry_price=entry, exit_price=cur_price,
-                        pnl=partial_pnl, stage=stage_num, opened_at=opened_at,
-                    )
-                    await self.db.mark_scale_out(trade["id"], stage_num, remaining_qty)
-                    await self.db.update_daily_pnl(partial_pnl)
-                    await self._record_pnl(partial_pnl, balance)
-                except Exception:
-                    logger.exception("SMC graduated TP: DB update failed %s", symbol)
-
-                tracker["stage"] += 1
-
-                # After stage 1: move SL to breakeven on EXCHANGE + DB
-                if stage == 0:
-                    try:
-                        if self.exchange_type == "bybit":
-                            self.client.session.set_trading_stop(
-                                category=category, symbol=symbol,
-                                stopLoss=str(round(entry, 6)), positionIdx=0,
-                            )
-                        await self.db.update_stop_loss(trade["id"], entry)
-                        logger.info("SMC graduated TP: %s SL → breakeven (%.6f) ON EXCHANGE", symbol, entry)
-                    except Exception:
-                        logger.exception("SMC graduated TP: failed to move SL to breakeven %s", symbol)
-
-            direction = "LONG" if side == "Buy" else "SHORT"
-            ext_name = levels[stage] if stage < len(levels) else "final"
-            msg = (
-                f"📊 SMC Graduated TP Stage {stage_num}: {symbol}\n"
-                f"{direction} | Closed {close_pct*100:.0f}% ({close_qty}) at {ext_name}\n"
-                f"PnL: ${partial_pnl:.2f}\n"
-                f"Remaining: {remaining_qty}"
-            )
-            await self._notify(msg)
 
     async def _run_loop(self):
         interval_sec = self._timeframe_to_seconds(self.timeframe)
@@ -1100,25 +805,6 @@ class TradingEngine:
                 symbol, side, category, result.score, result.details,
                 atr=atr, df=df,
             )
-
-            # Store graduated TP levels for this position (ATR-based, not raw Fib)
-            if self._smc_graduated_tp_enabled and atr and atr > 0:
-                price = self.client.get_last_price(symbol, category=category)
-                # Use ATR multipliers for stages: 1.0 ATR, 1.5 ATR, 2.0 ATR
-                stage_mults = self._smc_tp_stages  # [1.0, 1.272, 1.618] used as ATR multipliers
-                if side == "Buy":
-                    levels = [round(price + atr * m, 6) for m in stage_mults]
-                else:
-                    levels = [round(price - atr * m, 6) for m in stage_mults]
-                self._smc_graduated_tracker[symbol] = {
-                    "levels": levels,
-                    "sizes": list(self._smc_tp_sizes),
-                    "stage": 0,
-                    "side": side,
-                }
-                stage_pcts = [abs(l - price) / price * 100 for l in levels]
-                logger.info("SMC graduated TP: %s stages=%s (%.2f%%, %.2f%%, %.2f%%) sizes=%s",
-                            symbol, levels, *stage_pcts, self._smc_tp_sizes)
             return
 
         # ── Turtle Trading path: Donchian breakout + pyramiding ──
@@ -1570,14 +1256,10 @@ class TradingEngine:
                 sl_source += f"→cap${max_sl_usd}"
                 logger.info("SL capped: %s $%.0f → $%.0f (max_sl_usd=%d)", symbol, sl_loss, max_sl_usd, max_sl_usd)
 
-        if smc_tp is not None and not self._smc_graduated_tp_enabled:
+        if smc_tp is not None:
             tp = smc_tp
             tp_dist_pct = abs(tp - price) / price * 100
             tp_source = f"SMC:fib_ext({tp_dist_pct:.2f}%)"
-        elif smc_tp is not None and self._smc_graduated_tp_enabled:
-            # Graduated TP manages exits — no DB TP needed
-            tp = 0
-            tp_source = "graduated_tp(no_db_tp)"
         elif ai_tp_pct is not None and 0.5 <= ai_tp_pct <= 10.0:
             tp = price * (1 + ai_tp_pct / 100) if side == "Buy" else price * (1 - ai_tp_pct / 100)
             tp = round(tp, 6)
@@ -2411,10 +2093,6 @@ class TradingEngine:
             await self._record_pnl(net_pnl, balance)
         except Exception:
             logger.exception("DB stop-loss: DB update failed for %s", symbol)
-
-        # Clean up graduated TP tracker
-        self._smc_graduated_tracker.pop(symbol, None)
-        self._smc_pnl_tracker.pop(symbol, None)
 
         direction = "ЛОНГ" if side == "Buy" else "ШОРТ"
         fee = self._calc_fee(entry, cur_price, qty)
