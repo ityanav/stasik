@@ -134,9 +134,19 @@ class BybitClient(ExchangeClient):
                         "mark_price": float(p.get("markPrice") or 0),
                         "unrealised_pnl": float(p["unrealisedPnl"]),
                         "leverage": p["leverage"],
+                        "position_im": float(p.get("positionIM") or 0),
                     }
                 )
         return positions
+
+    def get_used_margin(self, symbols: list[str] | None = None, category: str = "linear") -> float:
+        """Sum of positionIM (initial margin) for given symbols. If symbols=None, sum all."""
+        positions = self.get_positions(category=category)
+        total = 0.0
+        for p in positions:
+            if symbols is None or p["symbol"] in symbols:
+                total += p["position_im"]
+        return total
 
     def get_all_leverage(self, category: str = "linear") -> dict[str, str]:
         """Return {symbol: leverage_string} for all pairs (including no open positions)."""

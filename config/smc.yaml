@@ -1,0 +1,130 @@
+instance_name: "SMC"
+initial_balance: 164235
+
+database:
+  path: "/root/stasik/data/smc.db"
+
+bybit:
+  testnet: false
+  demo: true
+  api_key: "Ct24OvPFimR3vLSlcW"
+  api_secret: "CNzK2w9eQ41j4A4dszBLvvOkAH61Z5BQG9oq"
+
+trading:
+  pairs: ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "AVAXUSDT", "LINKUSDT", "SUIUSDT", "APTUSDT"]
+  market_type: "futures"
+  timeframe: "15"          # 15m entry
+  htf_timeframe: "60"      # 1H structure (swings + fib)
+  leverage: 3
+  trading_hours: [0, 24]
+  tick_interval: 60         # every minute
+
+strategy:
+  strategy_mode: "smc"
+  min_score: 3
+  adx_min: 0
+  adx_max: 0
+  adx_period: 14
+  ema_fast: 9
+  ema_slow: 21
+  rsi_period: 14
+  bb_period: 20
+  bb_std: 2.0
+  vol_period: 20
+  vol_threshold: 1.5
+  sma_period: 25
+  htf_filter: false
+  htf_min_sma_dev: 0.0
+  htf_score_min: 0
+  market_bias: false
+  fng_extreme_greed: 100
+  fng_extreme_fear: 0
+  funding_rate_max: 999
+  orderbook_enabled: false
+  patterns_enabled: false
+  reversal_confirmation: false
+  macd_fast: 12
+  macd_slow: 26
+  macd_signal: 9
+
+smc:
+  swing_lookback: 5
+  swing_min_distance: 10
+  fib_premium_min: 0.618
+  fib_premium_max: 0.786
+  fib_standard_min: 0.382
+  fib_standard_max: 0.618
+  sweep_lookback: 30
+  sweep_fresh_candles: 5
+  fvg_lookback: 20
+  fvg_proximity_pct: 0.5
+  displacement_body_pct: 0.3
+  displacement_vol_mult: 1.5
+  ob_lookback: 50
+  ob_proximity_pct: 1.0
+  ob_displacement_pct: 1.5
+  tp_extension_1: 1.0
+  tp_extension_2: 1.272
+  adx_max: 0
+  partial_close_enabled: true
+  partial_close_threshold: 100    # start tracking when net PnL > $100
+  partial_close_pullback: 0.30    # close when PnL drops 30% from peak
+  partial_close_pct: 50           # close 50% of position
+
+risk:
+  risk_per_trade: 1.5
+  max_open_positions: 6
+  max_per_group: 2
+  commission_rate: 0.055
+  max_margin_usdt: 50000             # Max initial margin for this instance ($)
+  min_tp_net: 200
+  cooldown_after_loss: 5
+  stop_loss: 2.0
+  take_profit: 4.0
+  atr_period: 14
+  atr_sl_multiplier: 1.5
+  atr_tp_multiplier: 2.0
+  atr_trailing_multiplier: 1.0
+  atr_sl_max: 5.0
+  atr_sl_min: 0.5
+  atr_tp_max: 5.0
+  atr_tp_min: 1.0
+  atr_trail_max: 3.0
+  atr_trail_min: 0.3
+  trailing_stop: 0
+  trailing_activation: 0
+  breakeven_activation: 0
+  max_daily_loss: 5.0
+  smart_exit_min: 0
+  partial_close_enabled: false
+  correlation_groups:
+    majors:
+      - BTCUSDT
+      - ETHUSDT
+    alt_l1:
+      - SOLUSDT
+      - AVAXUSDT
+      - APTUSDT
+      - SUIUSDT
+    mid_cap:
+      - XRPUSDT
+      - LINKUSDT
+
+ai:
+  enabled: false
+  api_key: "sk-2dec36c8752d48b6b2cfdedd21337126"
+  provider: deepseek
+  model: deepseek-chat
+  min_confidence: 5
+  timeout: 10
+  review_interval: 9999
+  style: smc
+  extra_timeframes: ["5", "15", "60"]
+
+telegram:
+  token: "7852966698:AAFA_L6ovqXtTmMO05DBZg3UYbx4DklIY7k"
+  chat_id: "885025581"
+  notify_only: true
+
+dashboard:
+  enabled: false

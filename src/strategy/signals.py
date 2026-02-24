@@ -13,13 +13,18 @@ from src.strategy.indicators import (
     calculate_bollinger_pband,
     calculate_donchian,
     calculate_ema,
+    calculate_fibonacci_levels,
     calculate_macd,
     calculate_rsi,
     calculate_sma_deviation,
     calculate_volume_signal,
     detect_candlestick_patterns,
+    detect_displacement,
+    detect_fair_value_gap,
+    detect_liquidity_sweep,
     detect_order_blocks,
     detect_rsi_divergence,
+    detect_swing_points,
 )
 
 logger = logging.getLogger(__name__)
@@ -914,6 +919,277 @@ class TurtleGenerator:
         symbol = df.attrs.get("symbol", "?")
         logger.info(
             "HTF тренд %s: %s (EMA%d=%.4f, EMA%d=%.4f, price=%.4f)",
+            symbol, trend.value, self.ema_fast, fast_val, self.ema_slow, slow_val, price,
+        )
+        return trend
+
+
+class SMCGenerator:
+    """SMC/ICT: Fibonacci + Liquidity Sweep + Order Blocks.
+
+    Smart Money Concepts strategy — precision entries at Fibonacci
+    retracement zones after liquidity sweeps (stop hunts).
+
+    7 indicators (scoring):
+      1. fib_zone    — price in Fib retracement zone (±2 premium, ±1 standard)
+      2. liq_sweep   — liquidity sweep detected (±2 fresh, ±1 old)
+      3. fvg         — Fair Value Gap nearby (±1)
+      4. order_block — ICT Order Block (±1)
+      5. displacement — impulsive candle (±1)
+      6. volume      — above-average directional volume (±1)
+      7. rsi_div     — RSI divergence bonus (±1)
+
+    min_score: 3 (need confluence). Max score ±9.
+    """
+
+    def __init__(self, config: dict):
+        smc = config.get("smc", {})
+        strat = config.get("strategy", {})
+
+        # Swing detection
+        self.swing_lookback = smc.get("swing_lookback", 5)
+        self.swing_min_distance = smc.get("swing_min_distance", 10)
+
+        # Fibonacci zones
+        self.fib_premium_min = smc.get("fib_premium_min", 0.618)
+        self.fib_premium_max = smc.get("fib_premium_max", 0.786)
+        self.fib_standard_min = smc.get("fib_standard_min", 0.382)
+        self.fib_standard_max = smc.get("fib_standard_max", 0.618)
+
+        # Liquidity sweep
+        self.sweep_lookback = smc.get("sweep_lookback", 30)
+        self.sweep_fresh_candles = smc.get("sweep_fresh_candles", 5)
+
+        # FVG
+        self.fvg_lookback = smc.get("fvg_lookback", 20)
+        self.fvg_proximity_pct = smc.get("fvg_proximity_pct", 0.5)
+
+        # Displacement
+        self.displacement_body_pct = smc.get("displacement_body_pct", 0.3)
+        self.displacement_vol_mult = smc.get("displacement_vol_mult", 1.5)
+
+        # Order Blocks (reuse existing detect_order_blocks)
+        self.ob_lookback = smc.get("ob_lookback", 50)
+        self.ob_proximity_pct = smc.get("ob_proximity_pct", 1.0)
+        self.ob_displacement_pct = smc.get("ob_displacement_pct", 1.5)
+
+        # TP extensions
+        self.tp_extension_1 = smc.get("tp_extension_1", 1.272)
+        self.tp_extension_2 = smc.get("tp_extension_2", 1.618)
+
+        # ADX max (optional regime filter)
+        self.adx_max = smc.get("adx_max", 0)
+
+        # Volume
+        self.vol_period = strat.get("vol_period", 20)
+        self.vol_threshold = strat.get("vol_threshold", 1.5)
+
+        # RSI
+        self.rsi_period = strat.get("rsi_period", 14)
+
+        # Scoring
+        self.min_score = strat.get("min_score", 3)
+
+        # EMA for HTF trend
+        self.ema_fast = strat.get("ema_fast", 9)
+        self.ema_slow = strat.get("ema_slow", 21)
+
+        # Per-symbol caches (updated by engine via update_structure)
+        self._htf_swings: dict[str, dict] = {}      # symbol -> swing_points
+        self._fib_levels: dict[str, dict] = {}       # symbol -> fib levels
+        self._fib_direction: dict[str, str] = {}     # symbol -> "bullish"/"bearish"
+
+    def update_structure(self, symbol: str, swings: dict, htf_df: pd.DataFrame):
+        """Cache HTF swing structure and compute Fibonacci levels.
+
+        Called by engine before generate() with HTF data.
+        """
+        self._htf_swings[symbol] = swings
+
+        last_high = swings.get("last_swing_high")
+        last_low = swings.get("last_swing_low")
+        if not last_high or not last_low:
+            self._fib_levels[symbol] = {}
+            self._fib_direction[symbol] = ""
+            return
+
+        high_idx, high_price = last_high
+        low_idx, low_price = last_low
+
+        # Direction: if most recent swing is a high → bearish retracement
+        #            if most recent swing is a low → bullish retracement
+        if high_idx > low_idx:
+            direction = "bearish"
+        else:
+            direction = "bullish"
+
+        self._fib_direction[symbol] = direction
+        self._fib_levels[symbol] = calculate_fibonacci_levels(
+            high_price, low_price, direction
+        )
+
+    def generate(self, df: pd.DataFrame, symbol: str = "?", orderbook: dict | None = None) -> SignalResult:
+        df.attrs["symbol"] = symbol
+        scores: dict[str, int] = {}
+        details: dict = {}
+
+        fib = self._fib_levels.get(symbol, {})
+        direction = self._fib_direction.get(symbol, "")
+        swings = self._htf_swings.get(symbol, {})
+
+        if not fib or not direction:
+            return SignalResult(signal=Signal.HOLD, score=0, details={"no_structure": True})
+
+        close = df["close"].iloc[-1]
+        retracement = fib.get("retracement", {})
+        extensions = fib.get("extension", {})
+
+        # ── ADX regime filter (optional) ──
+        if self.adx_max > 0 and len(df) >= 30:
+            adx = calculate_adx(df, period=14)
+            if adx > self.adx_max:
+                logger.info("SMC %s: HOLD (ADX=%.1f > %d)", symbol, adx, self.adx_max)
+                return SignalResult(signal=Signal.HOLD, score=0,
+                                    details={"regime_filter": True, "adx": round(adx, 1)})
+
+        # ── 1. Fibonacci zone scoring ──
+        fib_score = 0
+        fib_zone_name = ""
+        if retracement:
+            fib_0382 = retracement.get(0.382, 0)
+            fib_0618 = retracement.get(0.618, 0)
+            fib_0786 = retracement.get(0.786, 0)
+
+            if direction == "bullish":
+                # Buy zone: price retraced DOWN
+                premium_low = min(fib_0618, fib_0786)
+                premium_high = max(fib_0618, fib_0786)
+                standard_low = min(fib_0382, fib_0618)
+                standard_high = max(fib_0382, fib_0618)
+
+                if premium_low <= close <= premium_high:
+                    fib_score = 2
+                    fib_zone_name = "premium_buy"
+                elif standard_low <= close <= standard_high:
+                    fib_score = 1
+                    fib_zone_name = "standard_buy"
+            else:
+                # Sell zone: price retraced UP
+                premium_low = min(fib_0618, fib_0786)
+                premium_high = max(fib_0618, fib_0786)
+                standard_low = min(fib_0382, fib_0618)
+                standard_high = max(fib_0382, fib_0618)
+
+                if premium_low <= close <= premium_high:
+                    fib_score = -2
+                    fib_zone_name = "premium_sell"
+                elif standard_low <= close <= standard_high:
+                    fib_score = -1
+                    fib_zone_name = "standard_sell"
+
+        scores["fib_zone"] = fib_score
+        details["fib_zone_name"] = fib_zone_name
+
+        # ── 2. Liquidity sweep scoring ──
+        sweep = detect_liquidity_sweep(
+            df, swings,
+            lookback=self.sweep_lookback,
+            fresh_candles=self.sweep_fresh_candles,
+        )
+        scores["liq_sweep"] = sweep["score"]
+        details["sweep_type"] = sweep["type"]
+        details["swept_level"] = sweep["swept_level"]
+        details["sweep_fresh"] = sweep["is_fresh"]
+
+        # ── 3. Fair Value Gap scoring ──
+        fvg = detect_fair_value_gap(
+            df, lookback=self.fvg_lookback, proximity_pct=self.fvg_proximity_pct,
+        )
+        scores["fvg"] = fvg["score"]
+
+        # ── 4. Order Block scoring (reuse existing) ──
+        ob = detect_order_blocks(
+            df,
+            lookback=self.ob_lookback,
+            proximity_pct=self.ob_proximity_pct,
+            displacement_pct=self.ob_displacement_pct,
+        )
+        scores["order_block"] = ob["score"]
+
+        # ── 5. Displacement scoring ──
+        disp = detect_displacement(
+            df,
+            body_pct=self.displacement_body_pct,
+            vol_mult=self.displacement_vol_mult,
+        )
+        scores["displacement"] = disp["score"]
+
+        # ── 6. Volume scoring ──
+        _, vol_ratio = calculate_volume_signal(df, self.vol_period)
+        if vol_ratio >= self.vol_threshold:
+            candle_change = close - df["open"].iloc[-1]
+            if candle_change > 0:
+                scores["volume"] = 1
+            elif candle_change < 0:
+                scores["volume"] = -1
+            else:
+                scores["volume"] = 0
+        else:
+            scores["volume"] = 0
+        details["vol_ratio"] = round(vol_ratio, 2)
+
+        # ── 7. RSI divergence bonus ──
+        rsi_div = detect_rsi_divergence(df, self.rsi_period)
+        scores["rsi_div"] = rsi_div
+
+        total = sum(scores.values())
+
+        if total >= self.min_score:
+            signal = Signal.BUY
+        elif total <= -self.min_score:
+            signal = Signal.SELL
+        else:
+            signal = Signal.HOLD
+
+        # TP levels from Fibonacci extensions
+        if extensions:
+            details["tp1_level"] = round(extensions.get(self.tp_extension_1, 0), 6)
+            details["tp2_level"] = round(extensions.get(self.tp_extension_2, 0), 6)
+
+        # Store sweep level for SL calculation in engine
+        details["sweep_level"] = sweep["swept_level"]
+        details["fib_direction"] = direction
+
+        logger.info(
+            "SMC %s: %s (score=%d, fib=%d[%s], sweep=%d[%s], fvg=%d, ob=%d, disp=%d, vol=%d, rsi_div=%d)",
+            symbol, signal.value, total,
+            scores["fib_zone"], fib_zone_name,
+            scores["liq_sweep"], sweep["type"],
+            scores["fvg"], scores["order_block"],
+            scores["displacement"], scores["volume"], scores["rsi_div"],
+        )
+        return SignalResult(signal=signal, score=total, details={**details, **scores})
+
+    def get_htf_trend(self, df: pd.DataFrame) -> Trend:
+        """HTF trend for SMC — EMA-based."""
+        if len(df) < self.ema_slow + 2:
+            return Trend.NEUTRAL
+
+        ema_fast, ema_slow = calculate_ema(df, self.ema_fast, self.ema_slow)
+        fast_val = ema_fast.iloc[-1]
+        slow_val = ema_slow.iloc[-1]
+        price = df["close"].iloc[-1]
+
+        if fast_val > slow_val and price > fast_val:
+            trend = Trend.BULLISH
+        elif fast_val < slow_val and price < fast_val:
+            trend = Trend.BEARISH
+        else:
+            trend = Trend.NEUTRAL
+
+        symbol = df.attrs.get("symbol", "?")
+        logger.info(
+            "SMC HTF %s: %s (EMA%d=%.4f, EMA%d=%.4f, price=%.4f)",
             symbol, trend.value, self.ema_fast, fast_val, self.ema_slow, slow_val, price,
         )
         return trend

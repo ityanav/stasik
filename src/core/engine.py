@@ -11,8 +11,8 @@ from src.exchange.base import ExchangeClient
 from src.risk.manager import RiskManager
 from src.storage.database import Database
 from src.strategy.ai_analyst import AIAnalyst, extract_indicator_values, format_risk_text, summarize_candles
-from src.strategy.indicators import calculate_atr, calculate_sma_deviation
-from src.strategy.signals import GrinderGenerator, KotegawaGenerator, MomentumGenerator, Signal, SignalGenerator, SignalResult, Trend, TurtleGenerator
+from src.strategy.indicators import calculate_atr, calculate_sma_deviation, detect_swing_points
+from src.strategy.signals import GrinderGenerator, KotegawaGenerator, MomentumGenerator, SMCGenerator, Signal, SignalGenerator, SignalResult, Trend, TurtleGenerator
 
 logger = logging.getLogger(__name__)
 
@@ -151,6 +151,24 @@ class TradingEngine:
         self._turtle_pyramid_n_mult: float = turtle_cfg.get("pyramid_n_mult", 0.5)
         self._turtle_sl_n_mult: float = turtle_cfg.get("sl_n_mult", 2.0)
 
+        # SMC mode
+        smc_cfg = config.get("smc", {})
+        self._smc_mode: bool = config.get("strategy", {}).get("strategy_mode") == "smc" and bool(smc_cfg)
+        self._smc_htf_structure_cache: dict[str, tuple[dict, float]] = {}  # symbol -> (swings, timestamp)
+        self._smc_structure_interval: int = 300  # refresh HTF structure every 5 min
+
+        # SMC PnL momentum partial close
+        self._smc_partial_enabled: bool = smc_cfg.get("partial_close_enabled", False)
+        self._smc_partial_threshold: float = smc_cfg.get("partial_close_threshold", 100)  # min net PnL $ to start tracking
+        self._smc_partial_pullback: float = smc_cfg.get("partial_close_pullback", 0.3)  # close when PnL drops 30% from peak
+        self._smc_partial_pct: float = smc_cfg.get("partial_close_pct", 50)  # close 50% of position
+        self._smc_pnl_tracker: dict[str, dict] = {}  # symbol -> {peak_pnl, prev_pnl, samples}
+
+        # Max margin per instance
+        self._max_margin_usdt: float = config["risk"].get("max_margin_usdt", 0)
+        self._margin_cache: tuple[float, float] = (0.0, 0.0)  # (used_margin, timestamp)
+        self._margin_cache_ttl: int = 30  # seconds
+
         # Weekly report
         self._weekly_report_day: int = config.get("weekly_report_day", 0)  # 0=Monday
         self._last_weekly_report: str = ""  # ISO date of last report
@@ -180,6 +198,9 @@ class TradingEngine:
         if mode == "turtle":
             logger.info("Strategy mode: Turtle Trading (Donchian breakout)")
             return TurtleGenerator(config)
+        if mode == "smc":
+            logger.info("Strategy mode: SMC/ICT (Fibonacci + Liquidity Sweep)")
+            return SMCGenerator(config)
         return SignalGenerator(config)
 
     def _update_market_bias(self):
@@ -429,6 +450,7 @@ class TradingEngine:
             return
 
         # Refresh subscriptions & check SL/TP every 2s
+        self._ws_reconcile_counter = 0
         while self._running:
             try:
                 # Get current open trades with SL/TP
@@ -481,6 +503,12 @@ class TradingEngine:
                             await self._check_db_take_profit_with_price(trade, cur_price)
                         except Exception:
                             logger.exception("TP monitor error %s", sym)
+
+                # Detect manually closed positions (every 15th iteration = ~30s)
+                self._ws_reconcile_counter += 1
+                if open_trades and self._ws_reconcile_counter >= 15:
+                    self._ws_reconcile_counter = 0
+                    await self._detect_closed_positions(open_trades)
             except Exception:
                 logger.exception("SL/TP WS monitor error")
             await asyncio.sleep(2)
@@ -498,6 +526,7 @@ class TradingEngine:
 
     async def _run_sl_tp_poll(self):
         """Fast polling SL/TP check every 5 seconds."""
+        self._reconcile_poll_counter = 0
         while self._running:
             try:
                 open_trades = await self.db.get_open_trades()
@@ -520,9 +549,199 @@ class TradingEngine:
                 # Grinder hedge: open opposite when position goes negative
                 if self._grinder_mode and self._grinder_hedge_enabled:
                     await self._grinder_check_hedge(open_trades)
+                # SMC PnL momentum partial close
+                if self._smc_mode and self._smc_partial_enabled:
+                    await self._smc_check_partial_close(open_trades)
+                # Detect manually closed positions (every 6th poll = ~30s)
+                self._reconcile_poll_counter += 1
+                if open_trades and self._reconcile_poll_counter >= 6:
+                    self._reconcile_poll_counter = 0
+                    await self._detect_closed_positions(open_trades)
             except Exception:
                 logger.exception("SL/TP poll error")
             await asyncio.sleep(5)
+
+    async def _detect_closed_positions(self, open_trades: list[dict]):
+        """Detect positions closed externally (manually or by exchange SL/TP).
+
+        Runs every ~30s inside the poll loop. Fetches exchange positions once
+        and compares with DB open trades.
+        """
+        try:
+            if self.exchange_type == "tbank":
+                exchange_positions = self.client.get_positions()
+            else:
+                exchange_positions = self.client.get_positions(category="linear")
+
+            exch_open = set()
+            for p in exchange_positions:
+                if p["size"] > 0:
+                    exch_open.add((p["symbol"], p["side"]))
+
+            for trade in open_trades:
+                key = (trade["symbol"], trade["side"])
+                if key not in exch_open:
+                    logger.info("Detected externally closed position: %s %s (trade #%d)",
+                                trade["side"], trade["symbol"], trade["id"])
+                    try:
+                        await self._check_trade_closed(trade)
+                    except Exception:
+                        logger.exception("Failed to process externally closed trade #%d", trade["id"])
+        except Exception:
+            logger.exception("_detect_closed_positions error")
+
+    async def _smc_check_partial_close(self, open_trades: list[dict]):
+        """Close part of SMC position when PnL momentum fades.
+
+        Logic:
+        - Track unrealized net PnL for each open position
+        - When net PnL > threshold ($100): start tracking peak PnL
+        - When PnL drops by pullback% from peak: close partial_pct% of position
+        - Only fires once per position (uses partial_closed flag)
+        """
+        commission_rate = self.risk.commission_rate
+
+        for trade in open_trades:
+            symbol = trade["symbol"]
+            side = trade["side"]
+            entry = trade["entry_price"]
+            qty = trade["qty"]
+            category = trade["category"]
+
+            # Skip if already partially closed
+            if (trade.get("partial_closed") or 0) > 0:
+                self._smc_pnl_tracker.pop(symbol, None)
+                continue
+
+            # Get current price
+            try:
+                cur_price = self.client.get_last_price(symbol, category=category)
+            except Exception:
+                continue
+
+            # Calculate unrealized net PnL
+            if side == "Buy":
+                gross_pnl = (cur_price - entry) * qty
+            else:
+                gross_pnl = (entry - cur_price) * qty
+            round_trip_fee = entry * qty * commission_rate * 2
+            net_pnl = gross_pnl - round_trip_fee
+
+            tracker = self._smc_pnl_tracker.get(symbol)
+
+            if net_pnl < self._smc_partial_threshold:
+                # Below threshold — reset tracker
+                if tracker:
+                    self._smc_pnl_tracker.pop(symbol, None)
+                continue
+
+            # Above threshold — start/update tracking
+            if not tracker:
+                self._smc_pnl_tracker[symbol] = {
+                    "peak_pnl": net_pnl,
+                    "prev_pnl": net_pnl,
+                    "samples": 1,
+                }
+                logger.info("SMC partial: %s tracking started, net PnL=$%.2f", symbol, net_pnl)
+                continue
+
+            tracker["samples"] += 1
+
+            # Update peak
+            if net_pnl > tracker["peak_pnl"]:
+                tracker["peak_pnl"] = net_pnl
+                tracker["prev_pnl"] = net_pnl
+                return  # still growing, wait
+
+            # Check pullback from peak
+            peak = tracker["peak_pnl"]
+            pullback_ratio = (peak - net_pnl) / peak if peak > 0 else 0
+
+            if pullback_ratio < self._smc_partial_pullback:
+                tracker["prev_pnl"] = net_pnl
+                return  # pullback not deep enough yet
+
+            # ── Pullback triggered: close partial ──
+            logger.info(
+                "SMC partial: %s peak=$%.2f, now=$%.2f, pullback=%.0f%% → closing %.0f%%",
+                symbol, peak, net_pnl, pullback_ratio * 100, self._smc_partial_pct,
+            )
+
+            close_pct = self._smc_partial_pct / 100
+            close_qty = qty * close_pct
+
+            # Round to exchange step
+            info = self._get_instrument_info(symbol, category)
+            close_qty = math.floor(close_qty / info["qty_step"]) * info["qty_step"]
+            close_qty = round(close_qty, 8)
+
+            if close_qty < info["min_qty"]:
+                logger.info("SMC partial: %s close_qty too small, skipping", symbol)
+                self._smc_pnl_tracker.pop(symbol, None)
+                continue
+
+            remaining_qty = round(qty - close_qty, 8)
+            if remaining_qty < info["min_qty"]:
+                # Remainder too small — close everything
+                close_qty = qty
+                remaining_qty = 0
+
+            close_side = "Sell" if side == "Buy" else "Buy"
+            try:
+                self.client.place_order(
+                    symbol=symbol, side=close_side, qty=close_qty,
+                    category=category, reduce_only=True,
+                )
+            except Exception:
+                logger.exception("SMC partial: failed to close %s", symbol)
+                self._smc_pnl_tracker.pop(symbol, None)
+                continue
+
+            # Calculate PnL for closed part
+            if side == "Buy":
+                partial_pnl = (cur_price - entry) * close_qty
+            else:
+                partial_pnl = (entry - cur_price) * close_qty
+
+            opened_at = trade.get("opened_at", datetime.utcnow().isoformat())
+
+            if remaining_qty <= 0:
+                # Closed everything
+                try:
+                    balance = self.client.get_balance()
+                    await self.db.close_trade(trade["id"], cur_price, partial_pnl)
+                    await self.db.update_daily_pnl(partial_pnl)
+                    await self._record_pnl(partial_pnl, balance)
+                except Exception:
+                    logger.exception("SMC partial: DB update failed %s", symbol)
+            else:
+                # Partial close — record and update remaining qty
+                try:
+                    balance = self.client.get_balance()
+                    await self.db.insert_partial_close(
+                        symbol=symbol, side=side, category=category,
+                        qty=close_qty, entry_price=entry, exit_price=cur_price,
+                        pnl=partial_pnl, stage=1, opened_at=opened_at,
+                    )
+                    await self.db.mark_scale_out(trade["id"], 1, remaining_qty)
+                    await self.db.update_daily_pnl(partial_pnl)
+                    await self._record_pnl(partial_pnl, balance)
+                except Exception:
+                    logger.exception("SMC partial: DB update failed %s", symbol)
+
+            # Notify
+            direction = "LONG" if side == "Buy" else "SHORT"
+            pct_str = f"{self._smc_partial_pct:.0f}%"
+            msg = (
+                f"📊 SMC Partial Close: {symbol}\n"
+                f"{direction} | Закрыто {pct_str} ({close_qty})\n"
+                f"Peak PnL: ${peak:.2f} → Now: ${net_pnl:.2f}\n"
+                f"Partial PnL: ${partial_pnl:.2f}\n"
+                f"Остаток: {remaining_qty}"
+            )
+            await self._notify(msg)
+
+            self._smc_pnl_tracker.pop(symbol, None)
 
     async def _run_loop(self):
         interval_sec = self._timeframe_to_seconds(self.timeframe)
@@ -689,7 +908,87 @@ class TradingEngine:
 
             if not self.risk.can_open_position(len(open_trades)):
                 return
+            if not self._check_margin_limit():
+                return
             await self._open_grinder_trade(symbol, side, category, result.details)
+            return
+
+        # ── SMC/ICT path: Fibonacci + Liquidity Sweep ──
+        if self._smc_mode:
+            now = time.time()
+
+            # 1. Fetch/cache HTF structure (1H klines → swing points)
+            cached = self._smc_htf_structure_cache.get(symbol)
+            if cached and (now - cached[1]) < self._smc_structure_interval:
+                swings = cached[0]
+            else:
+                htf_df = self.client.get_klines(
+                    symbol=symbol, interval=self.htf_timeframe, limit=200, category=category
+                )
+                if len(htf_df) < 30:
+                    return
+                smc_cfg = self.config.get("smc", {})
+                swings = detect_swing_points(
+                    htf_df,
+                    lookback=smc_cfg.get("swing_lookback", 5),
+                    min_distance=smc_cfg.get("swing_min_distance", 10),
+                )
+                self._smc_htf_structure_cache[symbol] = (swings, now)
+
+                if not swings.get("last_swing_high") or not swings.get("last_swing_low"):
+                    logger.debug("SMC %s: no swing structure found on HTF", symbol)
+                    return
+
+                # 2. Update signal generator with HTF structure
+                self.signal_gen.update_structure(symbol, swings, htf_df)
+
+            if not swings.get("last_swing_high") or not swings.get("last_swing_low"):
+                return
+
+            # 3. Fetch entry TF klines (15m)
+            df = self.client.get_klines(
+                symbol=symbol, interval=self.timeframe, limit=200, category=category
+            )
+            if len(df) < 50:
+                return
+
+            # 4. Generate signal
+            result = self.signal_gen.generate(df, symbol)
+            if result.signal == Signal.HOLD:
+                return
+
+            side = "Buy" if result.signal == Signal.BUY else "Sell"
+
+            # 5. Check existing positions
+            open_trades = await self.db.get_open_trades()
+            symbol_open = [t for t in open_trades if t["symbol"] == symbol]
+            if symbol_open:
+                return
+
+            if not self.risk.can_open_position(len(open_trades)):
+                return
+
+            if not self._check_margin_limit():
+                return
+
+            # Correlation group limit
+            group = self._corr_groups.get(symbol)
+            if group:
+                group_open = sum(
+                    1 for t in open_trades
+                    if self._corr_groups.get(t["symbol"]) == group
+                )
+                if group_open >= self._max_per_group:
+                    logger.info("SMC корреляция: отклонён %s — %d/%d в группе '%s'",
+                                symbol, group_open, self._max_per_group, group)
+                    return
+
+            # 6. Open trade with SMC SL/TP
+            atr = calculate_atr(df, self._atr_period)
+            await self._open_trade(
+                symbol, side, category, result.score, result.details,
+                atr=atr, df=df,
+            )
             return
 
         # ── Turtle Trading path: Donchian breakout + pyramiding ──
@@ -725,6 +1024,8 @@ class TradingEngine:
                     else:
                         return
                 if not self.risk.can_open_position(len(open_trades)):
+                    return
+                if not self._check_margin_limit():
                     return
                 await self._open_turtle_trade(symbol, side, category, n_value, system, df)
             elif not symbol_open and turtle_state:
@@ -905,6 +1206,9 @@ class TradingEngine:
         if not is_scale_in and not self.risk.can_open_position(open_count):
             return
 
+        if not self._check_margin_limit():
+            return
+
         # Correlation group limit
         group = self._corr_groups.get(symbol)
         if group:
@@ -1073,6 +1377,29 @@ class TradingEngine:
             df=df,
         )
 
+    def _check_margin_limit(self) -> bool:
+        """Check if instance margin limit is exceeded. Returns True if OK to trade."""
+        if self._max_margin_usdt <= 0:
+            return True  # disabled
+        now = time.time()
+        cached_margin, cached_ts = self._margin_cache
+        if now - cached_ts < self._margin_cache_ttl:
+            used = cached_margin
+        else:
+            try:
+                used = self.client.get_used_margin(self.pairs)
+                self._margin_cache = (used, now)
+            except Exception as e:
+                logger.warning("Margin check failed: %s — allowing trade", e)
+                return True
+        if used >= self._max_margin_usdt:
+            logger.info(
+                "Margin limit: %s used $%.0f / $%.0f — blocking new entry",
+                self.instance_name, used, self._max_margin_usdt,
+            )
+            return False
+        return True
+
     async def _open_trade(
         self, symbol: str, side: str, category: str, score: int, details: dict,
         ai_reasoning: str = "",
@@ -1139,9 +1466,39 @@ class TradingEngine:
             logger.info("Position size too small for %s, skipping", symbol)
             return
 
-        # SL/TP priority: Kotegawa (recent low/high) > AI > ATR > fixed
+        # SL/TP priority: SMC (swept_level+ATR) > Kotegawa (recent low/high) > AI > ATR > fixed
         sl_source = "fixed"
         tp_source = "fixed"
+
+        # SMC SL/TP: behind swept_level + 0.5 ATR buffer; TP from Fib extension
+        smc_sl = None
+        smc_tp = None
+        if isinstance(self.signal_gen, SMCGenerator) and details:
+            sweep_level = details.get("sweep_level", 0)
+            tp1_level = details.get("tp1_level", 0)
+            atr_buf = atr * 0.5 if atr and atr > 0 else 0
+            if sweep_level and sweep_level > 0:
+                if side == "Buy":
+                    smc_sl = round(sweep_level - atr_buf, 6)
+                else:
+                    smc_sl = round(sweep_level + atr_buf, 6)
+            if tp1_level and tp1_level > 0:
+                smc_tp = round(tp1_level, 6)
+                # Cap SMC TP by ATR multiplier so it doesn't overshoot
+                if atr and atr > 0:
+                    max_tp_dist = atr * self._atr_tp_mult
+                    if side == "Buy":
+                        atr_cap = round(price + max_tp_dist, 6)
+                        if smc_tp > atr_cap:
+                            logger.info("SMC TP capped: %s %.6f → %.6f (ATR cap %.2f%%)",
+                                        symbol, smc_tp, atr_cap, max_tp_dist / price * 100)
+                            smc_tp = atr_cap
+                    else:
+                        atr_cap = round(price - max_tp_dist, 6)
+                        if smc_tp < atr_cap:
+                            logger.info("SMC TP capped: %s %.6f → %.6f (ATR cap %.2f%%)",
+                                        symbol, smc_tp, atr_cap, max_tp_dist / price * 100)
+                            smc_tp = atr_cap
 
         # Kotegawa SL: behind recent low (Buy) / recent high (Sell)
         kotegawa_sl = None
@@ -1169,7 +1526,11 @@ class TradingEngine:
                     logger.info("Котегава SL clamped: %.6f → %.6f (max %.1f%%)", kotegawa_sl, max_sl, sl_max_pct * 100)
                     kotegawa_sl = round(max_sl, 6)
 
-        if kotegawa_sl is not None:
+        if smc_sl is not None:
+            sl = smc_sl
+            sl_dist_pct = abs(price - sl) / price * 100
+            sl_source = f"SMC:sweep({sl_dist_pct:.2f}%)"
+        elif kotegawa_sl is not None:
             sl = kotegawa_sl
             sl_dist_pct = abs(price - sl) / price * 100
             sl_source = f"Котегава:low/high({sl_dist_pct:.2f}%)"
@@ -1196,7 +1557,11 @@ class TradingEngine:
                 sl_source += f"→cap${max_sl_usd}"
                 logger.info("SL capped: %s $%.0f → $%.0f (max_sl_usd=%d)", symbol, sl_loss, max_sl_usd, max_sl_usd)
 
-        if ai_tp_pct is not None and 0.5 <= ai_tp_pct <= 10.0:
+        if smc_tp is not None:
+            tp = smc_tp
+            tp_dist_pct = abs(tp - price) / price * 100
+            tp_source = f"SMC:fib_ext({tp_dist_pct:.2f}%)"
+        elif ai_tp_pct is not None and 0.5 <= ai_tp_pct <= 10.0:
             tp = price * (1 + ai_tp_pct / 100) if side == "Buy" else price * (1 - ai_tp_pct / 100)
             tp = round(tp, 6)
             tp_source = f"AI:{ai_tp_pct:.1f}%"
@@ -1656,6 +2021,9 @@ class TradingEngine:
         if side == "Buy" and price < last_add + threshold:
             return
         if side == "Sell" and price > last_add - threshold:
+            return
+
+        if not self._check_margin_limit():
             return
 
         balance = self.client.get_balance()
@@ -4071,9 +4439,9 @@ class TradingEngine:
             emoji = "🟢" if upnl >= 0 else "🔴"
             lines.append(
                 f"{emoji} {direction} {sym}\n"
-                f"   Вход: {entry:.2f}  →  Сейчас: {mark:.2f}\n"
+                f"   Сейчас: {mark:.2f}\n"
                 f"   PnL: {pnl_pct:+.2f}%, {upnl:+,.2f} {currency}{target_line}{sl_line}\n"
-                f"   Объём: {size} (~{pos_value:,.0f} {currency})\n"
+                f"   Сумма входа: {pos_value:,.0f} {currency}\n"
             )
 
         # Other instances — open trades from DB with live prices
@@ -4156,15 +4524,16 @@ class TradingEngine:
                                     emoji = "🟢" if upnl >= 0 else "🔴"
                                     lines.append(
                                         f"{emoji} {direction} {sym}\n"
-                                        f"   Вход: {entry:.2f}  →  Сейчас: {cur_price:.2f}\n"
+                                        f"   Сейчас: {cur_price:.2f}\n"
                                         f"   PnL: {pnl_pct:+.2f}%, {upnl:+,.2f} {inst_currency}{target_line}{sl_line}\n"
-                                        f"   Объём: {qty_val} (~{inst_pos_value:,.0f} {inst_currency})\n"
+                                        f"   Сумма входа: {inst_pos_value:,.0f} {inst_currency}\n"
                                     )
                                 else:
+                                    inst_pos_value = entry * qty_val
                                     lines.append(
                                         f"📊 {direction} {sym}\n"
-                                        f"   Вход: {entry:.2f}  →  Сейчас: ?\n"
-                                        f"   Объём: {qty_val}\n"
+                                        f"   Сейчас: ?\n"
+                                        f"   Сумма входа: {inst_pos_value:,.0f} {inst_currency}\n"
                                     )
                 except Exception:
                     logger.warning("Failed to read positions from %s", inst_name, exc_info=True)

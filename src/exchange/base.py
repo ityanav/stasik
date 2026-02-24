@@ -70,3 +70,7 @@ class ExchangeClient(ABC):
     def get_orderbook(self, symbol: str, limit: int = 50) -> dict:
         """Return {"bids": [[price, qty], ...], "asks": [[price, qty], ...]}."""
         return {"bids": [], "asks": []}
+
+    def get_used_margin(self, symbols: list[str] | None = None) -> float:
+        """Sum of initial margin for given symbols. Returns 0 by default (disabled)."""
+        return 0.0
