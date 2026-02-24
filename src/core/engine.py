@@ -602,6 +602,9 @@ class TradingEngine:
                 if key not in exch_open:
                     logger.info("Detected externally closed position: %s %s (trade #%d)",
                                 trade["side"], trade["symbol"], trade["id"])
+                    # Clean up graduated TP tracker
+                    self._smc_graduated_tracker.pop(trade["symbol"], None)
+                    self._smc_pnl_tracker.pop(trade["symbol"], None)
                     try:
                         await self._check_trade_closed(trade)
                     except Exception:
@@ -1153,16 +1156,24 @@ class TradingEngine:
                 atr=atr, df=df,
             )
 
-            # Store graduated TP levels for this position
-            if self._smc_graduated_tp_enabled and result.details.get("tp_stage_levels"):
+            # Store graduated TP levels for this position (ATR-based, not raw Fib)
+            if self._smc_graduated_tp_enabled and atr and atr > 0:
+                price = self.client.get_last_price(symbol, category=category)
+                # Use ATR multipliers for stages: 1.0 ATR, 1.5 ATR, 2.0 ATR
+                stage_mults = self._smc_tp_stages  # [1.0, 1.272, 1.618] used as ATR multipliers
+                if side == "Buy":
+                    levels = [round(price + atr * m, 6) for m in stage_mults]
+                else:
+                    levels = [round(price - atr * m, 6) for m in stage_mults]
                 self._smc_graduated_tracker[symbol] = {
-                    "levels": result.details["tp_stage_levels"],
+                    "levels": levels,
                     "sizes": list(self._smc_tp_sizes),
                     "stage": 0,
                     "side": side,
                 }
-                logger.info("SMC graduated TP: %s stages=%s sizes=%s",
-                            symbol, result.details["tp_stage_levels"], self._smc_tp_sizes)
+                stage_pcts = [abs(l - price) / price * 100 for l in levels]
+                logger.info("SMC graduated TP: %s stages=%s (%.2f%%, %.2f%%, %.2f%%) sizes=%s",
+                            symbol, levels, *stage_pcts, self._smc_tp_sizes)
             return
 
         # ── Turtle Trading path: Donchian breakout + pyramiding ──
@@ -2888,6 +2899,10 @@ class TradingEngine:
             await self._record_pnl(upnl, balance)
         except Exception:
             logger.exception("DB stop-loss: DB update failed for %s", symbol)
+
+        # Clean up graduated TP tracker
+        self._smc_graduated_tracker.pop(symbol, None)
+        self._smc_pnl_tracker.pop(symbol, None)
 
         direction = "ЛОНГ" if side == "Buy" else "ШОРТ"
         logger.info("🛑 SL сработал: %s %s @ %.6f (SL=%.6f, PnL=%.2f)", direction, symbol, cur_price, sl, upnl)

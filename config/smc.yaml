@@ -80,10 +80,11 @@ smc:
   # Fibonacci Pivot Points (daily S/R levels)
   fib_pivots: true
   fib_pivot_proximity_pct: 0.3
-  # Graduated TP (3-stage Fibonacci extensions)
+  # Graduated TP (3-stage ATR-based)
+  # tp_stages = ATR multipliers from entry: 1.0 ATR, 1.5 ATR, 2.0 ATR
   graduated_tp: true
-  tp_stages: [1.0, 1.272, 1.618]
-  tp_sizes: [0.30, 0.30, 0.40]
+  tp_stages: [1.0, 1.5, 2.0]
+  tp_sizes: [0.40, 0.30, 0.30]
   # Legacy partial close (disabled — replaced by graduated TP)
   partial_close_enabled: false
   partial_close_threshold: 100
