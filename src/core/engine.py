@@ -12,7 +12,7 @@ from src.risk.manager import RiskManager
 from src.storage.database import Database
 from src.strategy.ai_analyst import AIAnalyst, extract_indicator_values, format_risk_text, summarize_candles
 from src.strategy.indicators import calculate_atr, calculate_sma_deviation
-from src.strategy.signals import GrinderGenerator, KotegawaGenerator, MomentumGenerator, Signal, SignalGenerator, SignalResult, Trend
+from src.strategy.signals import GrinderGenerator, KotegawaGenerator, MomentumGenerator, Signal, SignalGenerator, SignalResult, Trend, TurtleGenerator
 
 logger = logging.getLogger(__name__)
 
@@ -141,6 +141,16 @@ class TradingEngine:
         self._grinder_last_direction: dict[str, str] = {}  # symbol -> last trade side
         self._grinder_ls_period: str = grinder_cfg.get("ls_period", "5min")
 
+        # Turtle Trading mode
+        turtle_cfg = config.get("turtle", {})
+        self._turtle_mode: bool = config.get("strategy", {}).get("strategy_mode") == "turtle" and bool(turtle_cfg)
+        self._turtle_state: dict[str, dict] = {}  # symbol -> {units, entries, side, system, last_add_price, entry_n}
+        self._turtle_last_breakout: dict[str, bool] = {}  # symbol -> was_last_breakout_profitable (System 1 filter)
+        self._turtle_risk_pct: float = turtle_cfg.get("risk_pct", 1.0)
+        self._turtle_max_units: int = turtle_cfg.get("max_units", 4)
+        self._turtle_pyramid_n_mult: float = turtle_cfg.get("pyramid_n_mult", 0.5)
+        self._turtle_sl_n_mult: float = turtle_cfg.get("sl_n_mult", 2.0)
+
         # Weekly report
         self._weekly_report_day: int = config.get("weekly_report_day", 0)  # 0=Monday
         self._last_weekly_report: str = ""  # ISO date of last report
@@ -167,6 +177,9 @@ class TradingEngine:
         if mode == "grinder":
             logger.info("Strategy mode: Grinder (ping-pong)")
             return GrinderGenerator(config)
+        if mode == "turtle":
+            logger.info("Strategy mode: Turtle Trading (Donchian breakout)")
+            return TurtleGenerator(config)
         return SignalGenerator(config)
 
     def _update_market_bias(self):
@@ -677,6 +690,46 @@ class TradingEngine:
             if not self.risk.can_open_position(len(open_trades)):
                 return
             await self._open_grinder_trade(symbol, side, category, result.details)
+            return
+
+        # ── Turtle Trading path: Donchian breakout + pyramiding ──
+        if self._turtle_mode:
+            df = self.client.get_klines(
+                symbol=symbol, interval=self.timeframe, limit=200, category=category
+            )
+            if len(df) < 60:
+                return
+
+            result = self.signal_gen.generate(df, symbol)
+            n_value = result.details.get("n_value", 0)
+            system = result.details.get("system")
+
+            open_trades = await self.db.get_open_trades()
+            symbol_open = [t for t in open_trades if t["symbol"] == symbol]
+            turtle_state = self._turtle_state.get(symbol)
+
+            if symbol_open and turtle_state:
+                # Check exit channel + pyramid
+                await self._check_turtle_exit(symbol, df, turtle_state, category)
+                if self._turtle_state.get(symbol):  # still open after exit check
+                    await self._check_turtle_pyramid(symbol, df, turtle_state, n_value, category)
+            elif not symbol_open and result.signal != Signal.HOLD:
+                side = "Buy" if result.signal == Signal.BUY else "Sell"
+                # System 1 filter: skip if last breakout was profitable
+                if system == 1 and self._turtle_last_breakout.get(symbol, False):
+                    logger.info("Turtle S1 filter: skip %s %s (last breakout profitable)", side, symbol)
+                    # But System 2 breakout overrides the filter
+                    if result.details.get("s2_breakout"):
+                        system = 2
+                        logger.info("Turtle S2 override: %s %s (55-period breakout)", side, symbol)
+                    else:
+                        return
+                if not self.risk.can_open_position(len(open_trades)):
+                    return
+                await self._open_turtle_trade(symbol, side, category, n_value, system, df)
+            elif not symbol_open and turtle_state:
+                # State cleanup: position closed externally
+                del self._turtle_state[symbol]
             return
 
         # Cooldown check (before API calls to save quota)
@@ -1517,6 +1570,254 @@ class TradingEngine:
                 hedge_side, symbol, side, upnl, hedge_size,
             )
             await self._open_grinder_trade(symbol, hedge_side, category, {"hedge": True}, size_override=hedge_size)
+
+    # ── Turtle Trading methods ─────────────────────────────
+
+    async def _open_turtle_trade(self, symbol: str, side: str, category: str,
+                                  n_value: float, system: int | None, df):
+        """Open first Turtle unit with N-based sizing, SL=2N, no TP."""
+        price = self.client.get_last_price(symbol, category=category)
+        balance = self.client.get_balance()
+        if price <= 0 or n_value <= 0:
+            return
+
+        # Unit size: (risk_pct% of equity) / N per unit
+        dollar_risk = balance * (self._turtle_risk_pct / 100)
+        qty_raw = dollar_risk / n_value
+        info = self._get_instrument_info(symbol, category)
+        qty = math.floor(qty_raw / info["qty_step"]) * info["qty_step"]
+        qty = round(qty, 8)
+        if qty <= 0:
+            logger.info("Turtle: position size too small for %s (N=%.4f)", symbol, n_value)
+            return
+
+        # SL = 2N from entry
+        sl_dist = self._turtle_sl_n_mult * n_value
+        if side == "Buy":
+            sl = round(price - sl_dist, 6)
+        else:
+            sl = round(price + sl_dist, 6)
+
+        # No TP — exit only via Donchian exit channel
+        try:
+            order = self.client.place_order(
+                symbol=symbol, side=side, qty=qty, category=category,
+                stop_loss=sl, take_profit=None,
+            )
+        except Exception:
+            logger.exception("Turtle: failed to place order for %s", symbol)
+            return
+
+        order_id = order.get("orderId", "")
+        await self.db.insert_trade(
+            symbol=symbol, side=side, category=category,
+            qty=qty, entry_price=price, stop_loss=sl, take_profit=0,
+            order_id=order_id,
+        )
+
+        # Track turtle state
+        self._turtle_state[symbol] = {
+            "units": 1,
+            "entries": [{"price": price, "qty": qty}],
+            "side": side,
+            "system": system or 1,
+            "last_add_price": price,
+            "entry_n": n_value,
+        }
+
+        direction = "LONG" if side == "Buy" else "SHORT"
+        pos_value = qty * price
+        daily_total = await self._get_daily_total_pnl()
+        day_arrow = "▲" if daily_total >= 0 else "▼"
+        msg = (
+            f"🐢 Turtle {direction} {symbol} (S{system or '?'})\n"
+            f"Price: {price:.2f} | N: {n_value:.4f}\n"
+            f"SL: {sl:.2f} ({self._turtle_sl_n_mult}N) | TP: exit channel\n"
+            f"Unit 1/{self._turtle_max_units} | Size: {qty} (~${pos_value:,.0f})\n"
+            f"Balance: {balance:,.0f} USDT ({day_arrow} {daily_total:+,.0f})"
+        )
+        logger.info(msg)
+        await self._notify(msg)
+
+    async def _check_turtle_pyramid(self, symbol: str, df, state: dict,
+                                     n_value: float, category: str):
+        """Add unit every 0.5N price movement in profit direction (max 4 units)."""
+        if state["units"] >= self._turtle_max_units:
+            return
+        if n_value <= 0:
+            return
+
+        price = df["close"].iloc[-1]
+        last_add = state["last_add_price"]
+        side = state["side"]
+        threshold = self._turtle_pyramid_n_mult * n_value
+
+        # Check if price moved enough since last unit addition
+        if side == "Buy" and price < last_add + threshold:
+            return
+        if side == "Sell" and price > last_add - threshold:
+            return
+
+        balance = self.client.get_balance()
+        dollar_risk = balance * (self._turtle_risk_pct / 100)
+        qty_raw = dollar_risk / n_value
+        info = self._get_instrument_info(symbol, category)
+        qty = math.floor(qty_raw / info["qty_step"]) * info["qty_step"]
+        qty = round(qty, 8)
+        if qty <= 0:
+            return
+
+        # New SL for ALL units: 2N from this new entry
+        sl_dist = self._turtle_sl_n_mult * n_value
+        if side == "Buy":
+            new_sl = round(price - sl_dist, 6)
+        else:
+            new_sl = round(price + sl_dist, 6)
+
+        try:
+            self.client.place_order(
+                symbol=symbol, side=side, qty=qty, category=category,
+                stop_loss=new_sl, take_profit=None,
+            )
+        except Exception:
+            logger.exception("Turtle pyramid: failed for %s", symbol)
+            return
+
+        await self.db.insert_trade(
+            symbol=symbol, side=side, category=category,
+            qty=qty, entry_price=price, stop_loss=new_sl, take_profit=0,
+            order_id=f"pyramid_{state['units'] + 1}",
+        )
+
+        # Update SL on all existing trades for this symbol
+        await self._turtle_update_trailing_sl(symbol, new_sl)
+
+        state["units"] += 1
+        state["entries"].append({"price": price, "qty": qty})
+        state["last_add_price"] = price
+        state["entry_n"] = n_value
+
+        unit_num = state["units"]
+        logger.info(
+            "🐢 Turtle PYRAMID %s %s: unit %d/%d @ %.2f (SL moved to %.2f)",
+            side, symbol, unit_num, self._turtle_max_units, price, new_sl,
+        )
+        await self._notify(
+            f"🐢 Pyramid {side} {symbol}: unit {unit_num}/{self._turtle_max_units} @ {price:.2f}\n"
+            f"SL all units → {new_sl:.2f}"
+        )
+
+    async def _check_turtle_exit(self, symbol: str, df, state: dict, category: str):
+        """Check if price broke exit channel — close all units."""
+        price = df["close"].iloc[-1]
+        side = state["side"]
+        system = state.get("system", 1)
+
+        # Use appropriate exit channel based on entry system
+        from src.strategy.indicators import calculate_donchian
+        if system == 1:
+            exit_period = self.signal_gen.exit_period_s1
+        else:
+            exit_period = self.signal_gen.exit_period_s2
+
+        exit_upper, exit_lower = calculate_donchian(df, exit_period)
+        # Use previous bar's exit channel (exclude current forming bar)
+        exit_high = exit_upper.iloc[-2] if pd.notna(exit_upper.iloc[-2]) else None
+        exit_low = exit_lower.iloc[-2] if pd.notna(exit_lower.iloc[-2]) else None
+
+        should_exit = False
+        if side == "Buy" and exit_low is not None and price < exit_low:
+            should_exit = True
+            logger.info("Turtle EXIT: %s price %.2f < exit low %.2f (S%d, %d-period)",
+                        symbol, price, exit_low, system, exit_period)
+        elif side == "Sell" and exit_high is not None and price > exit_high:
+            should_exit = True
+            logger.info("Turtle EXIT: %s price %.2f > exit high %.2f (S%d, %d-period)",
+                        symbol, price, exit_high, system, exit_period)
+
+        if should_exit:
+            await self._close_all_turtle_units(symbol, category, price)
+
+    async def _close_all_turtle_units(self, symbol: str, category: str, exit_price: float = 0):
+        """Close all trades for symbol and record PnL. Update System 1 filter."""
+        open_trades = await self.db.get_open_trades()
+        symbol_trades = [t for t in open_trades if t["symbol"] == symbol]
+        if not symbol_trades:
+            self._turtle_state.pop(symbol, None)
+            return
+
+        state = self._turtle_state.get(symbol, {})
+        side = state.get("side", symbol_trades[0]["side"])
+        close_side = "Sell" if side == "Buy" else "Buy"
+
+        total_pnl = 0
+        total_qty = 0
+        for trade in symbol_trades:
+            qty = trade["qty"]
+            entry = trade["entry_price"]
+            total_qty += qty
+
+        # Close entire position at once
+        if total_qty > 0:
+            try:
+                self.client.place_order(
+                    symbol=symbol, side=close_side, qty=total_qty,
+                    category=category, reduce_only=True,
+                )
+            except Exception:
+                logger.exception("Turtle: failed to close all units for %s", symbol)
+
+        # Get actual exit price
+        if exit_price <= 0:
+            try:
+                exit_price = self.client.get_last_price(symbol, category=category)
+            except Exception:
+                exit_price = 0
+
+        # Close each trade in DB
+        balance = self.client.get_balance()
+        for trade in symbol_trades:
+            qty = trade["qty"]
+            entry = trade["entry_price"]
+            if side == "Buy":
+                pnl = (exit_price - entry) * qty
+            else:
+                pnl = (entry - exit_price) * qty
+            total_pnl += pnl
+            try:
+                await self.db.close_trade(trade["id"], exit_price, pnl)
+                await self.db.update_daily_pnl(pnl)
+                await self._record_pnl(pnl, balance)
+            except Exception:
+                logger.exception("Turtle: DB error closing trade #%d", trade["id"])
+
+        # System 1 filter: remember if this breakout was profitable
+        self._turtle_last_breakout[symbol] = total_pnl > 0
+
+        # Clean up state
+        units = state.get("units", len(symbol_trades))
+        self._turtle_state.pop(symbol, None)
+
+        emoji = "+" if total_pnl >= 0 else ""
+        direction = "LONG" if side == "Buy" else "SHORT"
+        msg = (
+            f"🐢 Turtle CLOSED {direction} {symbol}\n"
+            f"Exit: {exit_price:.2f} | Units: {units}\n"
+            f"PnL: {emoji}{total_pnl:.2f} USDT\n"
+            f"Balance: {balance:,.0f} USDT"
+        )
+        logger.info(msg)
+        await self._notify(msg)
+
+    async def _turtle_update_trailing_sl(self, symbol: str, new_sl: float):
+        """Update SL on all open trades for a symbol (when pyramiding)."""
+        open_trades = await self.db.get_open_trades()
+        for trade in open_trades:
+            if trade["symbol"] == symbol:
+                try:
+                    await self.db.update_trade(trade["id"], stop_loss=new_sl)
+                except Exception:
+                    logger.warning("Turtle: failed to update SL for trade #%d", trade["id"])
 
     # ── AI strategy review ──────────────────────────────────
 

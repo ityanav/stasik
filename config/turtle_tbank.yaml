@@ -1,0 +1,89 @@
+instance_name: "TURTLE-TB"
+initial_balance: 100000
+exchange: tbank
+
+database:
+  path: "/root/stasik/data/turtle_tbank.db"
+
+tbank:
+  token: "t.Vk5L6-uEu1OMc2MkcSnA28LR390jDcg6sVVEsqP1HTOkc3K_FTOjy9qaj_H3mRtRIX3E5Nq254Ol7M13RATPIQ"
+  sandbox: true
+  account_type: "sandbox"
+  instrument_type: "share"
+
+trading:
+  pairs: ["SBER", "GAZP", "LKOH", "YDEX", "ROSN"]
+  market_type: "futures"
+  timeframe: "240"           # 4H candles
+  htf_timeframe: "D"         # Daily for HTF trend
+  leverage: 1
+  trading_hours: [7, 16]     # MOEX hours (UTC)
+  tick_interval: 300          # check every 5 min
+
+strategy:
+  strategy_mode: "turtle"
+  min_score: 1
+  ema_fast: 9
+  ema_slow: 21
+  adx_min: 0
+  adx_max: 0
+  reversal_confirmation: false
+  market_bias: false
+  fng_extreme_greed: 100
+  fng_extreme_fear: 0
+  funding_rate_max: 999
+  htf_filter: false
+  patterns_enabled: false
+  orderbook_enabled: false
+
+turtle:
+  entry_period_s1: 20
+  exit_period_s1: 10
+  entry_period_s2: 55
+  exit_period_s2: 20
+  n_period: 20
+  risk_pct: 1.0
+  max_units: 4
+  pyramid_n_mult: 0.5
+  sl_n_mult: 2.0
+
+risk:
+  risk_per_trade: 1.0
+  stop_loss: 5.0
+  take_profit: 20.0
+  max_open_positions: 30     # 4 units x 7 pairs = 28 max
+  max_daily_loss: 10.0
+  cooldown_after_loss: 0
+  min_tp_net: 0
+  commission_rate: 0.04      # TBank commission
+  atr_period: 20
+  atr_sl_multiplier: 2.0
+  atr_tp_multiplier: 4.0
+  atr_trailing_multiplier: 1.5
+  atr_sl_min: 0.5
+  atr_sl_max: 10.0
+  atr_tp_min: 1.0
+  atr_tp_max: 20.0
+  atr_trail_min: 0.5
+  atr_trail_max: 5.0
+  trailing_stop: 0
+  trailing_activation: 0
+  breakeven_activation: 0
+  smart_exit_min: 0
+  partial_close_enabled: false
+  max_per_group: 1
+  correlation_groups:
+    energy: ["GAZP", "LKOH", "ROSN"]
+    tech: ["YDEX"]
+    banks: ["SBER"]
+
+ai:
+  enabled: false
+
+dashboard:
+  enabled: false
+
+telegram:
+  token: "7852966698:AAFA_L6ovqXtTmMO05DBZg3UYbx4DklIY7k"
+  chat_id: "885025581"
+  notify_only: true

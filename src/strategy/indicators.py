@@ -68,6 +68,13 @@ def calculate_sma_deviation(df: pd.DataFrame, period: int = 25) -> float:
     return ((price - sma_val) / sma_val) * 100
 
 
+def calculate_donchian(df: pd.DataFrame, period: int = 20) -> tuple[pd.Series, pd.Series]:
+    """Donchian Channel: rolling max(high) / min(low) over N periods."""
+    upper = df["high"].rolling(window=period).max()
+    lower = df["low"].rolling(window=period).min()
+    return upper, lower
+
+
 def calculate_atr(df: pd.DataFrame, period: int = 14) -> float:
     """Returns current ATR value (Average True Range)."""
     atr = ta.volatility.AverageTrueRange(

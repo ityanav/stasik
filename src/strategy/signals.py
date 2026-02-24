@@ -7,9 +7,11 @@ import pandas as pd
 from src.strategy.indicators import (
     analyze_orderbook,
     calculate_adx,
+    calculate_atr,
     calculate_bollinger,
     calculate_bollinger_bandwidth,
     calculate_bollinger_pband,
+    calculate_donchian,
     calculate_ema,
     calculate_macd,
     calculate_rsi,
@@ -778,3 +780,140 @@ class GrinderGenerator:
     def get_htf_trend(self, df: pd.DataFrame) -> Trend:
         """Grinder does not use HTF trend — always neutral."""
         return Trend.NEUTRAL
+
+
+class TurtleGenerator:
+    """Turtle Trading: Donchian Channel breakout (trend-following).
+
+    Richard Dennis' system: trade WITH the trend on channel breakouts.
+    System 1: 20-period entry, 10-period exit. Filter: skip if last breakout profitable.
+    System 2: 55-period entry, 20-period exit. No filter.
+    """
+
+    def __init__(self, config: dict):
+        turtle = config.get("turtle", {})
+        strat = config.get("strategy", {})
+
+        # Donchian channel periods
+        self.entry_period_s1 = turtle.get("entry_period_s1", 20)
+        self.exit_period_s1 = turtle.get("exit_period_s1", 10)
+        self.entry_period_s2 = turtle.get("entry_period_s2", 55)
+        self.exit_period_s2 = turtle.get("exit_period_s2", 20)
+        self.n_period = turtle.get("n_period", 20)
+
+        self.system1_enabled = turtle.get("system1_enabled", True)
+        self.system2_enabled = turtle.get("system2_enabled", True)
+        self.min_score = strat.get("min_score", 1)
+
+        # EMA for HTF trend
+        self.ema_fast = strat.get("ema_fast", 9)
+        self.ema_slow = strat.get("ema_slow", 21)
+
+    def generate(self, df: pd.DataFrame, symbol: str = "?", orderbook: dict | None = None) -> SignalResult:
+        df.attrs["symbol"] = symbol
+        scores: dict[str, int] = {}
+        details: dict = {}
+
+        min_bars = max(self.entry_period_s2, self.n_period) + 2
+        if len(df) < min_bars:
+            return SignalResult(signal=Signal.HOLD, score=0, details={"insufficient_data": True})
+
+        close = df["close"].iloc[-1]
+
+        # ATR(N) — the "N" in Turtle parlance
+        atr_series = df["high"].combine(df["close"].shift(1), max) - df["low"].combine(df["close"].shift(1), min)
+        n_value = atr_series.rolling(window=self.n_period).mean().iloc[-1]
+        if pd.isna(n_value) or n_value <= 0:
+            n_value = calculate_atr(df, self.n_period)
+        details["n_value"] = round(float(n_value), 6)
+
+        # Donchian Channels (exclude current bar: use iloc[-2] as prev)
+        # System 1 entry channel (20-period)
+        if self.system1_enabled:
+            s1_upper, s1_lower = calculate_donchian(df, self.entry_period_s1)
+            prev_s1_high = s1_upper.iloc[-2]
+            prev_s1_low = s1_lower.iloc[-2]
+            details["s1_high"] = round(float(prev_s1_high), 6) if pd.notna(prev_s1_high) else 0
+            details["s1_low"] = round(float(prev_s1_low), 6) if pd.notna(prev_s1_low) else 0
+
+            if pd.notna(prev_s1_high) and close > prev_s1_high:
+                scores["s1"] = 1
+                details["s1_breakout"] = "long"
+            elif pd.notna(prev_s1_low) and close < prev_s1_low:
+                scores["s1"] = -1
+                details["s1_breakout"] = "short"
+            else:
+                scores["s1"] = 0
+
+        # System 2 entry channel (55-period)
+        if self.system2_enabled:
+            s2_upper, s2_lower = calculate_donchian(df, self.entry_period_s2)
+            prev_s2_high = s2_upper.iloc[-2]
+            prev_s2_low = s2_lower.iloc[-2]
+            details["s2_high"] = round(float(prev_s2_high), 6) if pd.notna(prev_s2_high) else 0
+            details["s2_low"] = round(float(prev_s2_low), 6) if pd.notna(prev_s2_low) else 0
+
+            if pd.notna(prev_s2_high) and close > prev_s2_high:
+                scores["s2"] = 1
+                details["s2_breakout"] = "long"
+            elif pd.notna(prev_s2_low) and close < prev_s2_low:
+                scores["s2"] = -1
+                details["s2_breakout"] = "short"
+            else:
+                scores["s2"] = 0
+
+        # Exit channels (for position management in engine)
+        exit_s1_upper, exit_s1_lower = calculate_donchian(df, self.exit_period_s1)
+        exit_s2_upper, exit_s2_lower = calculate_donchian(df, self.exit_period_s2)
+        details["exit_s1_high"] = round(float(exit_s1_upper.iloc[-1]), 6) if pd.notna(exit_s1_upper.iloc[-1]) else 0
+        details["exit_s1_low"] = round(float(exit_s1_lower.iloc[-1]), 6) if pd.notna(exit_s1_lower.iloc[-1]) else 0
+        details["exit_s2_high"] = round(float(exit_s2_upper.iloc[-1]), 6) if pd.notna(exit_s2_upper.iloc[-1]) else 0
+        details["exit_s2_low"] = round(float(exit_s2_lower.iloc[-1]), 6) if pd.notna(exit_s2_lower.iloc[-1]) else 0
+
+        # Determine which system triggered
+        system = None
+        if scores.get("s1", 0) != 0:
+            system = 1
+        if scores.get("s2", 0) != 0:
+            system = 2 if system is None else system  # prefer S1 if both
+        details["system"] = system
+
+        total = sum(scores.values())
+
+        if total >= self.min_score:
+            signal = Signal.BUY
+        elif total <= -self.min_score:
+            signal = Signal.SELL
+        else:
+            signal = Signal.HOLD
+
+        logger.info(
+            "Turtle %s: %s (score=%d, system=%s, n=%.4f, close=%.2f, s1=%d, s2=%d)",
+            symbol, signal.value, total, system, n_value, close,
+            scores.get("s1", 0), scores.get("s2", 0),
+        )
+        return SignalResult(signal=signal, score=total, details=details)
+
+    def get_htf_trend(self, df: pd.DataFrame) -> Trend:
+        """HTF trend for Turtle — EMA-based."""
+        if len(df) < self.ema_slow + 2:
+            return Trend.NEUTRAL
+
+        ema_fast, ema_slow = calculate_ema(df, self.ema_fast, self.ema_slow)
+        fast_val = ema_fast.iloc[-1]
+        slow_val = ema_slow.iloc[-1]
+        price = df["close"].iloc[-1]
+
+        if fast_val > slow_val and price > fast_val:
+            trend = Trend.BULLISH
+        elif fast_val < slow_val and price < fast_val:
+            trend = Trend.BEARISH
+        else:
+            trend = Trend.NEUTRAL
+
+        symbol = df.attrs.get("symbol", "?")
+        logger.info(
+            "HTF тренд %s: %s (EMA%d=%.4f, EMA%d=%.4f, price=%.4f)",
+            symbol, trend.value, self.ema_fast, fast_val, self.ema_slow, slow_val, price,
+        )
+        return trend
