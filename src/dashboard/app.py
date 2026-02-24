@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import subprocess
 import time
@@ -59,6 +60,7 @@ class Dashboard:
             except Exception:
                 logger.warning("Dashboard: failed to init standalone BybitClient")
         self._sma_cache: dict = {}  # (symbol, timeframe) -> (sma_val, timestamp)
+        self._last_trade_count: int = 0  # for SSE change detection
 
     def _get_client(self):
         """Get Bybit client from engine or standalone."""
@@ -118,6 +120,7 @@ class Dashboard:
         self.app.router.add_post("/api/set-tp", self._api_set_tp)
         self.app.router.add_get("/api/instances", self._api_instances)
         self.app.router.add_post("/api/set-leverage", self._api_set_leverage)
+        self.app.router.add_get("/api/events", self._api_events)
 
     async def start(self):
         self._runner = web.AppRunner(self.app)
@@ -1097,6 +1100,58 @@ class Dashboard:
         except Exception as e:
             logger.exception("set-leverage error")
             return web.json_response({"ok": False, "error": str(e)}, status=500)
+
+    async def _get_total_trade_count(self) -> int:
+        """Count total closed trades across all instances for change detection."""
+        total = 0
+        try:
+            async with aiosqlite.connect(str(self.db.db_path)) as db:
+                cur = await db.execute(
+                    "SELECT COUNT(*) FROM trades WHERE status = 'closed'"
+                )
+                row = await cur.fetchone()
+                if row:
+                    total += row[0]
+        except Exception:
+            pass
+        for inst in _other_instances(self.config):
+            db_path = inst.get("db_path", "")
+            if db_path and Path(db_path).exists():
+                try:
+                    async with aiosqlite.connect(db_path) as db:
+                        cur = await db.execute(
+                            "SELECT COUNT(*) FROM trades WHERE status = 'closed'"
+                        )
+                        row = await cur.fetchone()
+                        if row:
+                            total += row[0]
+                except Exception:
+                    pass
+        return total
+
+    async def _api_events(self, request: web.Request) -> web.StreamResponse:
+        """SSE endpoint — pushes 'trade_closed' when new trades appear."""
+        resp = web.StreamResponse()
+        resp.content_type = "text/event-stream"
+        resp.headers["Cache-Control"] = "no-cache"
+        resp.headers["X-Accel-Buffering"] = "no"
+        await resp.prepare(request)
+
+        # Init baseline
+        last_count = await self._get_total_trade_count()
+        self._last_trade_count = last_count
+
+        try:
+            while True:
+                await asyncio.sleep(3)
+                current = await self._get_total_trade_count()
+                if current != last_count:
+                    last_count = current
+                    self._last_trade_count = current
+                    await resp.write(b"event: trade_closed\ndata: {}\n\n")
+        except (asyncio.CancelledError, ConnectionResetError):
+            pass
+        return resp
 
     async def _api_instances(self, request: web.Request) -> web.Response:
         source = request.query.get("source", "live")
@@ -2722,6 +2777,17 @@ function updateMarketBar(){
 updateMarketBar();setInterval(updateMarketBar,1000);
 
 loadAll();
-setInterval(async()=>{if(slEditing)return;await loadInstances();loadStats();loadChart();loadPositions()},10000);
+setInterval(async()=>{if(slEditing)return;await loadInstances();loadStats();loadChart();loadPositions();loadTrades(currentPage)},10000);
+
+// SSE: instant trade updates
+function connectSSE(){
+  const es=new EventSource('/api/events');
+  es.addEventListener('trade_closed',()=>{
+    console.log('SSE: trade closed, refreshing');
+    loadTrades(1);loadPositions();loadInstances();loadStats();loadChart();
+  });
+  es.onerror=()=>{es.close();setTimeout(connectSSE,5000)};
+}
+connectSSE();
 </script>
 </body></html>"""
