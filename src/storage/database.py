@@ -130,6 +130,14 @@ class Database:
         )
         await self._db.commit()
 
+    async def update_stop_loss(self, trade_id: int, new_sl: float):
+        """Update stop loss for an open trade (e.g. move to breakeven)."""
+        await self._db.execute(
+            "UPDATE trades SET stop_loss = ? WHERE id = ?",
+            (new_sl, trade_id),
+        )
+        await self._db.commit()
+
     async def insert_partial_close(
         self,
         symbol: str,

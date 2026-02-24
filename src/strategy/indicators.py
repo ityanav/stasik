@@ -419,6 +419,195 @@ def detect_swing_points(
     }
 
 
+def detect_swing_points_zigzag(
+    df: pd.DataFrame, atr_period: int = 14, atr_mult: float = 2.0
+) -> dict:
+    """ATR-based ZigZag swing detection — adaptive to volatility.
+
+    A swing is confirmed when price reverses by atr_mult * ATR from the
+    current extreme. More robust than fractal-based detection in trending markets.
+
+    Returns same format as detect_swing_points() for drop-in replacement.
+    """
+    n = len(df)
+    if n < atr_period + 5:
+        return {"swing_highs": [], "swing_lows": [], "last_swing_high": None, "last_swing_low": None}
+
+    highs = df["high"].values
+    lows = df["low"].values
+    closes = df["close"].values
+
+    # Calculate ATR series
+    atr_ind = ta.volatility.AverageTrueRange(
+        high=df["high"], low=df["low"], close=df["close"], window=atr_period
+    )
+    atr_series = atr_ind.average_true_range().values
+
+    swing_highs: list[tuple[int, float]] = []
+    swing_lows: list[tuple[int, float]] = []
+
+    # State: 1 = looking for high (trending up), -1 = looking for low (trending down)
+    state = 0
+    extreme_idx = 0
+    extreme_val = closes[atr_period]
+
+    for i in range(atr_period, n):
+        atr_val = atr_series[i]
+        if np.isnan(atr_val) or atr_val <= 0:
+            continue
+        threshold = atr_val * atr_mult
+
+        if state == 0:
+            # Initialize direction
+            if highs[i] > extreme_val:
+                state = 1
+                extreme_idx = i
+                extreme_val = highs[i]
+            elif lows[i] < extreme_val:
+                state = -1
+                extreme_idx = i
+                extreme_val = lows[i]
+            continue
+
+        if state == 1:
+            # Trending up — track highest high
+            if highs[i] > extreme_val:
+                extreme_idx = i
+                extreme_val = highs[i]
+            elif extreme_val - lows[i] >= threshold:
+                # Reversal down — confirm swing high
+                swing_highs.append((extreme_idx, float(extreme_val)))
+                state = -1
+                extreme_idx = i
+                extreme_val = lows[i]
+        else:
+            # Trending down — track lowest low
+            if lows[i] < extreme_val:
+                extreme_idx = i
+                extreme_val = lows[i]
+            elif highs[i] - extreme_val >= threshold:
+                # Reversal up — confirm swing low
+                swing_lows.append((extreme_idx, float(extreme_val)))
+                state = 1
+                extreme_idx = i
+                extreme_val = highs[i]
+
+    return {
+        "swing_highs": swing_highs,
+        "swing_lows": swing_lows,
+        "last_swing_high": swing_highs[-1] if swing_highs else None,
+        "last_swing_low": swing_lows[-1] if swing_lows else None,
+    }
+
+
+def find_fibonacci_clusters(
+    swing_highs: list[tuple[int, float]],
+    swing_lows: list[tuple[int, float]],
+    threshold_pct: float = 1.0,
+) -> list[dict]:
+    """Find Fibonacci confluence zones from multiple swing pairs.
+
+    Calculates Fib retracement levels from up to 4 most recent swing
+    high/low pairs. Groups levels that are within threshold_pct of each
+    other. Zones with 3+ overlapping levels are strong confluence.
+
+    Returns:
+        List of cluster dicts: [{"price": mid_price, "count": N, "levels": [...]}]
+        sorted by count descending.
+    """
+    if len(swing_highs) < 1 or len(swing_lows) < 1:
+        return []
+
+    # Take up to 4 most recent swing highs and lows
+    recent_highs = [p for _, p in swing_highs[-4:]]
+    recent_lows = [p for _, p in swing_lows[-4:]]
+
+    fib_ratios = [0.236, 0.382, 0.5, 0.618, 0.705, 0.786]
+    all_levels: list[float] = []
+
+    # Generate fib levels from all pairs
+    for sh in recent_highs:
+        for sl in recent_lows:
+            if sh <= sl:
+                continue
+            price_range = sh - sl
+            for ratio in fib_ratios:
+                # Bullish retracement (from high down)
+                all_levels.append(sh - price_range * ratio)
+                # Bearish retracement (from low up)
+                all_levels.append(sl + price_range * ratio)
+
+    if not all_levels:
+        return []
+
+    # Sort and cluster levels within threshold_pct
+    all_levels.sort()
+    clusters: list[dict] = []
+    used = [False] * len(all_levels)
+
+    for i in range(len(all_levels)):
+        if used[i]:
+            continue
+        cluster_levels = [all_levels[i]]
+        used[i] = True
+        for j in range(i + 1, len(all_levels)):
+            if used[j]:
+                continue
+            mid = (all_levels[i] + all_levels[j]) / 2
+            if mid > 0 and abs(all_levels[j] - all_levels[i]) / mid * 100 <= threshold_pct:
+                cluster_levels.append(all_levels[j])
+                used[j] = True
+
+        if len(cluster_levels) >= 2:
+            clusters.append({
+                "price": sum(cluster_levels) / len(cluster_levels),
+                "count": len(cluster_levels),
+                "levels": cluster_levels,
+            })
+
+    clusters.sort(key=lambda c: c["count"], reverse=True)
+    return clusters
+
+
+def calculate_fib_pivots(daily_df: pd.DataFrame) -> dict:
+    """Calculate Fibonacci Pivot Points from daily OHLC data.
+
+    P = (H + L + C) / 3
+    R1 = P + 0.382 * (H - L),  R2 = P + 0.618 * (H - L),  R3 = P + 1.0 * (H - L)
+    S1 = P - 0.382 * (H - L),  S2 = P - 0.618 * (H - L),  S3 = P - 1.0 * (H - L)
+
+    Uses the last completed daily candle (iloc[-2] if available, else iloc[-1]).
+
+    Returns:
+        {"pivot": P, "r1": R1, "r2": R2, "r3": R3, "s1": S1, "s2": S2, "s3": S3}
+    """
+    empty = {"pivot": 0, "r1": 0, "r2": 0, "r3": 0, "s1": 0, "s2": 0, "s3": 0}
+    if len(daily_df) < 2:
+        return empty
+
+    # Use last completed bar (not current partial)
+    bar = daily_df.iloc[-2]
+    h = bar["high"]
+    l = bar["low"]
+    c = bar["close"]
+
+    if h <= l or h == 0:
+        return empty
+
+    p = (h + l + c) / 3
+    r = h - l  # daily range
+
+    return {
+        "pivot": round(p, 6),
+        "r1": round(p + 0.382 * r, 6),
+        "r2": round(p + 0.618 * r, 6),
+        "r3": round(p + 1.0 * r, 6),
+        "s1": round(p - 0.382 * r, 6),
+        "s2": round(p - 0.618 * r, 6),
+        "s3": round(p - 1.0 * r, 6),
+    }
+
+
 def calculate_fibonacci_levels(
     swing_high: float, swing_low: float, direction: str
 ) -> dict:
@@ -438,8 +627,8 @@ def calculate_fibonacci_levels(
     if price_range <= 0:
         return {"retracement": {}, "extension": {}, "range": 0.0}
 
-    ret_levels = [0.236, 0.382, 0.5, 0.618, 0.786]
-    ext_levels = [1.272, 1.618, 2.0]
+    ret_levels = [0.236, 0.382, 0.5, 0.618, 0.705, 0.786]
+    ext_levels = [1.0, 1.272, 1.618, 2.0]
 
     retracement: dict[float, float] = {}
     extension: dict[float, float] = {}

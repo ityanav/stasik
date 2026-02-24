@@ -13,6 +13,7 @@ from src.strategy.indicators import (
     calculate_bollinger_pband,
     calculate_donchian,
     calculate_ema,
+    calculate_fib_pivots,
     calculate_fibonacci_levels,
     calculate_macd,
     calculate_rsi,
@@ -25,6 +26,8 @@ from src.strategy.indicators import (
     detect_order_blocks,
     detect_rsi_divergence,
     detect_swing_points,
+    detect_swing_points_zigzag,
+    find_fibonacci_clusters,
 )
 
 logger = logging.getLogger(__name__)
@@ -977,6 +980,20 @@ class SMCGenerator:
         self.tp_extension_1 = smc.get("tp_extension_1", 1.272)
         self.tp_extension_2 = smc.get("tp_extension_2", 1.618)
 
+        # OTE 0.705 bonus
+        self.ote_bonus = smc.get("ote_bonus", False)
+        self.ote_proximity_pct = smc.get("ote_proximity_pct", 0.3)
+
+        # Fibonacci clusters
+        self.cluster_enabled = smc.get("cluster_enabled", False)
+        self.cluster_threshold_pct = smc.get("cluster_threshold_pct", 1.0)
+        self.cluster_min_levels = smc.get("cluster_min_levels", 3)
+        self.cluster_proximity_pct = smc.get("cluster_proximity_pct", 0.5)
+
+        # Fibonacci Pivot Points
+        self.fib_pivots_enabled = smc.get("fib_pivots", False)
+        self.fib_pivot_proximity_pct = smc.get("fib_pivot_proximity_pct", 0.3)
+
         # ADX max (optional regime filter)
         self.adx_max = smc.get("adx_max", 0)
 
@@ -998,6 +1015,8 @@ class SMCGenerator:
         self._htf_swings: dict[str, dict] = {}      # symbol -> swing_points
         self._fib_levels: dict[str, dict] = {}       # symbol -> fib levels
         self._fib_direction: dict[str, str] = {}     # symbol -> "bullish"/"bearish"
+        self._fib_clusters: dict[str, list] = {}     # symbol -> cluster zones
+        self._fib_pivots: dict[str, dict] = {}       # symbol -> pivot levels
 
     def update_structure(self, symbol: str, swings: dict, htf_df: pd.DataFrame):
         """Cache HTF swing structure and compute Fibonacci levels.
@@ -1027,6 +1046,19 @@ class SMCGenerator:
         self._fib_levels[symbol] = calculate_fibonacci_levels(
             high_price, low_price, direction
         )
+
+        # Compute Fibonacci clusters from multiple swing pairs
+        if self.cluster_enabled:
+            self._fib_clusters[symbol] = find_fibonacci_clusters(
+                swings.get("swing_highs", []),
+                swings.get("swing_lows", []),
+                threshold_pct=self.cluster_threshold_pct,
+            )
+
+    def update_pivots(self, symbol: str, daily_df: pd.DataFrame):
+        """Cache Fibonacci Pivot Points from daily data. Called by engine."""
+        if self.fib_pivots_enabled and len(daily_df) >= 2:
+            self._fib_pivots[symbol] = calculate_fib_pivots(daily_df)
 
     def generate(self, df: pd.DataFrame, symbol: str = "?", orderbook: dict | None = None) -> SignalResult:
         df.attrs["symbol"] = symbol
@@ -1090,6 +1122,17 @@ class SMCGenerator:
         scores["fib_zone"] = fib_score
         details["fib_zone_name"] = fib_zone_name
 
+        # ── OTE 0.705 bonus ──
+        ote_bonus_val = 0
+        if self.ote_bonus and retracement and fib_score != 0:
+            ote_level = retracement.get(0.705, 0)
+            if ote_level > 0:
+                prox = close * self.ote_proximity_pct / 100
+                if abs(close - ote_level) <= prox:
+                    ote_bonus_val = 1 if fib_score > 0 else -1
+                    details["ote_hit"] = True
+        scores["ote_bonus"] = ote_bonus_val
+
         # ── 2. Liquidity sweep scoring ──
         sweep = detect_liquidity_sweep(
             df, swings,
@@ -1142,6 +1185,43 @@ class SMCGenerator:
         rsi_div = detect_rsi_divergence(df, self.rsi_period)
         scores["rsi_div"] = rsi_div
 
+        # ── 8. Fibonacci Cluster bonus ──
+        cluster_bonus = 0
+        if self.cluster_enabled:
+            clusters = self._fib_clusters.get(symbol, [])
+            for cl in clusters:
+                if cl["count"] >= self.cluster_min_levels:
+                    prox = close * self.cluster_proximity_pct / 100
+                    if abs(close - cl["price"]) <= prox:
+                        cluster_bonus = 1 if fib_score > 0 else (-1 if fib_score < 0 else 0)
+                        details["cluster_price"] = round(cl["price"], 6)
+                        details["cluster_count"] = cl["count"]
+                        break
+        scores["cluster_bonus"] = cluster_bonus
+
+        # ── 9. Fibonacci Pivot Points bonus ──
+        pivot_bonus = 0
+        if self.fib_pivots_enabled:
+            pivots = self._fib_pivots.get(symbol, {})
+            if pivots and pivots.get("pivot", 0) > 0:
+                prox = close * self.fib_pivot_proximity_pct / 100
+                # Check support levels (bullish)
+                for key in ("s1", "s2", "s3"):
+                    level = pivots.get(key, 0)
+                    if level > 0 and abs(close - level) <= prox:
+                        pivot_bonus = 1
+                        details["pivot_level"] = key
+                        break
+                # Check resistance levels (bearish)
+                if pivot_bonus == 0:
+                    for key in ("r1", "r2", "r3"):
+                        level = pivots.get(key, 0)
+                        if level > 0 and abs(close - level) <= prox:
+                            pivot_bonus = -1
+                            details["pivot_level"] = key
+                            break
+        scores["pivot_bonus"] = pivot_bonus
+
         total = sum(scores.values())
 
         if total >= self.min_score:
@@ -1155,18 +1235,28 @@ class SMCGenerator:
         if extensions:
             details["tp1_level"] = round(extensions.get(self.tp_extension_1, 0), 6)
             details["tp2_level"] = round(extensions.get(self.tp_extension_2, 0), 6)
+            # Graduated TP stage levels (for engine)
+            tp_stage_levels = []
+            for ext in [1.0, 1.272, 1.618]:
+                level = extensions.get(ext, 0)
+                if level > 0:
+                    tp_stage_levels.append(round(level, 6))
+            if tp_stage_levels:
+                details["tp_stage_levels"] = tp_stage_levels
 
         # Store sweep level for SL calculation in engine
         details["sweep_level"] = sweep["swept_level"]
         details["fib_direction"] = direction
 
         logger.info(
-            "SMC %s: %s (score=%d, fib=%d[%s], sweep=%d[%s], fvg=%d, ob=%d, disp=%d, vol=%d, rsi_div=%d)",
+            "SMC %s: %s (score=%d, fib=%d[%s], ote=%d, sweep=%d[%s], fvg=%d, ob=%d, disp=%d, vol=%d, rsi_div=%d, cluster=%d, pivot=%d)",
             symbol, signal.value, total,
             scores["fib_zone"], fib_zone_name,
+            scores.get("ote_bonus", 0),
             scores["liq_sweep"], sweep["type"],
             scores["fvg"], scores["order_block"],
             scores["displacement"], scores["volume"], scores["rsi_div"],
+            scores.get("cluster_bonus", 0), scores.get("pivot_bonus", 0),
         )
         return SignalResult(signal=signal, score=total, details={**details, **scores})
 

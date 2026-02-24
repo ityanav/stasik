@@ -66,10 +66,29 @@ smc:
   tp_extension_1: 1.0
   tp_extension_2: 1.272
   adx_max: 0
-  partial_close_enabled: true
-  partial_close_threshold: 100    # start tracking when net PnL > $100
-  partial_close_pullback: 0.30    # close when PnL drops 30% from peak
-  partial_close_pct: 50           # close 50% of position
+  # OTE 0.705 bonus (+1 score near optimal trade entry)
+  ote_bonus: true
+  ote_proximity_pct: 0.3
+  # ZigZag ATR-based swing detection (adaptive to volatility)
+  zigzag_enabled: true
+  zigzag_atr_period: 14
+  zigzag_atr_mult: 2.0
+  # Fibonacci Clusters (multi-swing confluence zones)
+  cluster_enabled: true
+  cluster_threshold_pct: 1.0
+  cluster_min_levels: 3
+  # Fibonacci Pivot Points (daily S/R levels)
+  fib_pivots: true
+  fib_pivot_proximity_pct: 0.3
+  # Graduated TP (3-stage Fibonacci extensions)
+  graduated_tp: true
+  tp_stages: [1.0, 1.272, 1.618]
+  tp_sizes: [0.30, 0.30, 0.40]
+  # Legacy partial close (disabled — replaced by graduated TP)
+  partial_close_enabled: false
+  partial_close_threshold: 100
+  partial_close_pullback: 0.30
+  partial_close_pct: 50
 
 risk:
   risk_per_trade: 1.5

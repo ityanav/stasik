@@ -11,7 +11,7 @@ from src.exchange.base import ExchangeClient
 from src.risk.manager import RiskManager
 from src.storage.database import Database
 from src.strategy.ai_analyst import AIAnalyst, extract_indicator_values, format_risk_text, summarize_candles
-from src.strategy.indicators import calculate_atr, calculate_sma_deviation, detect_swing_points
+from src.strategy.indicators import calculate_atr, calculate_sma_deviation, detect_swing_points, detect_swing_points_zigzag
 from src.strategy.signals import GrinderGenerator, KotegawaGenerator, MomentumGenerator, SMCGenerator, Signal, SignalGenerator, SignalResult, Trend, TurtleGenerator
 
 logger = logging.getLogger(__name__)
@@ -157,12 +157,29 @@ class TradingEngine:
         self._smc_htf_structure_cache: dict[str, tuple[dict, float]] = {}  # symbol -> (swings, timestamp)
         self._smc_structure_interval: int = 300  # refresh HTF structure every 5 min
 
+        # SMC ZigZag swing detection
+        self._smc_zigzag_enabled: bool = smc_cfg.get("zigzag_enabled", False)
+        self._smc_zigzag_atr_period: int = smc_cfg.get("zigzag_atr_period", 14)
+        self._smc_zigzag_atr_mult: float = smc_cfg.get("zigzag_atr_mult", 2.0)
+
+        # SMC Fibonacci Pivot Points
+        self._smc_fib_pivots: bool = smc_cfg.get("fib_pivots", False)
+        self._smc_fib_pivot_proximity_pct: float = smc_cfg.get("fib_pivot_proximity_pct", 0.3)
+        self._smc_daily_klines_cache: dict[str, tuple[pd.DataFrame, float]] = {}  # symbol -> (daily_df, ts)
+        self._smc_daily_klines_ttl: int = 3600  # 1 hour
+
+        # SMC Graduated TP
+        self._smc_graduated_tp_enabled: bool = smc_cfg.get("graduated_tp", False)
+        self._smc_tp_stages: list[float] = smc_cfg.get("tp_stages", [1.0, 1.272, 1.618])
+        self._smc_tp_sizes: list[float] = smc_cfg.get("tp_sizes", [0.30, 0.30, 0.40])
+
         # SMC PnL momentum partial close
         self._smc_partial_enabled: bool = smc_cfg.get("partial_close_enabled", False)
         self._smc_partial_threshold: float = smc_cfg.get("partial_close_threshold", 100)  # min net PnL $ to start tracking
         self._smc_partial_pullback: float = smc_cfg.get("partial_close_pullback", 0.3)  # close when PnL drops 30% from peak
         self._smc_partial_pct: float = smc_cfg.get("partial_close_pct", 50)  # close 50% of position
         self._smc_pnl_tracker: dict[str, dict] = {}  # symbol -> {peak_pnl, prev_pnl, samples}
+        self._smc_graduated_tracker: dict[str, dict] = {}  # symbol -> {levels: [price], sizes: [float], stage: int}
 
         # Max margin per instance
         self._max_margin_usdt: float = config["risk"].get("max_margin_usdt", 0)
@@ -549,8 +566,10 @@ class TradingEngine:
                 # Grinder hedge: open opposite when position goes negative
                 if self._grinder_mode and self._grinder_hedge_enabled:
                     await self._grinder_check_hedge(open_trades)
-                # SMC PnL momentum partial close
-                if self._smc_mode and self._smc_partial_enabled:
+                # SMC graduated TP (replaces simple partial close when enabled)
+                if self._smc_mode and self._smc_graduated_tp_enabled:
+                    await self._smc_check_graduated_tp(open_trades)
+                elif self._smc_mode and self._smc_partial_enabled:
                     await self._smc_check_partial_close(open_trades)
                 # Detect manually closed positions (every 6th poll = ~30s)
                 self._reconcile_poll_counter += 1
@@ -743,6 +762,129 @@ class TradingEngine:
 
             self._smc_pnl_tracker.pop(symbol, None)
 
+    async def _smc_check_graduated_tp(self, open_trades: list[dict]):
+        """Graduated TP: close portions at Fib extension levels.
+
+        3 stages by default:
+          Stage 0 → close 30% at Fib 1.0, then move SL to breakeven
+          Stage 1 → close 30% at Fib 1.272
+          Stage 2 → close 40% at Fib 1.618 (or trail)
+        """
+        for trade in open_trades:
+            symbol = trade["symbol"]
+            tracker = self._smc_graduated_tracker.get(symbol)
+            if not tracker:
+                continue
+
+            stage = tracker["stage"]
+            levels = tracker["levels"]
+            sizes = tracker["sizes"]
+            side = tracker["side"]
+            category = trade["category"]
+            entry = trade["entry_price"]
+            qty = trade["qty"]
+
+            if stage >= len(levels) or stage >= len(sizes):
+                self._smc_graduated_tracker.pop(symbol, None)
+                continue
+
+            # Get current price
+            try:
+                cur_price = self.client.get_last_price(symbol, category=category)
+            except Exception:
+                continue
+
+            target = levels[stage]
+            hit = False
+            if side == "Buy" and cur_price >= target:
+                hit = True
+            elif side == "Sell" and cur_price <= target:
+                hit = True
+
+            if not hit:
+                continue
+
+            # Calculate close qty for this stage
+            close_pct = sizes[stage]
+            close_qty = qty * close_pct
+
+            info = self._get_instrument_info(symbol, category)
+            close_qty = math.floor(close_qty / info["qty_step"]) * info["qty_step"]
+            close_qty = round(close_qty, 8)
+
+            if close_qty < info["min_qty"]:
+                # Too small — skip this stage
+                tracker["stage"] += 1
+                continue
+
+            remaining_qty = round(qty - close_qty, 8)
+            is_final = (stage == len(levels) - 1) or remaining_qty < info["min_qty"]
+            if is_final:
+                close_qty = qty
+                remaining_qty = 0
+
+            close_side = "Sell" if side == "Buy" else "Buy"
+            try:
+                self.client.place_order(
+                    symbol=symbol, side=close_side, qty=close_qty,
+                    category=category, reduce_only=True,
+                )
+            except Exception:
+                logger.exception("SMC graduated TP: failed to close %s stage %d", symbol, stage)
+                continue
+
+            # PnL for closed portion
+            if side == "Buy":
+                partial_pnl = (cur_price - entry) * close_qty
+            else:
+                partial_pnl = (entry - cur_price) * close_qty
+
+            opened_at = trade.get("opened_at", datetime.utcnow().isoformat())
+            stage_num = stage + 1
+
+            if is_final:
+                try:
+                    balance = self.client.get_balance()
+                    await self.db.close_trade(trade["id"], cur_price, partial_pnl)
+                    await self.db.update_daily_pnl(partial_pnl)
+                    await self._record_pnl(partial_pnl, balance)
+                except Exception:
+                    logger.exception("SMC graduated TP: DB update failed %s", symbol)
+                self._smc_graduated_tracker.pop(symbol, None)
+            else:
+                try:
+                    balance = self.client.get_balance()
+                    await self.db.insert_partial_close(
+                        symbol=symbol, side=side, category=category,
+                        qty=close_qty, entry_price=entry, exit_price=cur_price,
+                        pnl=partial_pnl, stage=stage_num, opened_at=opened_at,
+                    )
+                    await self.db.mark_scale_out(trade["id"], stage_num, remaining_qty)
+                    await self.db.update_daily_pnl(partial_pnl)
+                    await self._record_pnl(partial_pnl, balance)
+                except Exception:
+                    logger.exception("SMC graduated TP: DB update failed %s", symbol)
+
+                tracker["stage"] += 1
+
+                # After stage 1: move SL to breakeven
+                if stage == 0:
+                    try:
+                        await self.db.update_stop_loss(trade["id"], entry)
+                        logger.info("SMC graduated TP: %s SL → breakeven (%.6f)", symbol, entry)
+                    except Exception:
+                        logger.exception("SMC graduated TP: failed to move SL to breakeven %s", symbol)
+
+            direction = "LONG" if side == "Buy" else "SHORT"
+            ext_name = levels[stage] if stage < len(levels) else "final"
+            msg = (
+                f"📊 SMC Graduated TP Stage {stage_num}: {symbol}\n"
+                f"{direction} | Closed {close_pct*100:.0f}% ({close_qty}) at {ext_name}\n"
+                f"PnL: ${partial_pnl:.2f}\n"
+                f"Remaining: {remaining_qty}"
+            )
+            await self._notify(msg)
+
     async def _run_loop(self):
         interval_sec = self._timeframe_to_seconds(self.timeframe)
         # For D/W/M: check every hour for position monitoring, not once per candle
@@ -928,11 +1070,18 @@ class TradingEngine:
                 if len(htf_df) < 30:
                     return
                 smc_cfg = self.config.get("smc", {})
-                swings = detect_swing_points(
-                    htf_df,
-                    lookback=smc_cfg.get("swing_lookback", 5),
-                    min_distance=smc_cfg.get("swing_min_distance", 10),
-                )
+                if self._smc_zigzag_enabled:
+                    swings = detect_swing_points_zigzag(
+                        htf_df,
+                        atr_period=self._smc_zigzag_atr_period,
+                        atr_mult=self._smc_zigzag_atr_mult,
+                    )
+                else:
+                    swings = detect_swing_points(
+                        htf_df,
+                        lookback=smc_cfg.get("swing_lookback", 5),
+                        min_distance=smc_cfg.get("swing_min_distance", 10),
+                    )
                 self._smc_htf_structure_cache[symbol] = (swings, now)
 
                 if not swings.get("last_swing_high") or not swings.get("last_swing_low"):
@@ -944,6 +1093,20 @@ class TradingEngine:
 
             if not swings.get("last_swing_high") or not swings.get("last_swing_low"):
                 return
+
+            # 2b. Fetch/cache daily klines for Fibonacci Pivot Points
+            if self._smc_fib_pivots:
+                daily_cached = self._smc_daily_klines_cache.get(symbol)
+                if not daily_cached or (now - daily_cached[1]) >= self._smc_daily_klines_ttl:
+                    try:
+                        daily_df = self.client.get_klines(
+                            symbol=symbol, interval="D", limit=5, category=category
+                        )
+                        if len(daily_df) >= 2:
+                            self._smc_daily_klines_cache[symbol] = (daily_df, now)
+                            self.signal_gen.update_pivots(symbol, daily_df)
+                    except Exception:
+                        logger.debug("SMC %s: failed to fetch daily klines for pivots", symbol)
 
             # 3. Fetch entry TF klines (15m)
             df = self.client.get_klines(
@@ -989,6 +1152,17 @@ class TradingEngine:
                 symbol, side, category, result.score, result.details,
                 atr=atr, df=df,
             )
+
+            # Store graduated TP levels for this position
+            if self._smc_graduated_tp_enabled and result.details.get("tp_stage_levels"):
+                self._smc_graduated_tracker[symbol] = {
+                    "levels": result.details["tp_stage_levels"],
+                    "sizes": list(self._smc_tp_sizes),
+                    "stage": 0,
+                    "side": side,
+                }
+                logger.info("SMC graduated TP: %s stages=%s sizes=%s",
+                            symbol, result.details["tp_stage_levels"], self._smc_tp_sizes)
             return
 
         # ── Turtle Trading path: Donchian breakout + pyramiding ──
