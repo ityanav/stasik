@@ -1151,6 +1151,17 @@ class TradingEngine:
 
             # 6. Open trade with SMC SL/TP
             atr = calculate_atr(df, self._atr_period)
+            price = df["close"].iloc[-1]
+
+            # Skip if ATR too small — commission will eat profits
+            # Need at least 0.3% ATR to cover round-trip fees
+            if atr > 0 and price > 0:
+                atr_pct = atr / price * 100
+                if atr_pct < 0.3:
+                    logger.info("SMC %s: skip — ATR=%.4f (%.3f%%) too small, commission would eat profits",
+                                symbol, atr, atr_pct)
+                    return
+
             await self._open_trade(
                 symbol, side, category, result.score, result.details,
                 atr=atr, df=df,
