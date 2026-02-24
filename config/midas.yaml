@@ -21,7 +21,7 @@ trading:
   trading_hours: [7, 16]             # 10:00-19:00 МСК = 07:00-16:00 UTC (торги MOEX)
 
 strategy:
-  strategy_mode: "kotegawa"
+  strategy_mode: "trend"
   sma_period: 25
   sma_deviation_mild: 0.3            # 0.3% — драгметаллы: золото 0.12%/5м, серебро 0.29%/5м
   sma_deviation_extreme: 1.0         # 1.0% — extreme для scale-in (платина до 8%/день)
@@ -54,12 +54,9 @@ strategy:
   reversal_confirmation: true
   reversal_candles: 1
   reversal_max_wait: 5               # 5 свечей = 25 мин на 5м TF
-  kotegawa_exit_ratio: 0.7
   scale_out_enabled: true
   scale_out_stages: [0.20, 0.40, 0.60]
   scale_out_sizes: [0.35, 0.35, 0.30]
-  kotegawa_sl_lookback: 10           # 10 свечей = 50 мин на 5м
-  kotegawa_sl_buffer: 0.25           # 0.25% буфер SL
 
 risk:
   risk_per_trade: 2.0                # 2% баланса на сделку
@@ -94,7 +91,7 @@ ai:
   provider: "deepseek"
   api_key: "sk-2dec36c8752d48b6b2cfdedd21337126"
   model: "deepseek-chat"
-  style: "kotegawa"
+  style: "aggressive"
   min_confidence: 6
   timeout: 15
   review_interval: 20

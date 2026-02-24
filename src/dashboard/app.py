@@ -15,11 +15,11 @@ logger = logging.getLogger(__name__)
 
 
 _ARCHIVE_MAP = {
-    "trades.db": "archive_scalp_pre_kotegawa.db",
-    "degen.db": "archive_degen_pre_kotegawa.db",
-    "swing.db": "archive_swing_pre_kotegawa.db",
-    "tbank_scalp.db": "archive_tbank_scalp_pre_kotegawa.db",
-    "tbank_swing.db": "archive_tbank_swing_pre_kotegawa.db",
+    "trades.db": "archive_scalp.db",
+    "degen.db": "archive_degen.db",
+    "swing.db": "archive_swing.db",
+    "tbank_scalp.db": "archive_tbank_scalp.db",
+    "tbank_swing.db": "archive_tbank_swing.db",
 }
 
 
@@ -59,7 +59,6 @@ class Dashboard:
                 logger.info("Dashboard: standalone BybitClient initialized")
             except Exception:
                 logger.warning("Dashboard: failed to init standalone BybitClient")
-        self._sma_cache: dict = {}  # (symbol, timeframe) -> (sma_val, timestamp)
         self._last_trade_count: int = 0  # for SSE change detection
 
     def _get_client(self):
@@ -67,30 +66,6 @@ class Dashboard:
         if self.engine:
             return self.engine.client
         return self._client
-
-    def _get_cached_sma(self, symbol: str, timeframe: str, period: int = 25):
-        """Get SMA value with caching to avoid excessive API calls."""
-        cache_key = (symbol, timeframe)
-        now = time.time()
-        if cache_key in self._sma_cache:
-            val, ts = self._sma_cache[cache_key]
-            ttl = 3600 if timeframe in ("D", "W") else 120
-            if now - ts < ttl:
-                return val
-        try:
-            client = self._get_client()
-            if not client:
-                return None
-            df = client.get_klines(symbol, timeframe, limit=100, category="linear")
-            if df is None or df.empty:
-                return None
-            from src.strategy.indicators import calculate_sma
-            sma = calculate_sma(df, period)
-            sma_val = float(sma.iloc[-1])
-            self._sma_cache[cache_key] = (sma_val, now)
-            return sma_val
-        except Exception:
-            return None
 
     @staticmethod
     def _check_service_active(service: str) -> bool:
@@ -659,25 +634,12 @@ class Dashboard:
             except Exception:
                 pass
 
-        # Calculate entry_amount and target exit price (Kotegawa)
-        main_exit_ratio = self.config.get("strategy", {}).get("kotegawa_exit_ratio", 0.8)
-        main_timeframe = self.config.get("trading", {}).get("timeframe", "5")
-        inst_upper = (self.config.get("instance_name") or "SCALP").upper()
-        exit_ratios = {inst_upper: main_exit_ratio}
-        timeframes = {inst_upper: main_timeframe}
-        for inst in _other_instances(self.config):
-            iname = inst.get("name", "").upper()
-            exit_ratios[iname] = inst.get("exit_ratio", 0.8)
-            tf = inst.get("timeframe", "5").replace("м", "").replace("m", "")
-            timeframes[iname] = tf
-
         for pos in positions:
             entry = float(pos["entry_price"])
             qty = float(pos["size"])
             sl = float(pos.get("stop_loss") or 0)
             tp = float(pos.get("take_profit") or 0)
             pos["entry_amount"] = round(entry * qty, 2)
-            pos["target_price"] = None
             # SL PnL: loss in currency when stop-loss triggers
             if sl > 0:
                 if pos["side"] == "Buy":
@@ -694,14 +656,6 @@ class Dashboard:
                     pos["tp_pnl"] = round((entry - tp) * qty, 2)
             else:
                 pos["tp_pnl"] = None
-            inst = (pos.get("instance") or "").upper()
-            if "TBANK" in inst or is_archive or not self._get_client():
-                continue
-            er = exit_ratios.get(inst, 0.8)
-            tf = timeframes.get(inst, "5")
-            sma_val = self._get_cached_sma(pos["symbol"], tf)
-            if sma_val and sma_val > 0:
-                pos["target_price"] = round(entry + er * (sma_val - entry), 6)
 
         return web.json_response(positions)
 

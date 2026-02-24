@@ -12,7 +12,7 @@ from src.risk.manager import RiskManager
 from src.storage.database import Database
 from src.strategy.ai_analyst import AIAnalyst, extract_indicator_values, format_risk_text, summarize_candles
 from src.strategy.indicators import calculate_atr, calculate_sma_deviation, detect_swing_points, detect_swing_points_zigzag
-from src.strategy.signals import GrinderGenerator, KotegawaGenerator, MomentumGenerator, SMCGenerator, Signal, SignalGenerator, SignalResult, Trend, TurtleGenerator
+from src.strategy.signals import MomentumGenerator, SMCGenerator, Signal, SignalGenerator, SignalResult, Trend, TurtleGenerator
 
 logger = logging.getLogger(__name__)
 
@@ -83,15 +83,6 @@ class TradingEngine:
         self._breakeven_activation: float = config["risk"].get("breakeven_activation", 0.5) / 100
         self._halt_closed: bool = False  # flag: already closed positions on halt
 
-        # Kotegawa scaling in: track symbols where we already added to position
-        self._scaled_in: set[str] = set()
-
-        # Reversal confirmation: pending signals waiting for confirming candle
-        self._pending_signals: dict[str, dict] = {}  # symbol -> pending signal data
-        strat_cfg = config.get("strategy", {})
-        self._reversal_confirmation: bool = strat_cfg.get("reversal_confirmation", False)
-        self._reversal_candles: int = strat_cfg.get("reversal_candles", 1)
-        self._reversal_max_wait: int = strat_cfg.get("reversal_max_wait", 3)
 
         # Trading hours filter
         trading_hours = config["trading"].get("trading_hours")
@@ -126,20 +117,6 @@ class TradingEngine:
 
         # AI lessons from strategy reviews
         self._ai_lessons: list[str] = []
-
-        # Grinder grid mode
-        grinder_cfg = config.get("grinder", {})
-        self._grinder_mode: bool = config.get("strategy", {}).get("strategy_mode") == "grinder" and bool(grinder_cfg)
-        self._grinder_position_size_usdt: float = grinder_cfg.get("position_size_usdt", 5000)
-        self._grinder_tp_usdt: float = grinder_cfg.get("tp_usdt", 10)
-        self._grinder_sl_usdt: float = grinder_cfg.get("sl_usdt", 10)
-        self._grinder_auto_reentry: bool = grinder_cfg.get("auto_reentry", True)
-        self._grinder_tp_parts: int = grinder_cfg.get("tp_parts", 3)
-        self._grinder_hedge_enabled: bool = grinder_cfg.get("hedge_enabled", True)
-        self._grinder_hedge_after_usdt: float = grinder_cfg.get("hedge_after_usdt", 1.0)  # hedge when loss > N USDT
-        self._grinder_hedged: set[str] = set()  # symbols already hedged
-        self._grinder_last_direction: dict[str, str] = {}  # symbol -> last trade side
-        self._grinder_ls_period: str = grinder_cfg.get("ls_period", "5min")
 
         # Turtle Trading mode
         turtle_cfg = config.get("turtle", {})
@@ -203,15 +180,9 @@ class TradingEngine:
     @staticmethod
     def _create_signal_gen(config: dict):
         mode = config.get("strategy", {}).get("strategy_mode", "trend")
-        if mode == "kotegawa":
-            logger.info("Strategy mode: Kotegawa (mean reversion)")
-            return KotegawaGenerator(config)
         if mode == "momentum":
             logger.info("Strategy mode: Momentum (breakout, long-only)")
             return MomentumGenerator(config)
-        if mode == "grinder":
-            logger.info("Strategy mode: Grinder (ping-pong)")
-            return GrinderGenerator(config)
         if mode == "turtle":
             logger.info("Strategy mode: Turtle Trading (Donchian breakout)")
             return TurtleGenerator(config)
@@ -316,8 +287,7 @@ class TradingEngine:
         # Reconcile exchange positions with DB
         await self._reconcile_positions()
 
-        if not self._grinder_mode:
-            await self._notify("🚀 Бот запущен\nПары: " + ", ".join(self.pairs))
+        await self._notify("🚀 Бот запущен\nПары: " + ", ".join(self.pairs))
         logger.info("Trading engine started")
 
         asyncio.create_task(self._run_sl_tp_monitor())
@@ -576,9 +546,6 @@ class TradingEngine:
                             await self._check_db_take_profit(trade)
                         except Exception:
                             logger.exception("TP poll error %s", trade.get("symbol"))
-                # Grinder hedge: open opposite when position goes negative
-                if self._grinder_mode and self._grinder_hedge_enabled:
-                    await self._grinder_check_hedge(open_trades)
                 # SMC graduated TP (replaces simple partial close when enabled)
                 if self._smc_mode and self._smc_graduated_tp_enabled:
                     await self._smc_check_graduated_tp(open_trades)
@@ -1025,51 +992,6 @@ class TradingEngine:
         return passed
 
     async def _process_pair(self, symbol: str, category: str):
-        # ── Grinder contrarian-path: L/S ratio + funding ──
-        if self._grinder_mode:
-            try:
-                ls_ratio = self.client.get_long_short_ratio(symbol, period=self._grinder_ls_period, category=category)
-            except Exception:
-                ls_ratio = {"buy_ratio": 0.5, "sell_ratio": 0.5}
-            funding = self.client.get_funding_rate(symbol, category=category)
-            oi_data = self.client.get_open_interest_history(symbol, category=category)
-            obi = self.client.get_orderbook_imbalance(symbol, category=category)
-            self.signal_gen.update_market_data(symbol, ls_ratio, funding, oi_data=oi_data, obi=obi)
-
-            df = self.client.get_klines(
-                symbol=symbol, interval=self.timeframe, limit=30, category=category
-            )
-            if len(df) < 2:
-                return
-
-            result = self.signal_gen.generate(df, symbol)
-            if result.signal == Signal.HOLD:
-                return
-
-            side = "Buy" if result.signal == Signal.BUY else "Sell"
-            open_trades = await self.db.get_open_trades()
-            symbol_open = [t for t in open_trades if t["symbol"] == symbol]
-
-            if symbol_open:
-                # Hedge active (both directions) — don't interfere, let TP/SL resolve
-                if len(symbol_open) >= 2:
-                    return
-                existing = symbol_open[0]
-                if existing["side"] == side:
-                    return  # same direction — hold
-                # opposite signal → close & reopen
-                await self._close_grinder_trade(existing, category)
-                if self.risk.can_open_position(len(open_trades) - 1):
-                    await self._open_grinder_trade(symbol, side, category, result.details)
-                return
-
-            if not self.risk.can_open_position(len(open_trades)):
-                return
-            if not self._check_margin_limit():
-                return
-            await self._open_grinder_trade(symbol, side, category, result.details)
-            return
-
         # ── SMC/ICT path: Fibonacci + Liquidity Sweep ──
         if self._smc_mode:
             now = time.time()
@@ -1315,10 +1237,6 @@ class TradingEngine:
             logger.info("Market bias [%s]: %s score %d → %d", self._market_bias, symbol, original_score, result.score)
 
         if result.signal == Signal.HOLD:
-            # Clear pending reversal if signal is gone
-            if symbol in self._pending_signals:
-                logger.info("⏳ Reversal reset %s: сигнал стал HOLD", symbol)
-                del self._pending_signals[symbol]
             return
 
         # HTF trend + ADX + SMA deviation filter
@@ -1391,22 +1309,8 @@ class TradingEngine:
         symbol_open = [t for t in open_trades if t["symbol"] == symbol and t["category"] == category]
         side = "Buy" if result.signal == Signal.BUY else "Sell"
 
-        # Kotegawa scaling in: allow adding to position on extreme deviation
         is_scale_in = False
-        if symbol_open and isinstance(self.signal_gen, KotegawaGenerator):
-            sma_dev_score = abs(result.details.get("sma_dev", 0))
-            existing_side = symbol_open[0]["side"]
-            # Scale in only if: extreme deviation, same direction, not yet scaled
-            if sma_dev_score >= 2 and side == existing_side and symbol not in self._scaled_in:
-                is_scale_in = True
-                logger.info(
-                    "Котегава scale-in: %s %s — extreme deviation, добавляем к позиции",
-                    side, symbol,
-                )
-            else:
-                logger.debug("Already have open trade for %s (%s), skipping", symbol, category)
-                return
-        elif symbol_open:
+        if symbol_open:
             logger.debug("Already have open trade for %s (%s), skipping", symbol, category)
             return
 
@@ -1434,68 +1338,6 @@ class TradingEngine:
         # Spot: only Buy (no short selling)
         if category == "spot" and side == "Sell":
             return
-
-        # Reversal confirmation: wait for a confirming candle before entry
-        if (
-            self._reversal_confirmation
-            and isinstance(self.signal_gen, KotegawaGenerator)
-            and not is_scale_in
-        ):
-            pending = self._pending_signals.get(symbol)
-            if pending:
-                # Signal direction changed — reset pending
-                if pending["side"] != side:
-                    logger.info("⏳ Reversal reset %s: сигнал сменился %s → %s", symbol, pending["side"], side)
-                    del self._pending_signals[symbol]
-                    # Fall through to create new pending below
-
-            pending = self._pending_signals.get(symbol)
-            if pending is None:
-                # New signal — store as pending, don't enter yet
-                self._pending_signals[symbol] = {
-                    "side": side,
-                    "score": result.score,
-                    "details": result.details,
-                    "candles_waited": 0,
-                }
-                logger.info(
-                    "⏳ Pending reversal %s %s (score=%d, dev=%.1f%%) — ждём подтверждающую свечу",
-                    side, symbol, result.score, result.details.get("sma_dev", 0),
-                )
-                return
-            else:
-                # Check last closed candle (iloc[-2], current candle is still forming)
-                prev_candle = df.iloc[-2]
-                confirmed = False
-                if side == "Buy" and prev_candle["close"] > prev_candle["open"]:
-                    confirmed = True  # green candle confirms buy
-                elif side == "Sell" and prev_candle["close"] < prev_candle["open"]:
-                    confirmed = True  # red candle confirms sell
-
-                if confirmed:
-                    logger.info(
-                        "✅ Reversal confirmed %s %s (waited %d candles)",
-                        side, symbol, pending["candles_waited"],
-                    )
-                    del self._pending_signals[symbol]
-                    # Continue to AI / _open_trade below
-                else:
-                    pending["candles_waited"] += 1
-                    # Update score/details with fresh values
-                    pending["score"] = result.score
-                    pending["details"] = result.details
-                    if pending["candles_waited"] >= self._reversal_max_wait:
-                        logger.info(
-                            "❌ Reversal timeout %s %s (waited %d candles, max=%d)",
-                            side, symbol, pending["candles_waited"], self._reversal_max_wait,
-                        )
-                        del self._pending_signals[symbol]
-                    else:
-                        logger.info(
-                            "⏳ Waiting reversal %s %s (candle %d/%d)",
-                            side, symbol, pending["candles_waited"], self._reversal_max_wait,
-                        )
-                    return
 
         # AI analyst filter
         ai_reasoning = ""
@@ -1630,20 +1472,7 @@ class TradingEngine:
             )
 
         info = self._get_instrument_info(symbol, category)
-        # Use Kotegawa SL% or ATR SL% for adaptive position sizing
-        if isinstance(self.signal_gen, KotegawaGenerator) and df is not None and len(df) >= 10:
-            lookback = self.config.get("strategy", {}).get("kotegawa_sl_lookback", 10)
-            sl_buffer = self.config.get("strategy", {}).get("kotegawa_sl_buffer", 0.2)
-            recent = df.tail(lookback)
-            if side == "Buy":
-                swing_low = recent["low"].min()
-                pre_sl = swing_low * (1 - sl_buffer / 100)
-            else:
-                swing_high = recent["high"].max()
-                pre_sl = swing_high * (1 + sl_buffer / 100)
-            sizing_sl = abs(price - pre_sl) / price
-        else:
-            sizing_sl = atr_sl_pct if atr_sl_pct else None
+        sizing_sl = atr_sl_pct if atr_sl_pct else None
         qty = self.risk.calculate_position_size(
             balance=balance,
             price=price,
@@ -1652,11 +1481,6 @@ class TradingEngine:
             sl_pct=sizing_sl,
             leverage=self.leverage,
         )
-
-        # Kotegawa scaling: scale-in adds 50% of normal size
-        if is_scale_in:
-            qty = math.floor((qty * 0.5) / info["qty_step"]) * info["qty_step"]
-            qty = round(qty, 8)
 
         # AI position size multiplier
         if ai_size_mult is not None and 0.1 <= ai_size_mult <= 2.0:
@@ -1674,7 +1498,7 @@ class TradingEngine:
             logger.info("Position size too small for %s, skipping", symbol)
             return
 
-        # SL/TP priority: SMC (swept_level+ATR) > Kotegawa (recent low/high) > AI > ATR > fixed
+        # SL/TP priority: SMC (swept_level+ATR) > AI > ATR > fixed
         sl_source = "fixed"
         tp_source = "fixed"
 
@@ -1719,40 +1543,10 @@ class TradingEngine:
                                         symbol, smc_tp, atr_cap, max_tp_dist / price * 100)
                             smc_tp = atr_cap
 
-        # Kotegawa SL: behind recent low (Buy) / recent high (Sell)
-        kotegawa_sl = None
-        if isinstance(self.signal_gen, KotegawaGenerator) and df is not None and len(df) >= 10:
-            lookback = self.config.get("strategy", {}).get("kotegawa_sl_lookback", 10)
-            sl_buffer = self.config.get("strategy", {}).get("kotegawa_sl_buffer", 0.2)  # 0.2% запас
-            recent = df.tail(lookback)
-            if side == "Buy":
-                swing_low = recent["low"].min()
-                kotegawa_sl = swing_low * (1 - sl_buffer / 100)
-            else:
-                swing_high = recent["high"].max()
-                kotegawa_sl = swing_high * (1 + sl_buffer / 100)
-            kotegawa_sl = round(kotegawa_sl, 6)
-            # Clamp: SL не дальше atr_sl_max от цены
-            sl_max_pct = self.config.get("risk", {}).get("atr_sl_max", 10.0) / 100
-            if side == "Buy":
-                min_sl = price * (1 - sl_max_pct)
-                if kotegawa_sl < min_sl:
-                    logger.info("Котегава SL clamped: %.6f → %.6f (max %.1f%%)", kotegawa_sl, min_sl, sl_max_pct * 100)
-                    kotegawa_sl = round(min_sl, 6)
-            else:
-                max_sl = price * (1 + sl_max_pct)
-                if kotegawa_sl > max_sl:
-                    logger.info("Котегава SL clamped: %.6f → %.6f (max %.1f%%)", kotegawa_sl, max_sl, sl_max_pct * 100)
-                    kotegawa_sl = round(max_sl, 6)
-
         if smc_sl is not None:
             sl = smc_sl
             sl_dist_pct = abs(price - sl) / price * 100
             sl_source = f"SMC:sweep({sl_dist_pct:.2f}%)"
-        elif kotegawa_sl is not None:
-            sl = kotegawa_sl
-            sl_dist_pct = abs(price - sl) / price * 100
-            sl_source = f"Котегава:low/high({sl_dist_pct:.2f}%)"
         elif ai_sl_pct is not None and 0.3 <= ai_sl_pct <= 5.0:
             sl = price * (1 - ai_sl_pct / 100) if side == "Buy" else price * (1 + ai_sl_pct / 100)
             sl = round(sl, 6)
@@ -1863,10 +1657,6 @@ class TradingEngine:
             order_id="scale_in" if is_scale_in else order_id,
         )
 
-        # Track Kotegawa scale-in
-        if is_scale_in:
-            self._scaled_in.add(symbol)
-
         # Set trailing stop for futures / tbank (ATR-based or fixed)
         trailing_msg = ""
         if category in ("linear", "tbank"):
@@ -1919,250 +1709,6 @@ class TradingEngine:
             msg += f"\n{ai_reasoning}"
         logger.info(msg)
         await self._notify(msg)
-
-    # ── Grinder ping-pong trade ─────────────────────────────
-
-    async def _close_grinder_trade(self, trade: dict, category: str):
-        """Close a grinder position immediately (direction flip)."""
-        symbol = trade["symbol"]
-        side = trade["side"]
-        qty = trade["qty"]
-        entry = trade["entry_price"]
-        close_side = "Sell" if side == "Buy" else "Buy"
-        try:
-            self.client.place_order(
-                symbol=symbol, side=close_side, qty=qty,
-                category=category, reduce_only=True,
-            )
-        except Exception:
-            logger.exception("Grinder: failed to close %s", symbol)
-            return
-        # Get exit price and record
-        try:
-            exit_price = self.client.get_last_price(symbol, category=category)
-            if side == "Buy":
-                pnl = (exit_price - entry) * qty
-            else:
-                pnl = (entry - exit_price) * qty
-            balance = self.client.get_balance()
-            await self.db.close_trade(trade["id"], exit_price, pnl)
-            await self.db.update_daily_pnl(pnl)
-            await self._record_pnl(pnl, balance)
-            direction = "LONG" if side == "Buy" else "SHORT"
-            emoji = "+" if pnl >= 0 else ""
-            logger.info(
-                "Grinder flip: closed %s %s @ %.2f (PnL: %s%.2f)",
-                direction, symbol, exit_price, emoji, pnl,
-            )
-        except Exception:
-            logger.exception("Grinder: DB update failed for %s", symbol)
-
-    async def _open_grinder_trade(self, symbol: str, side: str, category: str, details: dict | None = None, size_override: float | None = None):
-        """Open a grinder trade with fixed USDT size, fixed USDT SL/TP."""
-        price = self.client.get_last_price(symbol, category=category)
-        if price <= 0:
-            return
-
-        info = self._get_instrument_info(symbol, category)
-        position_usdt = size_override if size_override else self._grinder_position_size_usdt
-        qty = position_usdt / price
-        qty = math.floor(qty / info["qty_step"]) * info["qty_step"]
-        qty = round(qty, 8)
-        if qty <= 0:
-            logger.info("Grinder: position size too small for %s", symbol)
-            return
-
-        # Fixed USDT SL/TP → convert to price offset
-        tp_offset = self._grinder_tp_usdt / qty if qty > 0 else 0
-        sl_offset = self._grinder_sl_usdt / qty if qty > 0 else 0
-
-        if side == "Buy":
-            tp = round(price + tp_offset, 6)
-            sl = round(price - sl_offset, 6)
-        else:
-            tp = round(price - tp_offset, 6)
-            sl = round(price + sl_offset, 6)
-
-        # Place order — if partial TP enabled, don't set TP on exchange (managed by polling)
-        exchange_tp = None if self._grinder_tp_parts > 1 else tp
-        try:
-            order = self.client.place_order(
-                symbol=symbol, side=side, qty=qty, category=category,
-                stop_loss=sl, take_profit=exchange_tp,
-            )
-        except Exception:
-            logger.exception("Grinder: failed to place order for %s", symbol)
-            return
-
-        order_id = order.get("orderId", "")
-        await self.db.insert_trade(
-            symbol=symbol, side=side, category=category,
-            qty=qty, entry_price=price, stop_loss=sl, take_profit=tp,
-            order_id=order_id,
-        )
-
-        self._grinder_last_direction[symbol] = side
-
-        balance = self.client.get_balance()
-        direction = "LONG" if side == "Buy" else "SHORT"
-
-        msg = (
-            f"{'🟢' if side == 'Buy' else '🔴'} Grinder {direction} {symbol}\n"
-            f"Price: {price:.2f} | Size: ~${position_usdt:,.0f}\n"
-            f"TP: +${self._grinder_tp_usdt} | SL: -${self._grinder_sl_usdt}\n"
-            f"Balance: {balance:,.0f} USDT"
-        )
-        logger.info(msg)
-
-    async def _grinder_partial_tp(self, trade: dict, cur_price: float):
-        """Grinder partial TP: close position in equal parts at each TP level.
-
-        Stage 0 → close 1/N at TP1, move TP to TP2
-        Stage 1 → close 1/N at TP2, move TP to TP3
-        ...
-        Last stage → close remainder, trigger re-entry.
-        Each TP level is spaced equally: TP_offset = tp_usdt / qty per part.
-        """
-        symbol = trade["symbol"]
-        side = trade["side"]
-        entry = trade["entry_price"]
-        qty = trade["qty"]
-        category = trade["category"]
-        n_parts = self._grinder_tp_parts
-        current_stage = trade.get("partial_closed", 0) or 0
-        is_last = current_stage >= n_parts - 1
-
-        # Qty to close this stage
-        if is_last:
-            close_qty = qty
-        else:
-            remaining_parts = n_parts - current_stage
-            close_qty = qty / remaining_parts
-
-        # Round to exchange step
-        info = self._get_instrument_info(symbol, "linear")
-        close_qty = math.floor(close_qty / info["qty_step"]) * info["qty_step"]
-        close_qty = round(close_qty, 8)
-
-        if close_qty < info["min_qty"]:
-            close_qty = qty
-            is_last = True
-
-        remaining_qty = round(qty - close_qty, 8)
-        if remaining_qty < info["min_qty"]:
-            close_qty = qty
-            remaining_qty = 0
-            is_last = True
-
-        # Net PnL for this partial (after commission)
-        partial_pnl = self._calc_net_pnl(side, entry, cur_price, close_qty)
-
-        # Close partial on exchange
-        close_side = "Sell" if side == "Buy" else "Buy"
-        try:
-            self.client.place_order(
-                symbol=symbol, side=close_side, qty=close_qty,
-                category="linear", reduce_only=True,
-            )
-        except Exception:
-            logger.warning("Grinder partial TP: exchange close failed %s", symbol)
-
-        new_stage = current_stage + 1
-        opened_at = trade.get("opened_at", datetime.utcnow().isoformat())
-
-        if is_last:
-            # Final part — fully close trade
-            try:
-                balance = self.client.get_balance()
-                await self.db.mark_scale_out(trade["id"], new_stage, 0)
-                await self.db.close_trade(trade["id"], cur_price, partial_pnl)
-                await self.db.update_daily_pnl(partial_pnl)
-                await self._record_pnl(partial_pnl, balance)
-            except Exception:
-                logger.exception("Grinder partial TP final: DB error %s", symbol)
-            logger.info(
-                "Grinder TP %d/%d (final) %s: closed %.4f @ %.6f, PnL=%.2f",
-                new_stage, n_parts, symbol, close_qty, cur_price, partial_pnl,
-            )
-        else:
-            # Intermediate part — record partial, move TP further
-            try:
-                balance = self.client.get_balance()
-                await self.db.insert_partial_close(
-                    symbol=symbol, side=side, category=category,
-                    qty=close_qty, entry_price=entry, exit_price=cur_price,
-                    pnl=partial_pnl, stage=new_stage, opened_at=opened_at,
-                )
-                # Move TP to next level (same offset from current TP)
-                old_tp = trade["take_profit"]
-                tp_offset = self._grinder_tp_usdt / (self._grinder_position_size_usdt / entry) if entry > 0 else 0
-                if side == "Buy":
-                    new_tp = round(old_tp + tp_offset, 6)
-                else:
-                    new_tp = round(old_tp - tp_offset, 6)
-                await self.db.mark_scale_out(trade["id"], new_stage, remaining_qty)
-                await self.db.update_trade(trade["id"], take_profit=new_tp)
-                await self.db.update_daily_pnl(partial_pnl)
-                await self._record_pnl(partial_pnl, balance)
-            except Exception:
-                logger.exception("Grinder partial TP %d: DB error %s", new_stage, symbol)
-            logger.info(
-                "Grinder TP %d/%d %s: closed %.4f @ %.6f, PnL=%.2f, remaining=%.4f, new_TP=%.6f",
-                new_stage, n_parts, symbol, close_qty, cur_price, partial_pnl,
-                remaining_qty, new_tp if not is_last else 0,
-            )
-
-    async def _grinder_check_hedge(self, open_trades: list[dict]):
-        """Open opposite position when existing grinder trade goes into loss.
-
-        If LONG is losing > hedge_after_usdt → open SHORT (same size, same TP/SL).
-        If SHORT is losing → open LONG.
-        Only one hedge per symbol. Hedge cleared when original trade closes.
-        """
-        # Clean up hedged set: remove symbols with no open trades
-        open_symbols = {t["symbol"] for t in open_trades}
-        self._grinder_hedged -= (self._grinder_hedged - open_symbols)
-
-        for trade in open_trades:
-            symbol = trade["symbol"]
-            if symbol in self._grinder_hedged:
-                continue  # already hedged
-
-            side = trade["side"]
-            entry = trade["entry_price"]
-            qty = trade["qty"]
-            category = trade.get("category", "linear")
-
-            try:
-                cur_price = self.client.get_last_price(symbol, category=category)
-            except Exception:
-                continue
-
-            if cur_price <= 0:
-                continue
-
-            # Calculate unrealized net PnL (after commission)
-            upnl = self._calc_net_pnl(side, entry, cur_price, qty)
-
-            # Only hedge if losing more than threshold (net)
-            if upnl >= -self._grinder_hedge_after_usdt:
-                continue
-
-            # Check we have room for another position
-            if not self.risk.can_open_position(len(open_trades)):
-                continue
-
-            # Open opposite direction at half size
-            hedge_side = "Sell" if side == "Buy" else "Buy"
-            self._grinder_hedged.add(symbol)
-            hedge_size = self._grinder_position_size_usdt / 2
-            logger.info(
-                "Grinder HEDGE %s %s: original %s PnL=%.2f, opening opposite $%.0f",
-                hedge_side, symbol, side, upnl, hedge_size,
-            )
-            await self._open_grinder_trade(symbol, hedge_side, category, {"hedge": True}, size_override=hedge_size)
-
-    # ── Turtle Trading methods ─────────────────────────────
 
     async def _open_turtle_trade(self, symbol: str, side: str, category: str,
                                   n_value: float, system: int | None, df):
@@ -2498,7 +2044,6 @@ class TradingEngine:
                 await self._check_db_take_profit(trade)
                 await self._check_breakeven(trade)
                 await self._check_smart_exit(trade)
-                await self._check_kotegawa_scale_out(trade)
                 await self._check_profit_target(trade)
                 await self._check_loss_target(trade)
                 await self._check_close_at_profit(trade)
@@ -2568,7 +2113,6 @@ class TradingEngine:
 
         # Clean up breakeven tracking
         self._breakeven_done.discard(trade["id"])
-        self._scaled_in.discard(symbol)
 
         # Send notification
         if pnl >= 0:
@@ -2599,35 +2143,7 @@ class TradingEngine:
             f"Баланс: {balance:,.0f} USDT ({day_arrow} сегодня: {daily_total:+,.0f})"
         )
         logger.info(msg)
-        if not self._grinder_mode:
-            await self._notify(msg)
-
-        # ── Grinder auto re-entry ─────────────────────────────
-        if self._grinder_mode and self._grinder_auto_reentry:
-            # Skip cooldown for grinder
-            self._cooldowns.pop(symbol, None)
-            # Determine if TP or SL hit
-            tp_price = trade.get("take_profit", 0)
-            sl_price = trade.get("stop_loss", 0)
-            hit_tp = False
-            if tp_price and sl_price and exit_price:
-                tp_dist = abs(exit_price - tp_price)
-                sl_dist = abs(exit_price - sl_price)
-                hit_tp = tp_dist < sl_dist
-            if hit_tp:
-                # TP hit → re-enter same direction
-                new_side = side
-                logger.info("Grinder re-entry: TP hit, same direction %s %s", new_side, symbol)
-            else:
-                # SL hit → reverse
-                new_side = "Sell" if side == "Buy" else "Buy"
-                logger.info("Grinder re-entry: SL hit, reversing to %s %s", new_side, symbol)
-            # Get current levels for SL/TP
-            details = {}
-            if hasattr(self.signal_gen, '_support'):
-                details["support"] = self.signal_gen._support.get(symbol, 0)
-                details["resistance"] = self.signal_gen._resistance.get(symbol, 0)
-            await self._open_grinder_trade(symbol, new_side, category, details)
+        await self._notify(msg)
 
     async def _check_close_at_profit(self, trade: dict):
         """Close position as soon as PnL > 0 (triggered by Telegram button)."""
@@ -2941,11 +2457,6 @@ class TradingEngine:
         if side == "Sell" and cur_price > tp:
             return
 
-        # ── Grinder partial TP ──────────────────────────────
-        if self._grinder_mode and self._grinder_tp_parts > 1:
-            await self._grinder_partial_tp(trade, cur_price)
-            return
-
         # TP hit — close position (net PnL after commission)
         net_pnl = self._calc_net_pnl(side, entry, cur_price, qty)
 
@@ -2975,395 +2486,6 @@ class TradingEngine:
             f"🎯 Тейк-профит: {direction} {symbol}\n"
             f"Цена: {cur_price:,.6f} (TP: {tp:,.6f})\n"
             f"Net PnL: {net_pnl:+,.2f} (fee: {fee:.2f})"
-        )
-
-    async def _check_kotegawa_scale_out(self, trade: dict):
-        """Kotegawa scale-out: close position in stages as price reverts toward SMA.
-
-        3-stage progressive close (default 35/35/30%) at increasing distances toward SMA.
-        After each stage, SL is moved to lock in profit.
-
-        Config (strategy section):
-          scale_out_enabled: true
-          scale_out_stages: [0.30, 0.60, 0.90]   # % distance entry→SMA for each stage
-          scale_out_sizes: [0.35, 0.35, 0.30]     # % of original position per stage
-          kotegawa_exit_ratio: 0.8                 # fallback single-exit ratio
-        """
-        if not isinstance(self.signal_gen, KotegawaGenerator):
-            return
-
-        strat = self.config.get("strategy", {})
-
-        if not strat.get("scale_out_enabled", False):
-            # Fallback: old single-exit behavior
-            return await self._check_kotegawa_exit_single(trade)
-
-        symbol = trade["symbol"]
-        side = trade["side"]
-        entry = trade["entry_price"]
-        qty = trade["qty"]
-        category = trade["category"]
-
-        stages = strat.get("scale_out_stages", [0.30, 0.60, 0.90])
-        sizes = strat.get("scale_out_sizes", [0.35, 0.35, 0.30])
-        current_stage = trade.get("partial_closed", 0) or 0
-
-        if current_stage >= len(stages):
-            return  # all stages done
-
-        try:
-            df = self.client.get_klines(symbol, self.timeframe, limit=100, category=category)
-            if df is None or df.empty:
-                return
-        except Exception:
-            return
-
-        from src.strategy.indicators import calculate_sma
-        sma = calculate_sma(df, self.signal_gen.sma_period)
-        sma_val = sma.iloc[-1]
-        if not sma_val or sma_val <= 0:
-            return
-
-        # Target = entry + stages[current_stage] * (sma - entry)
-        target_price = entry + stages[current_stage] * (sma_val - entry)
-
-        try:
-            if self.exchange_type == "tbank":
-                cur_price = self.client.get_last_price(symbol)
-            else:
-                cur_price = self.client.get_last_price(symbol, category="linear")
-        except Exception:
-            return
-
-        # Buy: close when price >= target (price rose toward SMA)
-        if side == "Buy" and cur_price < target_price:
-            return
-        # Sell: close when price <= target (price fell toward SMA)
-        if side == "Sell" and cur_price > target_price:
-            return
-
-        is_last_stage = current_stage == len(stages) - 1
-
-        if is_last_stage:
-            # Last stage: close everything remaining
-            close_qty = qty
-        else:
-            # Calculate fraction of CURRENT remaining qty
-            remaining_sizes = sum(sizes[current_stage:])
-            if remaining_sizes <= 0:
-                close_qty = qty
-            else:
-                close_qty = qty * sizes[current_stage] / remaining_sizes
-
-        # Round to exchange step, check min_qty
-        cat = "tbank" if self.exchange_type == "tbank" else "linear"
-        info = self._get_instrument_info(symbol, cat)
-        close_qty = math.floor(close_qty / info["qty_step"]) * info["qty_step"]
-        close_qty = round(close_qty, 8)
-
-        if close_qty < info["min_qty"]:
-            # Can't close partial — close everything
-            close_qty = qty
-            is_last_stage = True
-
-        remaining_qty = round(qty - close_qty, 8)
-        if remaining_qty < info["min_qty"]:
-            # Remainder too small — close everything
-            close_qty = qty
-            remaining_qty = 0
-            is_last_stage = True
-
-        # Place close order
-        close_side = "Sell" if side == "Buy" else "Buy"
-        try:
-            if self.exchange_type == "tbank":
-                self.client.place_order(symbol=symbol, side=close_side, qty=close_qty)
-            else:
-                self.client.place_order(symbol=symbol, side=close_side, qty=close_qty, category=category, reduce_only=True)
-        except Exception:
-            logger.exception("Scale-out stage %d: failed to close %s", current_stage + 1, symbol)
-            return
-
-        # Calculate net PnL for this partial (after commission)
-        partial_pnl = self._calc_net_pnl(side, entry, cur_price, close_qty)
-
-        new_stage = current_stage + 1
-        opened_at = trade.get("opened_at", datetime.utcnow().isoformat())
-
-        if is_last_stage or remaining_qty <= 0:
-            # Final stage — close the original trade with only the remaining portion's PnL
-            try:
-                balance = self.client.get_balance()
-                await self.db.mark_scale_out(trade["id"], new_stage, 0)
-                await self.db.close_trade(trade["id"], cur_price, partial_pnl)
-                await self.db.update_daily_pnl(partial_pnl)
-                await self._record_pnl(partial_pnl, balance)
-            except Exception:
-                logger.exception("Scale-out final: DB update failed for %s", symbol)
-
-            if partial_pnl < 0 and self._cooldown_seconds > 0:
-                self._cooldowns[symbol] = time.time() + self._cooldown_seconds
-            self._scaled_in.discard(symbol)
-        else:
-            # Intermediate stage — insert separate closed trade for this partial
-            try:
-                balance = self.client.get_balance()
-                await self.db.insert_partial_close(
-                    symbol=symbol, side=side, category=category,
-                    qty=close_qty, entry_price=entry, exit_price=cur_price,
-                    pnl=partial_pnl, stage=new_stage, opened_at=opened_at,
-                )
-                await self.db.mark_scale_out(trade["id"], new_stage, remaining_qty)
-                await self.db.update_daily_pnl(partial_pnl)
-                await self._record_pnl(partial_pnl, balance)
-            except Exception:
-                logger.exception("Scale-out stage %d: DB update failed for %s", new_stage, symbol)
-
-            # Move SL after each stage
-            await self._move_sl_after_scale_out(symbol, side, entry, stages, current_stage, sma_val, trade["id"])
-
-        # Notify
-        dev = calculate_sma_deviation(df, self.signal_gen.sma_period)
-        direction = "LONG" if side == "Buy" else "SHORT"
-        stage_pct = int(stages[current_stage] * 100)
-
-        if is_last_stage or remaining_qty <= 0:
-            emoji = "🎯" if partial_pnl >= 0 else "📉"
-            logger.info(
-                "%s Scale-out FINAL (%d/%d): %s %s — %d%% to SMA (dev=%.1f%%, PnL=%.2f)",
-                emoji, new_stage, len(stages), direction, symbol, stage_pct, dev, partial_pnl,
-            )
-            await self._notify(
-                f"{emoji} Scale-out закрытие: {direction} {symbol}\n"
-                f"Стадия {new_stage}/{len(stages)} (финал)\n"
-                f"PnL: {partial_pnl:+,.2f}"
-            )
-        else:
-            logger.info(
-                "✂️ Scale-out %d/%d: %s %s — закрыто %.4f @ %d%% к SMA (dev=%.1f%%, PnL=+%.2f), осталось %.4f",
-                new_stage, len(stages), direction, symbol, close_qty, stage_pct, dev, partial_pnl, remaining_qty,
-            )
-            await self._notify(
-                f"✂️ Scale-out {new_stage}/{len(stages)}: {direction} {symbol}\n"
-                f"Закрыто: {close_qty} ({int(sizes[current_stage]*100)}%)\n"
-                f"PnL: {partial_pnl:+,.2f}\n"
-                f"Остаток: {remaining_qty}"
-            )
-
-    async def _move_sl_after_scale_out(self, symbol: str, side: str, entry: float,
-                                       stages: list, completed_stage: int, sma_val: float,
-                                       trade_id: int):
-        """Move SL after scale-out stage to lock in profit.
-
-        After stage 0 (first close): SL → entry (breakeven)
-        After stage 1 (second close): SL → stage 0 target price (lock profit)
-        """
-        if completed_stage == 0:
-            # After first partial: move SL to breakeven (entry)
-            new_sl = entry
-        elif completed_stage >= 1:
-            # After second partial: move SL to stage 0 target (lock profit from first stage)
-            new_sl = entry + stages[0] * (sma_val - entry)
-        else:
-            return
-
-        try:
-            if self.exchange_type == "bybit":
-                self.client.session.set_trading_stop(
-                    category="linear", symbol=symbol,
-                    stopLoss=str(round(new_sl, 6)), positionIdx=0,
-                )
-                logger.info("Scale-out SL moved for %s: → %.6f (stage %d done)", symbol, new_sl, completed_stage + 1)
-            else:
-                logger.info("Scale-out SL for %s: tbank does not support SL move, tracking in DB", symbol)
-        except Exception:
-            logger.warning("Failed to move SL after scale-out for %s", symbol)
-
-        # Update SL in DB for dashboard monitoring
-        try:
-            await self.db.update_trade(trade_id, stop_loss=new_sl)
-        except Exception:
-            logger.warning("Failed to update SL in DB after scale-out for %s", symbol)
-
-    async def _check_kotegawa_exit_single(self, trade: dict):
-        """Fallback: single Kotegawa exit (original behavior when scale_out_enabled=false)."""
-        symbol = trade["symbol"]
-        side = trade["side"]
-        entry = trade["entry_price"]
-        qty = trade["qty"]
-        category = trade["category"]
-
-        exit_ratio = self.config.get("strategy", {}).get("kotegawa_exit_ratio", 0.8)
-
-        try:
-            df = self.client.get_klines(symbol, self.timeframe, limit=100, category=category)
-            if df is None or df.empty:
-                return
-        except Exception:
-            return
-
-        from src.strategy.indicators import calculate_sma
-        sma = calculate_sma(df, self.signal_gen.sma_period)
-        sma_val = sma.iloc[-1]
-        if not sma_val or sma_val <= 0:
-            return
-
-        target_price = entry + exit_ratio * (sma_val - entry)
-
-        try:
-            if self.exchange_type == "tbank":
-                cur_price = self.client.get_last_price(symbol)
-            else:
-                cur_price = self.client.get_last_price(symbol, category="linear")
-        except Exception:
-            return
-
-        if side == "Buy" and cur_price < target_price:
-            return
-        if side == "Sell" and cur_price > target_price:
-            return
-
-        # Net PnL (after commission)
-        upnl = self._calc_net_pnl(side, entry, cur_price, qty)
-
-        close_side = "Sell" if side == "Buy" else "Buy"
-        try:
-            if self.exchange_type == "tbank":
-                self.client.place_order(symbol=symbol, side=close_side, qty=qty)
-            else:
-                self.client.place_order(symbol=symbol, side=close_side, qty=qty, category=category, reduce_only=True)
-        except Exception:
-            logger.exception("Kotegawa exit: failed to close %s", symbol)
-            return
-
-        try:
-            balance = self.client.get_balance()
-            await self.db.close_trade(trade["id"], cur_price, upnl)
-            await self.db.update_daily_pnl(upnl)
-            await self._record_pnl(upnl, balance)
-        except Exception:
-            logger.exception("Kotegawa exit: DB update failed for %s", symbol)
-
-        if upnl < 0 and self._cooldown_seconds > 0:
-            self._cooldowns[symbol] = time.time() + self._cooldown_seconds
-
-        self._scaled_in.discard(symbol)
-
-        dev = calculate_sma_deviation(df, self.signal_gen.sma_period)
-        direction = "LONG" if side == "Buy" else "SHORT"
-        emoji = "🎯" if upnl >= 0 else "📉"
-        ratio_pct = int(exit_ratio * 100)
-        logger.info(
-            "%s Котегава выход: %s %s — цель %d%% к SMA (dev=%.1f%%, PnL=%.2f)",
-            emoji, direction, symbol, ratio_pct, dev, upnl,
-        )
-        await self._notify(
-            f"{emoji} Котегава выход: {direction} {symbol}\n"
-            f"Цель достигнута (откл: {dev:+.1f}%)\n"
-            f"PnL: {upnl:+,.2f}"
-        )
-
-    async def _check_grinder_bb_exit(self, trade: dict):
-        """Grinder BB exit: DEPRECATED (v1 logic). No longer called — grinder v2 uses SL/TP only."""
-        return  # v2: all exits via exchange SL/TP + auto re-entry
-        if not isinstance(self.signal_gen, GrinderGenerator):
-            return
-
-        symbol = trade["symbol"]
-        side = trade["side"]
-        entry = trade["entry_price"]
-        qty = trade["qty"]
-        category = trade["category"]
-
-        try:
-            df = self.client.get_klines(symbol, self.timeframe, limit=100, category=category)
-            if df is None or df.empty:
-                return
-        except Exception:
-            return
-
-        from src.strategy.indicators import calculate_bollinger
-        upper, middle, lower = calculate_bollinger(df, self.signal_gen.bb_period, self.signal_gen.bb_std)
-        mid_val = middle.iloc[-1]
-
-        try:
-            if self.exchange_type == "tbank":
-                cur_price = self.client.get_last_price(symbol)
-            else:
-                cur_price = self.client.get_last_price(symbol, category="linear")
-        except Exception:
-            return
-
-        # Update TP in DB to middle band (for dashboard display)
-        try:
-            await self.db.update_trade(trade["id"], take_profit=mid_val)
-        except Exception:
-            pass
-
-        # Check max hold time (force close)
-        max_hold = self.signal_gen.max_hold_candles
-        opened_at = trade.get("opened_at")
-        force_close = False
-        if opened_at and max_hold > 0:
-            from datetime import datetime, timezone
-            if isinstance(opened_at, str):
-                opened_dt = datetime.fromisoformat(opened_at.replace("Z", "+00:00"))
-            else:
-                opened_dt = opened_at
-            if opened_dt.tzinfo is None:
-                opened_dt = opened_dt.replace(tzinfo=timezone.utc)
-            now = datetime.now(timezone.utc)
-            # 1m candles → each candle = 60 seconds
-            tf_seconds = int(self.timeframe) * 60 if self.timeframe.isdigit() else 60
-            elapsed_candles = (now - opened_dt).total_seconds() / tf_seconds
-            if elapsed_candles >= max_hold:
-                force_close = True
-
-        # Check if price reached middle band
-        reached_middle = False
-        if side == "Buy" and cur_price >= mid_val:
-            reached_middle = True
-        elif side == "Sell" and cur_price <= mid_val:
-            reached_middle = True
-
-        if not reached_middle and not force_close:
-            return
-
-        # Close position (net PnL after commission)
-        upnl = self._calc_net_pnl(side, entry, cur_price, qty)
-
-        close_side = "Sell" if side == "Buy" else "Buy"
-        try:
-            if self.exchange_type == "tbank":
-                self.client.place_order(symbol=symbol, side=close_side, qty=qty)
-            else:
-                self.client.place_order(symbol=symbol, side=close_side, qty=qty, category=category, reduce_only=True)
-        except Exception:
-            logger.exception("Grinder BB exit: failed to close %s", symbol)
-            return
-
-        try:
-            balance = self.client.get_balance()
-            await self.db.close_trade(trade["id"], cur_price, upnl)
-            await self.db.update_daily_pnl(upnl)
-            await self._record_pnl(upnl, balance)
-        except Exception:
-            logger.exception("Grinder BB exit: DB update failed for %s", symbol)
-
-        if upnl < 0 and self._cooldown_seconds > 0:
-            self._cooldowns[symbol] = time.time() + self._cooldown_seconds
-
-        direction = "LONG" if side == "Buy" else "SHORT"
-        reason = "timeout" if force_close and not reached_middle else "middle band"
-        emoji = "🎯" if upnl >= 0 else "📉"
-        logger.info(
-            "%s Grinder выход (%s): %s %s @ %.6f (mid=%.6f, PnL=%.2f)",
-            emoji, reason, direction, symbol, cur_price, mid_val, upnl,
-        )
-        await self._notify(
-            f"{emoji} Grinder выход ({reason}): {direction} {symbol}\n"
-            f"Цена: {cur_price:,.6f} (BB mid: {mid_val:,.6f})\n"
-            f"PnL: {upnl:+,.2f}"
         )
 
     async def _check_smart_exit(self, trade: dict):
@@ -3582,8 +2704,6 @@ class TradingEngine:
         return self._instrument_cache[key]
 
     async def _notify(self, text: str):
-        if self._grinder_mode:
-            return
         if self.notifier:
             try:
                 if self.instance_name:
@@ -4586,28 +3706,8 @@ class TradingEngine:
             else:
                 pnl_pct = 0.0
 
-            # Target exit price: SMA for Kotegawa, TP for others
             target_line = ""
-            if isinstance(self.signal_gen, KotegawaGenerator):
-                try:
-                    from src.strategy.indicators import calculate_sma
-                    df = self.client.get_klines(sym, self.timeframe, limit=100, category=cat)
-                    if df is not None and not df.empty:
-                        sma = calculate_sma(df, self.signal_gen.sma_period)
-                        sma_val = sma.iloc[-1]
-                        if sma_val and sma_val > 0 and mark > 0:
-                            exit_ratio = self.config.get("strategy", {}).get("kotegawa_exit_ratio", 0.8)
-                            target = entry + exit_ratio * (sma_val - entry)
-                            if side == "Buy":
-                                target_pnl = (target - entry) * size
-                                target_pct = (target / mark - 1) * 100
-                            else:
-                                target_pnl = (entry - target) * size
-                                target_pct = (1 - target / mark) * 100
-                            target_line = f"\n   Цель: {target:,.2f} ({target_pct:+.1f}%, {target_pnl:+,.0f} {currency})"
-                except Exception:
-                    pass
-            elif t.get("take_profit") and t["take_profit"] > 0:
+            if t.get("take_profit") and t["take_profit"] > 0:
                 tp = t["take_profit"]
                 if side == "Buy":
                     target_pnl = (tp - entry) * size
@@ -4671,32 +3771,7 @@ class TradingEngine:
                                         tbank_pnl += upnl
                                     else:
                                         bybit_other_pnl += upnl
-                                    # SMA target for other Kotegawa instances
                                     target_line = ""
-                                    try:
-                                        from src.strategy.indicators import calculate_sma
-                                        inst_tf = inst.get("timeframe", self.timeframe)
-                                        # Normalize timeframe: "1м" -> "1", "15м" -> "15"
-                                        inst_tf = inst_tf.replace("м", "").replace("m", "")
-                                        if is_tbank:
-                                            df = self._get_tbank_klines(sym, inst_tf, limit=100)
-                                        else:
-                                            df = self.client.get_klines(sym, inst_tf, limit=100, category="linear")
-                                        if df is not None and not df.empty:
-                                            sma = calculate_sma(df, 25)
-                                            sma_val = sma.iloc[-1]
-                                            if sma_val and sma_val > 0 and cur_price and cur_price > 0:
-                                                exit_ratio = self.config.get("strategy", {}).get("kotegawa_exit_ratio", 0.8)
-                                                target = entry + exit_ratio * (sma_val - entry)
-                                                if r["side"] == "Buy":
-                                                    t_pnl = (target - entry) * qty_val
-                                                    t_pct = (target / cur_price - 1) * 100
-                                                else:
-                                                    t_pnl = (entry - target) * qty_val
-                                                    t_pct = (1 - target / cur_price) * 100
-                                                target_line = f"\n   Цель: {target:,.2f} ({t_pct:+.1f}%, {t_pnl:+,.0f} {inst_currency})"
-                                    except Exception:
-                                        pass
                                     # Stop-loss line
                                     sl_line = ""
                                     sl = r["stop_loss"] if r["stop_loss"] else 0
