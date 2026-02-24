@@ -1792,6 +1792,7 @@ tr:hover{background:rgba(99,102,241,0.04)}
 .dot-degen{background:#f472b6}
 .dot-tbank{background:#34d399}
 .dot-swing{background:#f59e0b}
+.dot-midas{background:#fbbf24}
 .chart-legend-custom{display:flex;gap:12px;font-size:12px;color:var(--muted)}
 .chart-legend-custom .leg-item{display:flex;align-items:center;gap:5px}
 .leg-bar{width:12px;height:10px;border-radius:2px}
@@ -2098,6 +2099,13 @@ body.archive-mode .header{background:#fff;border-bottom-color:rgba(245,158,11,0.
         </div>
         <canvas id="pnlChartTbankSwing"></canvas>
       </div>
+      <div class="chart-mini" id="mini-midas">
+        <div class="chart-mini-header">
+          <span class="chart-half-label" style="margin:0"><span class="dot dot-midas"></span>MIDAS</span>
+          <button class="expand-btn" onclick="expandChart('MIDAS')">&#x2922;</button>
+        </div>
+        <canvas id="pnlChartMidas"></canvas>
+      </div>
     </div>
   </div>
 
@@ -2359,11 +2367,11 @@ async function loadStats(){
 }
 
 let chartCombined=null, miniCharts={}, chartFull=null, instanceData={};
-const INST_COLORS={SCALP:'#818cf8',DEGEN:'#f472b6',SWING:'#f59e0b','TBANK-SCALP':'#34d399','TBANK-SWING':'#059669'};
-const INST_CANVAS={SCALP:'pnlChartScalp',DEGEN:'pnlChartDegen',SWING:'pnlChartSwing','TBANK-SCALP':'pnlChartTbankScalp','TBANK-SWING':'pnlChartTbankSwing'};
-const INST_MINI={SCALP:'mini-scalp',DEGEN:'mini-degen',SWING:'mini-swing','TBANK-SCALP':'mini-tbank-scalp','TBANK-SWING':'mini-tbank-swing'};
-const INST_CURRENCY={SCALP:'USDT',DEGEN:'USDT',SWING:'USDT','TBANK-SCALP':'RUB','TBANK-SWING':'RUB'};
-const INST_SYM={SCALP:'$',DEGEN:'$',SWING:'$','TBANK-SCALP':'\u20bd','TBANK-SWING':'\u20bd'};
+const INST_COLORS={SCALP:'#818cf8',DEGEN:'#f472b6',SWING:'#f59e0b','TBANK-SCALP':'#34d399','TBANK-SWING':'#059669',MIDAS:'#fbbf24'};
+const INST_CANVAS={SCALP:'pnlChartScalp',DEGEN:'pnlChartDegen',SWING:'pnlChartSwing','TBANK-SCALP':'pnlChartTbankScalp','TBANK-SWING':'pnlChartTbankSwing',MIDAS:'pnlChartMidas'};
+const INST_MINI={SCALP:'mini-scalp',DEGEN:'mini-degen',SWING:'mini-swing','TBANK-SCALP':'mini-tbank-scalp','TBANK-SWING':'mini-tbank-swing',MIDAS:'mini-midas'};
+const INST_CURRENCY={SCALP:'USDT',DEGEN:'USDT',SWING:'USDT','TBANK-SCALP':'RUB','TBANK-SWING':'RUB',MIDAS:'RUB'};
+const INST_SYM={SCALP:'$',DEGEN:'$',SWING:'$','TBANK-SCALP':'\u20bd','TBANK-SWING':'\u20bd',MIDAS:'\u20bd'};
 
 function buildArea(canvasId, labels, dailyArr, lineColor, currency, sym){
   const ctx=document.getElementById(canvasId).getContext('2d');

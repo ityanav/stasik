@@ -24,8 +24,8 @@ grinder:
   tp_parts: 1
   hedge_enabled: false
   position_size_usdt: 2000
-  tp_usdt: 20
-  sl_usdt: 10
+  tp_usdt: 8
+  sl_usdt: 6
   ls_crowd_threshold: 0.62
   funding_moderate: 0.0003
   funding_strong: 0.0005
@@ -34,7 +34,7 @@ grinder:
   oi_rise_threshold: 0.01
   obi_threshold: 0.4
   cvd_window: 5
-  adx_max: 40
+  adx_max: 50
   liq_oi_threshold: 0.02
   liq_vol_spike: 3.0
   liq_price_move: 0.005
