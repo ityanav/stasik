@@ -6,7 +6,10 @@ import pandas as pd
 
 from src.strategy.indicators import (
     analyze_orderbook,
+    calculate_adx,
     calculate_bollinger,
+    calculate_bollinger_bandwidth,
+    calculate_bollinger_pband,
     calculate_ema,
     calculate_macd,
     calculate_rsi,
@@ -214,8 +217,11 @@ class KotegawaGenerator:
       rsi_div  — RSI divergence (price vs RSI disagreement, +-1)
       bb       — price vs Bollinger Bands
       vol      — volume spike confirms panic/euphoria
+      cvd      — CVD divergence (buying/selling pressure vs price, +-1)
       pattern  — candlestick reversal patterns (hammer, engulfing)
       book     — orderbook imbalance (contrarian: sellers dominate → bounce)
+
+    Regime filter: ADX > adx_max → HOLD (don't fight strong trends).
     """
 
     def __init__(self, config: dict):
@@ -236,6 +242,10 @@ class KotegawaGenerator:
         # Volume
         self.vol_period = strat.get("vol_period", 20)
         self.vol_threshold = strat.get("vol_threshold", 1.5)     # vol spike = panic
+        # CVD divergence
+        self.cvd_window = strat.get("cvd_window", 0)            # 0 = disabled
+        # ADX regime filter
+        self.adx_max = strat.get("adx_max", 0)                  # 0 = disabled
         # Other
         self.min_score = strat.get("min_score", 3)
         self.patterns_enabled = strat.get("patterns_enabled", True)
@@ -246,6 +256,14 @@ class KotegawaGenerator:
     def generate(self, df: pd.DataFrame, symbol: str = "?", orderbook: dict | None = None) -> SignalResult:
         df.attrs["symbol"] = symbol
         scores: dict[str, int] = {}
+
+        # ── ADX regime filter (early exit if trending too hard) ──
+        if self.adx_max > 0 and len(df) >= 30:
+            adx = calculate_adx(df, period=14)
+            if adx > self.adx_max:
+                logger.info("Котегава %s: HOLD (ADX=%.1f > %d, trend too strong)", symbol, adx, self.adx_max)
+                return SignalResult(signal=Signal.HOLD, score=0,
+                                    details={"regime_filter": True, "adx": round(adx, 1)})
 
         # ── SMA deviation (MAIN signal) ─────────────────────
         dev = calculate_sma_deviation(df, self.sma_period)
@@ -324,6 +342,25 @@ class KotegawaGenerator:
             scores["book"] = -ob_result["score"]
         else:
             scores["book"] = 0
+
+        # ── CVD divergence (contrarian confirmation) ───────
+        if self.cvd_window > 0:
+            cvd_win = min(self.cvd_window, len(df))
+            if cvd_win >= 3:
+                closes = df["close"].tail(cvd_win).values
+                opens = df["open"].tail(cvd_win).values
+                volumes = df["volume"].tail(cvd_win).values
+                cvd = sum(v if c > o else -v for c, o, v in zip(closes, opens, volumes))
+                cvd_price_change = closes[-1] - closes[0]
+
+                if cvd_price_change < 0 and cvd > 0:
+                    scores["cvd"] = 1    # price down but buying pressure → bullish (buy the dip)
+                elif cvd_price_change > 0 and cvd < 0:
+                    scores["cvd"] = -1   # price up but selling pressure → bearish (sell the pump)
+                else:
+                    scores["cvd"] = 0
+            else:
+                scores["cvd"] = 0
 
         total = sum(scores.values())
 
@@ -545,3 +582,199 @@ class MomentumGenerator:
             symbol, trend.value, self.ema_fast, fast_val, self.ema_slow, slow_val, price,
         )
         return trend
+
+
+class GrinderGenerator:
+    """Contrarian v4: 6 indicators + regime filter + liquidation cascade.
+
+    Indicators:
+      1. L/S ratio     — crowd positioning (±1)
+      2. Funding rate   — graduated scoring (±1/±2/±3)
+      3. OI delta       — open interest changes (±1)
+      4. CVD divergence — approx cumulative volume delta (±1)
+      5. Order book imbalance — confirmation (±1)
+      6. Liquidation cascade — extreme OI drop + volume spike (±2)
+
+    Regime filter: ADX > adx_max → HOLD (don't trade strong trends).
+    min_score = 2 (need at least 2 confirming signals).
+    """
+
+    def __init__(self, config: dict):
+        grinder = config.get("grinder", {})
+        strat = config.get("strategy", {})
+
+        # L/S ratio
+        self.ls_crowd_threshold = grinder.get("ls_crowd_threshold", 0.55)
+
+        # Enhanced funding (3 tiers)
+        self.funding_moderate = grinder.get("funding_moderate", 0.0003)
+        self.funding_strong = grinder.get("funding_strong", 0.0005)
+        self.funding_extreme = grinder.get("funding_extreme", 0.001)
+
+        # OI delta
+        self.oi_drop_threshold = grinder.get("oi_drop_threshold", 0.005)
+        self.oi_rise_threshold = grinder.get("oi_rise_threshold", 0.01)
+
+        # Order book imbalance
+        self.obi_threshold = grinder.get("obi_threshold", 0.4)
+
+        # CVD
+        self.cvd_window = grinder.get("cvd_window", 5)
+
+        # ADX regime filter
+        self.adx_max = grinder.get("adx_max", 40)
+
+        # Liquidation cascade
+        self.liq_oi_threshold = grinder.get("liq_oi_threshold", 0.02)
+        self.liq_vol_spike = grinder.get("liq_vol_spike", 3.0)
+        self.liq_price_move = grinder.get("liq_price_move", 0.005)
+
+        self.min_score = strat.get("min_score", 2)
+
+        # Cached market data per symbol
+        self._ls_ratio: dict[str, dict] = {}
+        self._funding: dict[str, float] = {}
+        self._oi_data: dict[str, dict] = {}
+        self._obi: dict[str, float] = {}
+
+    def update_market_data(self, symbol: str, ls_ratio: dict, funding_rate: float,
+                           oi_data: dict | None = None, obi: float | None = None):
+        """Cache market data for a symbol."""
+        self._ls_ratio[symbol] = ls_ratio
+        self._funding[symbol] = funding_rate
+        if oi_data is not None:
+            self._oi_data[symbol] = oi_data
+        if obi is not None:
+            self._obi[symbol] = obi
+
+    def generate(self, df: pd.DataFrame, symbol: str = "?", orderbook: dict | None = None) -> SignalResult:
+        df.attrs["symbol"] = symbol
+        scores: dict[str, int] = {}
+
+        ls = self._ls_ratio.get(symbol)
+        funding = self._funding.get(symbol, 0.0)
+        if ls is None:
+            return SignalResult(signal=Signal.HOLD, score=0, details={"no_data": True})
+
+        # ── 1. ADX regime filter (early exit) ─────────────────
+        if len(df) >= 30:
+            adx = calculate_adx(df, period=14)
+            if adx > self.adx_max:
+                logger.info("Grinder %s: HOLD (ADX=%.1f > %d, trending)", symbol, adx, self.adx_max)
+                return SignalResult(signal=Signal.HOLD, score=0,
+                                    details={"regime_filter": True, "adx": round(adx, 1)})
+            scores["adx"] = 0  # passed filter
+        else:
+            adx = 0.0
+            scores["adx"] = 0
+
+        buy_ratio = ls["buy_ratio"]
+        sell_ratio = ls["sell_ratio"]
+
+        # ── 2. L/S ratio scoring (±1) ─────────────────────────
+        if buy_ratio > self.ls_crowd_threshold:
+            scores["ls"] = -1  # crowd long → go short
+        elif sell_ratio > self.ls_crowd_threshold:
+            scores["ls"] = 1   # crowd short → go long
+        else:
+            scores["ls"] = 0
+
+        # ── 3. Enhanced funding scoring (±1/±2/±3) ────────────
+        abs_funding = abs(funding)
+        if abs_funding > self.funding_extreme:
+            scores["funding"] = -3 if funding > 0 else 3
+        elif abs_funding > self.funding_strong:
+            scores["funding"] = -2 if funding > 0 else 2
+        elif abs_funding > self.funding_moderate:
+            scores["funding"] = -1 if funding > 0 else 1
+        else:
+            scores["funding"] = 0
+
+        # ── 4. OI delta scoring (±1) ──────────────────────────
+        oi = self._oi_data.get(symbol, {})
+        oi_delta = oi.get("delta_pct", 0.0)
+        price_change = 0.0
+        if len(df) >= 2:
+            price_change = (df["close"].iloc[-1] - df["close"].iloc[-2]) / df["close"].iloc[-2]
+
+        if oi_delta < -self.oi_drop_threshold and price_change < 0:
+            scores["oi"] = 1    # OI drop + price drop → liquidation cascade, buy the dip
+        elif oi_delta < -self.oi_drop_threshold and price_change > 0:
+            scores["oi"] = -1   # OI drop + price up → short squeeze ending
+        elif oi_delta > self.oi_rise_threshold and buy_ratio > self.ls_crowd_threshold:
+            scores["oi"] = -1   # OI rise + crowd long → overleverage
+        else:
+            scores["oi"] = 0
+
+        # ── 5. CVD divergence scoring (±1) ────────────────────
+        cvd_win = min(self.cvd_window, len(df))
+        if cvd_win >= 3:
+            closes = df["close"].tail(cvd_win).values
+            opens = df["open"].tail(cvd_win).values
+            volumes = df["volume"].tail(cvd_win).values
+            cvd = sum(v if c > o else -v for c, o, v in zip(closes, opens, volumes))
+            cvd_price_change = closes[-1] - closes[0]
+
+            if cvd_price_change > 0 and cvd < 0:
+                scores["cvd"] = -1  # price up but selling pressure → bearish divergence
+            elif cvd_price_change < 0 and cvd > 0:
+                scores["cvd"] = 1   # price down but buying pressure → bullish divergence
+            else:
+                scores["cvd"] = 0
+        else:
+            scores["cvd"] = 0
+
+        # ── 6. Order book imbalance (±1 confirmation) ─────────
+        obi = self._obi.get(symbol, 0.0)
+        if obi > self.obi_threshold:
+            scores["obi"] = -1   # bids dominate (contrarian: spoofing/trapped longs)
+        elif obi < -self.obi_threshold:
+            scores["obi"] = 1    # asks dominate → contrarian buy
+        else:
+            scores["obi"] = 0
+
+        # ── 7. Liquidation cascade bonus (±2) ─────────────────
+        vol_mean = df["volume"].tail(20).mean() if len(df) >= 20 else df["volume"].mean()
+        vol_ratio = df["volume"].iloc[-1] / vol_mean if vol_mean > 0 else 1.0
+
+        if abs(oi_delta) > self.liq_oi_threshold and vol_ratio > self.liq_vol_spike:
+            if price_change < -self.liq_price_move:
+                scores["liq"] = 2    # capitulation → strong BUY
+            elif price_change > self.liq_price_move:
+                scores["liq"] = -2   # short squeeze exhaustion → strong SELL
+            else:
+                scores["liq"] = 0
+        else:
+            scores["liq"] = 0
+
+        total = sum(scores.values())
+
+        if total >= self.min_score:
+            signal = Signal.BUY
+        elif total <= -self.min_score:
+            signal = Signal.SELL
+        else:
+            signal = Signal.HOLD
+
+        details = {
+            "buy_ratio": round(buy_ratio, 4),
+            "sell_ratio": round(sell_ratio, 4),
+            "funding": round(funding, 6),
+            "oi_delta": round(oi_delta, 4),
+            "obi": round(obi, 3),
+            "adx": round(adx, 1),
+            "vol_ratio": round(vol_ratio, 1),
+            **scores,
+        }
+
+        logger.info(
+            "Grinder %s: %s (score=%d, ls=%d, fund=%d, oi=%d, cvd=%d, obi=%d, liq=%d, adx=%.0f)",
+            symbol, signal.value, total,
+            scores.get("ls", 0), scores.get("funding", 0), scores.get("oi", 0),
+            scores.get("cvd", 0), scores.get("obi", 0), scores.get("liq", 0), adx,
+        )
+        return SignalResult(signal=signal, score=total, details=details)
+
+    def get_htf_trend(self, df: pd.DataFrame) -> Trend:
+        """Grinder does not use HTF trend — always neutral."""
+        return Trend.NEUTRAL

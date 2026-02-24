@@ -12,7 +12,7 @@ from src.risk.manager import RiskManager
 from src.storage.database import Database
 from src.strategy.ai_analyst import AIAnalyst, extract_indicator_values, format_risk_text, summarize_candles
 from src.strategy.indicators import calculate_atr, calculate_sma_deviation
-from src.strategy.signals import KotegawaGenerator, MomentumGenerator, Signal, SignalGenerator, SignalResult, Trend
+from src.strategy.signals import GrinderGenerator, KotegawaGenerator, MomentumGenerator, Signal, SignalGenerator, SignalResult, Trend
 
 logger = logging.getLogger(__name__)
 
@@ -127,6 +127,20 @@ class TradingEngine:
         # AI lessons from strategy reviews
         self._ai_lessons: list[str] = []
 
+        # Grinder grid mode
+        grinder_cfg = config.get("grinder", {})
+        self._grinder_mode: bool = config.get("strategy", {}).get("strategy_mode") == "grinder" and bool(grinder_cfg)
+        self._grinder_position_size_usdt: float = grinder_cfg.get("position_size_usdt", 5000)
+        self._grinder_tp_usdt: float = grinder_cfg.get("tp_usdt", 10)
+        self._grinder_sl_usdt: float = grinder_cfg.get("sl_usdt", 10)
+        self._grinder_auto_reentry: bool = grinder_cfg.get("auto_reentry", True)
+        self._grinder_tp_parts: int = grinder_cfg.get("tp_parts", 3)
+        self._grinder_hedge_enabled: bool = grinder_cfg.get("hedge_enabled", True)
+        self._grinder_hedge_after_usdt: float = grinder_cfg.get("hedge_after_usdt", 1.0)  # hedge when loss > N USDT
+        self._grinder_hedged: set[str] = set()  # symbols already hedged
+        self._grinder_last_direction: dict[str, str] = {}  # symbol -> last trade side
+        self._grinder_ls_period: str = grinder_cfg.get("ls_period", "5min")
+
         # Weekly report
         self._weekly_report_day: int = config.get("weekly_report_day", 0)  # 0=Monday
         self._last_weekly_report: str = ""  # ISO date of last report
@@ -150,6 +164,9 @@ class TradingEngine:
         if mode == "momentum":
             logger.info("Strategy mode: Momentum (breakout, long-only)")
             return MomentumGenerator(config)
+        if mode == "grinder":
+            logger.info("Strategy mode: Grinder (ping-pong)")
+            return GrinderGenerator(config)
         return SignalGenerator(config)
 
     def _update_market_bias(self):
@@ -235,7 +252,8 @@ class TradingEngine:
         # Reconcile exchange positions with DB
         await self._reconcile_positions()
 
-        await self._notify("🚀 Бот запущен\nПары: " + ", ".join(self.pairs))
+        if not self._grinder_mode:
+            await self._notify("🚀 Бот запущен\nПары: " + ", ".join(self.pairs))
         logger.info("Trading engine started")
 
         asyncio.create_task(self._run_sl_tp_monitor())
@@ -486,6 +504,9 @@ class TradingEngine:
                             await self._check_db_take_profit(trade)
                         except Exception:
                             logger.exception("TP poll error %s", trade.get("symbol"))
+                # Grinder hedge: open opposite when position goes negative
+                if self._grinder_mode and self._grinder_hedge_enabled:
+                    await self._grinder_check_hedge(open_trades)
             except Exception:
                 logger.exception("SL/TP poll error")
             await asyncio.sleep(5)
@@ -615,6 +636,49 @@ class TradingEngine:
         return passed
 
     async def _process_pair(self, symbol: str, category: str):
+        # ── Grinder contrarian-path: L/S ratio + funding ──
+        if self._grinder_mode:
+            try:
+                ls_ratio = self.client.get_long_short_ratio(symbol, period=self._grinder_ls_period, category=category)
+            except Exception:
+                ls_ratio = {"buy_ratio": 0.5, "sell_ratio": 0.5}
+            funding = self.client.get_funding_rate(symbol, category=category)
+            oi_data = self.client.get_open_interest_history(symbol, category=category)
+            obi = self.client.get_orderbook_imbalance(symbol, category=category)
+            self.signal_gen.update_market_data(symbol, ls_ratio, funding, oi_data=oi_data, obi=obi)
+
+            df = self.client.get_klines(
+                symbol=symbol, interval=self.timeframe, limit=30, category=category
+            )
+            if len(df) < 2:
+                return
+
+            result = self.signal_gen.generate(df, symbol)
+            if result.signal == Signal.HOLD:
+                return
+
+            side = "Buy" if result.signal == Signal.BUY else "Sell"
+            open_trades = await self.db.get_open_trades()
+            symbol_open = [t for t in open_trades if t["symbol"] == symbol]
+
+            if symbol_open:
+                # Hedge active (both directions) — don't interfere, let TP/SL resolve
+                if len(symbol_open) >= 2:
+                    return
+                existing = symbol_open[0]
+                if existing["side"] == side:
+                    return  # same direction — hold
+                # opposite signal → close & reopen
+                await self._close_grinder_trade(existing, category)
+                if self.risk.can_open_position(len(open_trades) - 1):
+                    await self._open_grinder_trade(symbol, side, category, result.details)
+                return
+
+            if not self.risk.can_open_position(len(open_trades)):
+                return
+            await self._open_grinder_trade(symbol, side, category, result.details)
+            return
+
         # Cooldown check (before API calls to save quota)
         now = time.time()
         cooldown_until = self._cooldowns.get(symbol, 0)
@@ -702,6 +766,13 @@ class TradingEngine:
         if adx < self._adx_min:
             logger.info("ADX фильтр: отклонён %s %s (ADX=%.1f < %d — боковик)",
                         result.signal.value, symbol, adx, self._adx_min)
+            return
+
+        # ADX max filter: skip if trend is too strong (mean-reversion dangerous)
+        adx_max = self.config.get("strategy", {}).get("adx_max", 0)
+        if adx_max > 0 and adx > adx_max:
+            logger.info("ADX max фильтр: отклонён %s %s (ADX=%.1f > %d — сильный тренд)",
+                        result.signal.value, symbol, adx, adx_max)
             return
 
         # HTF SMA deviation filter: отклонение должно быть видно и на старшем TF
@@ -1199,6 +1270,254 @@ class TradingEngine:
         logger.info(msg)
         await self._notify(msg)
 
+    # ── Grinder ping-pong trade ─────────────────────────────
+
+    async def _close_grinder_trade(self, trade: dict, category: str):
+        """Close a grinder position immediately (direction flip)."""
+        symbol = trade["symbol"]
+        side = trade["side"]
+        qty = trade["qty"]
+        entry = trade["entry_price"]
+        close_side = "Sell" if side == "Buy" else "Buy"
+        try:
+            self.client.place_order(
+                symbol=symbol, side=close_side, qty=qty,
+                category=category, reduce_only=True,
+            )
+        except Exception:
+            logger.exception("Grinder: failed to close %s", symbol)
+            return
+        # Get exit price and record
+        try:
+            exit_price = self.client.get_last_price(symbol, category=category)
+            if side == "Buy":
+                pnl = (exit_price - entry) * qty
+            else:
+                pnl = (entry - exit_price) * qty
+            balance = self.client.get_balance()
+            await self.db.close_trade(trade["id"], exit_price, pnl)
+            await self.db.update_daily_pnl(pnl)
+            await self._record_pnl(pnl, balance)
+            direction = "LONG" if side == "Buy" else "SHORT"
+            emoji = "+" if pnl >= 0 else ""
+            logger.info(
+                "Grinder flip: closed %s %s @ %.2f (PnL: %s%.2f)",
+                direction, symbol, exit_price, emoji, pnl,
+            )
+        except Exception:
+            logger.exception("Grinder: DB update failed for %s", symbol)
+
+    async def _open_grinder_trade(self, symbol: str, side: str, category: str, details: dict | None = None, size_override: float | None = None):
+        """Open a grinder trade with fixed USDT size, fixed USDT SL/TP."""
+        price = self.client.get_last_price(symbol, category=category)
+        if price <= 0:
+            return
+
+        info = self._get_instrument_info(symbol, category)
+        position_usdt = size_override if size_override else self._grinder_position_size_usdt
+        qty = position_usdt / price
+        qty = math.floor(qty / info["qty_step"]) * info["qty_step"]
+        qty = round(qty, 8)
+        if qty <= 0:
+            logger.info("Grinder: position size too small for %s", symbol)
+            return
+
+        # Fixed USDT SL/TP → convert to price offset
+        tp_offset = self._grinder_tp_usdt / qty if qty > 0 else 0
+        sl_offset = self._grinder_sl_usdt / qty if qty > 0 else 0
+
+        if side == "Buy":
+            tp = round(price + tp_offset, 6)
+            sl = round(price - sl_offset, 6)
+        else:
+            tp = round(price - tp_offset, 6)
+            sl = round(price + sl_offset, 6)
+
+        # Place order — if partial TP enabled, don't set TP on exchange (managed by polling)
+        exchange_tp = None if self._grinder_tp_parts > 1 else tp
+        try:
+            order = self.client.place_order(
+                symbol=symbol, side=side, qty=qty, category=category,
+                stop_loss=sl, take_profit=exchange_tp,
+            )
+        except Exception:
+            logger.exception("Grinder: failed to place order for %s", symbol)
+            return
+
+        order_id = order.get("orderId", "")
+        await self.db.insert_trade(
+            symbol=symbol, side=side, category=category,
+            qty=qty, entry_price=price, stop_loss=sl, take_profit=tp,
+            order_id=order_id,
+        )
+
+        self._grinder_last_direction[symbol] = side
+
+        balance = self.client.get_balance()
+        direction = "LONG" if side == "Buy" else "SHORT"
+
+        msg = (
+            f"{'🟢' if side == 'Buy' else '🔴'} Grinder {direction} {symbol}\n"
+            f"Price: {price:.2f} | Size: ~${position_usdt:,.0f}\n"
+            f"TP: +${self._grinder_tp_usdt} | SL: -${self._grinder_sl_usdt}\n"
+            f"Balance: {balance:,.0f} USDT"
+        )
+        logger.info(msg)
+
+    async def _grinder_partial_tp(self, trade: dict, cur_price: float):
+        """Grinder partial TP: close position in equal parts at each TP level.
+
+        Stage 0 → close 1/N at TP1, move TP to TP2
+        Stage 1 → close 1/N at TP2, move TP to TP3
+        ...
+        Last stage → close remainder, trigger re-entry.
+        Each TP level is spaced equally: TP_offset = tp_usdt / qty per part.
+        """
+        symbol = trade["symbol"]
+        side = trade["side"]
+        entry = trade["entry_price"]
+        qty = trade["qty"]
+        category = trade["category"]
+        n_parts = self._grinder_tp_parts
+        current_stage = trade.get("partial_closed", 0) or 0
+        is_last = current_stage >= n_parts - 1
+
+        # Qty to close this stage
+        if is_last:
+            close_qty = qty
+        else:
+            remaining_parts = n_parts - current_stage
+            close_qty = qty / remaining_parts
+
+        # Round to exchange step
+        info = self._get_instrument_info(symbol, "linear")
+        close_qty = math.floor(close_qty / info["qty_step"]) * info["qty_step"]
+        close_qty = round(close_qty, 8)
+
+        if close_qty < info["min_qty"]:
+            close_qty = qty
+            is_last = True
+
+        remaining_qty = round(qty - close_qty, 8)
+        if remaining_qty < info["min_qty"]:
+            close_qty = qty
+            remaining_qty = 0
+            is_last = True
+
+        # PnL for this partial
+        if side == "Buy":
+            partial_pnl = (cur_price - entry) * close_qty
+        else:
+            partial_pnl = (entry - cur_price) * close_qty
+
+        # Close partial on exchange
+        close_side = "Sell" if side == "Buy" else "Buy"
+        try:
+            self.client.place_order(
+                symbol=symbol, side=close_side, qty=close_qty,
+                category="linear", reduce_only=True,
+            )
+        except Exception:
+            logger.warning("Grinder partial TP: exchange close failed %s", symbol)
+
+        new_stage = current_stage + 1
+        opened_at = trade.get("opened_at", datetime.utcnow().isoformat())
+
+        if is_last:
+            # Final part — fully close trade
+            try:
+                balance = self.client.get_balance()
+                await self.db.mark_scale_out(trade["id"], new_stage, 0)
+                await self.db.close_trade(trade["id"], cur_price, partial_pnl)
+                await self.db.update_daily_pnl(partial_pnl)
+                await self._record_pnl(partial_pnl, balance)
+            except Exception:
+                logger.exception("Grinder partial TP final: DB error %s", symbol)
+            logger.info(
+                "Grinder TP %d/%d (final) %s: closed %.4f @ %.6f, PnL=%.2f",
+                new_stage, n_parts, symbol, close_qty, cur_price, partial_pnl,
+            )
+        else:
+            # Intermediate part — record partial, move TP further
+            try:
+                balance = self.client.get_balance()
+                await self.db.insert_partial_close(
+                    symbol=symbol, side=side, category=category,
+                    qty=close_qty, entry_price=entry, exit_price=cur_price,
+                    pnl=partial_pnl, stage=new_stage, opened_at=opened_at,
+                )
+                # Move TP to next level (same offset from current TP)
+                old_tp = trade["take_profit"]
+                tp_offset = self._grinder_tp_usdt / (self._grinder_position_size_usdt / entry) if entry > 0 else 0
+                if side == "Buy":
+                    new_tp = round(old_tp + tp_offset, 6)
+                else:
+                    new_tp = round(old_tp - tp_offset, 6)
+                await self.db.mark_scale_out(trade["id"], new_stage, remaining_qty)
+                await self.db.update_trade(trade["id"], take_profit=new_tp)
+                await self.db.update_daily_pnl(partial_pnl)
+                await self._record_pnl(partial_pnl, balance)
+            except Exception:
+                logger.exception("Grinder partial TP %d: DB error %s", new_stage, symbol)
+            logger.info(
+                "Grinder TP %d/%d %s: closed %.4f @ %.6f, PnL=%.2f, remaining=%.4f, new_TP=%.6f",
+                new_stage, n_parts, symbol, close_qty, cur_price, partial_pnl,
+                remaining_qty, new_tp if not is_last else 0,
+            )
+
+    async def _grinder_check_hedge(self, open_trades: list[dict]):
+        """Open opposite position when existing grinder trade goes into loss.
+
+        If LONG is losing > hedge_after_usdt → open SHORT (same size, same TP/SL).
+        If SHORT is losing → open LONG.
+        Only one hedge per symbol. Hedge cleared when original trade closes.
+        """
+        # Clean up hedged set: remove symbols with no open trades
+        open_symbols = {t["symbol"] for t in open_trades}
+        self._grinder_hedged -= (self._grinder_hedged - open_symbols)
+
+        for trade in open_trades:
+            symbol = trade["symbol"]
+            if symbol in self._grinder_hedged:
+                continue  # already hedged
+
+            side = trade["side"]
+            entry = trade["entry_price"]
+            qty = trade["qty"]
+            category = trade.get("category", "linear")
+
+            try:
+                cur_price = self.client.get_last_price(symbol, category=category)
+            except Exception:
+                continue
+
+            if cur_price <= 0:
+                continue
+
+            # Calculate unrealized PnL
+            if side == "Buy":
+                upnl = (cur_price - entry) * qty
+            else:
+                upnl = (entry - cur_price) * qty
+
+            # Only hedge if losing more than threshold
+            if upnl >= -self._grinder_hedge_after_usdt:
+                continue
+
+            # Check we have room for another position
+            if not self.risk.can_open_position(len(open_trades)):
+                continue
+
+            # Open opposite direction at half size
+            hedge_side = "Sell" if side == "Buy" else "Buy"
+            self._grinder_hedged.add(symbol)
+            hedge_size = self._grinder_position_size_usdt / 2
+            logger.info(
+                "Grinder HEDGE %s %s: original %s PnL=%.2f, opening opposite $%.0f",
+                hedge_side, symbol, side, upnl, hedge_size,
+            )
+            await self._open_grinder_trade(symbol, hedge_side, category, {"hedge": True}, size_override=hedge_size)
+
     # ── AI strategy review ──────────────────────────────────
 
     async def _ai_review_strategy(self):
@@ -1388,7 +1707,35 @@ class TradingEngine:
             f"Баланс: {balance:,.0f} USDT ({day_arrow} сегодня: {daily_total:+,.0f})"
         )
         logger.info(msg)
-        await self._notify(msg)
+        if not self._grinder_mode:
+            await self._notify(msg)
+
+        # ── Grinder auto re-entry ─────────────────────────────
+        if self._grinder_mode and self._grinder_auto_reentry:
+            # Skip cooldown for grinder
+            self._cooldowns.pop(symbol, None)
+            # Determine if TP or SL hit
+            tp_price = trade.get("take_profit", 0)
+            sl_price = trade.get("stop_loss", 0)
+            hit_tp = False
+            if tp_price and sl_price and exit_price:
+                tp_dist = abs(exit_price - tp_price)
+                sl_dist = abs(exit_price - sl_price)
+                hit_tp = tp_dist < sl_dist
+            if hit_tp:
+                # TP hit → re-enter same direction
+                new_side = side
+                logger.info("Grinder re-entry: TP hit, same direction %s %s", new_side, symbol)
+            else:
+                # SL hit → reverse
+                new_side = "Sell" if side == "Buy" else "Buy"
+                logger.info("Grinder re-entry: SL hit, reversing to %s %s", new_side, symbol)
+            # Get current levels for SL/TP
+            details = {}
+            if hasattr(self.signal_gen, '_support'):
+                details["support"] = self.signal_gen._support.get(symbol, 0)
+                details["resistance"] = self.signal_gen._resistance.get(symbol, 0)
+            await self._open_grinder_trade(symbol, new_side, category, details)
 
     async def _check_close_at_profit(self, trade: dict):
         """Close position as soon as PnL > 0 (triggered by Telegram button)."""
@@ -1715,6 +2062,11 @@ class TradingEngine:
         if side == "Sell" and cur_price > tp:
             return
 
+        # ── Grinder partial TP ──────────────────────────────
+        if self._grinder_mode and self._grinder_tp_parts > 1:
+            await self._grinder_partial_tp(trade, cur_price)
+            return
+
         # TP hit — close position
         if side == "Buy":
             upnl = (cur_price - entry) * qty
@@ -2039,6 +2391,112 @@ class TradingEngine:
             f"PnL: {upnl:+,.2f}"
         )
 
+    async def _check_grinder_bb_exit(self, trade: dict):
+        """Grinder BB exit: DEPRECATED (v1 logic). No longer called — grinder v2 uses SL/TP only."""
+        return  # v2: all exits via exchange SL/TP + auto re-entry
+        if not isinstance(self.signal_gen, GrinderGenerator):
+            return
+
+        symbol = trade["symbol"]
+        side = trade["side"]
+        entry = trade["entry_price"]
+        qty = trade["qty"]
+        category = trade["category"]
+
+        try:
+            df = self.client.get_klines(symbol, self.timeframe, limit=100, category=category)
+            if df is None or df.empty:
+                return
+        except Exception:
+            return
+
+        from src.strategy.indicators import calculate_bollinger
+        upper, middle, lower = calculate_bollinger(df, self.signal_gen.bb_period, self.signal_gen.bb_std)
+        mid_val = middle.iloc[-1]
+
+        try:
+            if self.exchange_type == "tbank":
+                cur_price = self.client.get_last_price(symbol)
+            else:
+                cur_price = self.client.get_last_price(symbol, category="linear")
+        except Exception:
+            return
+
+        # Update TP in DB to middle band (for dashboard display)
+        try:
+            await self.db.update_trade(trade["id"], take_profit=mid_val)
+        except Exception:
+            pass
+
+        # Check max hold time (force close)
+        max_hold = self.signal_gen.max_hold_candles
+        opened_at = trade.get("opened_at")
+        force_close = False
+        if opened_at and max_hold > 0:
+            from datetime import datetime, timezone
+            if isinstance(opened_at, str):
+                opened_dt = datetime.fromisoformat(opened_at.replace("Z", "+00:00"))
+            else:
+                opened_dt = opened_at
+            if opened_dt.tzinfo is None:
+                opened_dt = opened_dt.replace(tzinfo=timezone.utc)
+            now = datetime.now(timezone.utc)
+            # 1m candles → each candle = 60 seconds
+            tf_seconds = int(self.timeframe) * 60 if self.timeframe.isdigit() else 60
+            elapsed_candles = (now - opened_dt).total_seconds() / tf_seconds
+            if elapsed_candles >= max_hold:
+                force_close = True
+
+        # Check if price reached middle band
+        reached_middle = False
+        if side == "Buy" and cur_price >= mid_val:
+            reached_middle = True
+        elif side == "Sell" and cur_price <= mid_val:
+            reached_middle = True
+
+        if not reached_middle and not force_close:
+            return
+
+        # Close position
+        if side == "Buy":
+            upnl = (cur_price - entry) * qty
+        else:
+            upnl = (entry - cur_price) * qty
+
+        close_side = "Sell" if side == "Buy" else "Buy"
+        try:
+            if self.exchange_type == "tbank":
+                self.client.place_order(symbol=symbol, side=close_side, qty=qty)
+            else:
+                self.client.place_order(symbol=symbol, side=close_side, qty=qty, category=category, reduce_only=True)
+        except Exception:
+            logger.exception("Grinder BB exit: failed to close %s", symbol)
+            return
+
+        try:
+            balance = self.client.get_balance()
+            await self.db.close_trade(trade["id"], cur_price, upnl)
+            await self.db.update_daily_pnl(upnl)
+            await self._record_pnl(upnl, balance)
+        except Exception:
+            logger.exception("Grinder BB exit: DB update failed for %s", symbol)
+
+        if upnl < 0 and self._cooldown_seconds > 0:
+            self._cooldowns[symbol] = time.time() + self._cooldown_seconds
+
+        direction = "LONG" if side == "Buy" else "SHORT"
+        reason = "timeout" if force_close and not reached_middle else "middle band"
+        emoji = "🎯" if upnl >= 0 else "📉"
+        logger.info(
+            "%s Grinder выход (%s): %s %s @ %.6f (mid=%.6f, PnL=%.2f)",
+            emoji, reason, direction, symbol, cur_price, mid_val, upnl,
+        )
+        await self._notify(
+            f"{emoji} Grinder выход ({reason}): {direction} {symbol}\n"
+            f"Цена: {cur_price:,.6f} (BB mid: {mid_val:,.6f})\n"
+            f"PnL: {upnl:+,.2f}"
+        )
+
     async def _check_smart_exit(self, trade: dict):
         """Close trade early with small profit if signal reversed.
 
@@ -2257,6 +2715,8 @@ class TradingEngine:
         return self._instrument_cache[key]
 
     async def _notify(self, text: str):
+        if self._grinder_mode:
+            return
         if self.notifier:
             try:
                 if self.instance_name:

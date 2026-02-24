@@ -225,6 +225,51 @@ class BybitClient(ExchangeClient):
             logger.warning("Failed to get funding rate for %s: %s", symbol, e)
             return 0.0
 
+    # ── Long/Short ratio ───────────────────────────────────
+
+    def get_long_short_ratio(self, symbol: str, period: str = "5min", category: str = "linear") -> dict:
+        """Get current long/short ratio. Returns {buy_ratio, sell_ratio}."""
+        try:
+            resp = self.session.get_long_short_ratio(category=category, symbol=symbol, period=period)
+            data = resp["result"]["list"][0]
+            return {"buy_ratio": float(data["buyRatio"]), "sell_ratio": float(data["sellRatio"])}
+        except Exception as e:
+            logger.warning("Failed to get L/S ratio for %s: %s", symbol, e)
+            return {"buy_ratio": 0.5, "sell_ratio": 0.5}
+
+    # ── Open Interest history ──────────────────────────────
+
+    def get_open_interest_history(self, symbol: str, category: str = "linear") -> dict:
+        """Get OI for last 2 intervals (5min). Returns {current, previous, delta_pct}."""
+        try:
+            resp = self.session.get_open_interest(
+                category=category, symbol=symbol, intervalTime="5min", limit=2
+            )
+            items = resp["result"]["list"]
+            if len(items) >= 2:
+                current = float(items[0]["openInterest"])
+                previous = float(items[1]["openInterest"])
+                delta_pct = (current - previous) / previous if previous > 0 else 0.0
+                return {"current": current, "previous": previous, "delta_pct": delta_pct}
+            return {"current": 0, "previous": 0, "delta_pct": 0.0}
+        except Exception as e:
+            logger.warning("Failed to get OI history for %s: %s", symbol, e)
+            return {"current": 0, "previous": 0, "delta_pct": 0.0}
+
+    # ── Order book imbalance ─────────────────────────────
+
+    def get_orderbook_imbalance(self, symbol: str, depth: int = 25, category: str = "linear") -> float:
+        """Calculate order book imbalance: (bid_vol - ask_vol) / total. Range [-1, 1]."""
+        try:
+            book = self.get_orderbook(symbol, limit=depth, category=category)
+            bid_vol = sum(q for _, q in book["bids"][:depth])
+            ask_vol = sum(q for _, q in book["asks"][:depth])
+            total = bid_vol + ask_vol
+            return (bid_vol - ask_vol) / total if total > 0 else 0.0
+        except Exception as e:
+            logger.warning("Failed to get OBI for %s: %s", symbol, e)
+            return 0.0
+
     # ── All tickers (bulk) ─────────────────────────────────
 
     def get_all_tickers(self, category: str = "linear") -> dict:

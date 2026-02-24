@@ -38,6 +38,20 @@ def calculate_bollinger(
     return bb.bollinger_hband(), bb.bollinger_mavg(), bb.bollinger_lband()
 
 
+def calculate_bollinger_pband(df: pd.DataFrame, period: int = 20, std_dev: float = 2.0) -> float:
+    """Returns Bollinger %B (0.0 = lower band, 1.0 = upper, can exceed bounds)."""
+    bb = ta.volatility.BollingerBands(close=df["close"], window=period, window_dev=std_dev)
+    val = bb.bollinger_pband().iloc[-1]
+    return val if pd.notna(val) else 0.5
+
+
+def calculate_bollinger_bandwidth(df: pd.DataFrame, period: int = 20, std_dev: float = 2.0) -> float:
+    """Returns Bollinger Bandwidth (upper-lower)/middle — squeeze detection."""
+    bb = ta.volatility.BollingerBands(close=df["close"], window=period, window_dev=std_dev)
+    val = bb.bollinger_wband().iloc[-1]
+    return val if pd.notna(val) else 0.0
+
+
 def calculate_sma(df: pd.DataFrame, period: int = 25) -> pd.Series:
     """Returns Simple Moving Average."""
     return df["close"].rolling(window=period).mean()

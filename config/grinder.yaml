@@ -1,0 +1,131 @@
+ai:
+  api_key: sk-2dec36c8752d48b6b2cfdedd21337126
+  enabled: false
+  extra_timeframes:
+  - '5'
+  - '15'
+  min_confidence: 5
+  model: deepseek-chat
+  provider: deepseek
+  review_interval: 9999
+  style: grinder
+  timeout: 10
+bybit:
+  api_key: Ct24OvPFimR3vLSlcW
+  api_secret: CNzK2w9eQ41j4A4dszBLvvOkAH61Z5BQG9oq
+  demo: true
+  testnet: false
+dashboard:
+  enabled: false
+database:
+  path: /root/stasik/data/grinder.db
+grinder:
+  auto_reentry: false
+  tp_parts: 1
+  hedge_enabled: false
+  position_size_usdt: 2000
+  tp_usdt: 20
+  sl_usdt: 10
+  ls_crowd_threshold: 0.62
+  funding_moderate: 0.0003
+  funding_strong: 0.0005
+  funding_extreme: 0.001
+  oi_drop_threshold: 0.005
+  oi_rise_threshold: 0.01
+  obi_threshold: 0.4
+  cvd_window: 5
+  adx_max: 40
+  liq_oi_threshold: 0.02
+  liq_vol_spike: 3.0
+  liq_price_move: 0.005
+  ls_period: "5min"
+initial_balance: 164235
+instance_name: GRINDER
+risk:
+  atr_period: 14
+  atr_sl_max: 0.5
+  atr_sl_min: 0.1
+  atr_sl_multiplier: 1.5
+  atr_tp_max: 1.0
+  atr_tp_min: 0.2
+  atr_tp_multiplier: 3.0
+  atr_trail_max: 0.5
+  atr_trail_min: 0.1
+  atr_trailing_multiplier: 1.0
+  breakeven_activation: 0
+  commission_rate: 0.055
+  cooldown_after_loss: 60
+  correlation_groups:
+    majors:
+    - BTCUSDT
+    - ETHUSDT
+    alt_l1:
+    - SOLUSDT
+    memes:
+    - DOGEUSDT
+    - WIFUSDT
+    - 1000PEPEUSDT
+    - 1000FLOKIUSDT
+    - 1000BONKUSDT
+    - TRUMPUSDT
+  max_daily_loss: 5.0
+  max_open_positions: 3
+  max_per_group: 2
+  min_tp_net: 0
+  partial_close_enabled: false
+  risk_per_trade: 0.5
+  smart_exit_min: 0
+  stop_loss: 0.5
+  take_profit: 1.0
+  trailing_activation: 0
+  trailing_stop: 0
+strategy:
+  adx_min: 0
+  adx_period: 14
+  bb_period: 20
+  bb_std: 2.0
+  ema_fast: 9
+  ema_slow: 21
+  fng_extreme_fear: 0
+  fng_extreme_greed: 100
+  funding_rate_max: 999
+  htf_filter: false
+  htf_min_sma_dev: 0.0
+  htf_score_min: 0
+  macd_fast: 12
+  macd_signal: 9
+  macd_slow: 26
+  market_bias: false
+  min_score: 2
+  orderbook_enabled: false
+  patterns_enabled: false
+  reversal_confirmation: false
+  rsi_period: 14
+  sma_period: 25
+  squeeze_threshold: 0.03
+  strategy_mode: grinder
+  vol_period: 20
+  vol_threshold: 1.5
+telegram:
+  chat_id: '885025581'
+  token: 7852966698:AAFA_L6ovqXtTmMO05DBZg3UYbx4DklIY7k
+  notify_only: true
+trading:
+  htf_timeframe: '5'
+  leverage: 10
+  market_type: futures
+  pairs:
+  - BTCUSDT
+  - ETHUSDT
+  - SOLUSDT
+  - DOGEUSDT
+  - WIFUSDT
+  - 1000PEPEUSDT
+  - 1000FLOKIUSDT
+  - 1000BONKUSDT
+  - TRUMPUSDT
+  tick_interval: 15
+  timeframe: '1'
+  trading_hours:
+  - 0
+  - 24

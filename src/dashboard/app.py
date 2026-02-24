@@ -33,6 +33,11 @@ def _get_db_path(live_path: str, source: str) -> str:
     return live_path
 
 
+def _non_grinder_instances(config: dict) -> list[dict]:
+    """Return other_instances excluding GRINDER (it has its own /grinder page)."""
+    return [i for i in config.get("other_instances", []) if i.get("name", "").upper() != "GRINDER"]
+
+
 class Dashboard:
     def __init__(self, config: dict, db: Database, engine=None):
         self.config = config
@@ -113,6 +118,14 @@ class Dashboard:
         self.app.router.add_post("/api/set-tp", self._api_set_tp)
         self.app.router.add_get("/api/instances", self._api_instances)
         self.app.router.add_post("/api/set-leverage", self._api_set_leverage)
+        # Grinder page
+        self.app.router.add_get("/grinder", self._grinder_page)
+        self.app.router.add_get("/api/grinder/stats", self._api_grinder_stats)
+        self.app.router.add_get("/api/grinder/trades", self._api_grinder_trades)
+        self.app.router.add_get("/api/grinder/positions", self._api_grinder_positions)
+        self.app.router.add_get("/api/grinder/pnl", self._api_grinder_pnl)
+        self.app.router.add_get("/api/grinder/pairs", self._api_grinder_pairs)
+        self.app.router.add_post("/api/grinder/settings", self._api_grinder_settings)
 
     async def start(self):
         self._runner = web.AppRunner(self.app)
@@ -248,7 +261,7 @@ class Dashboard:
 
         # Total trades across all instances
         all_trades = total
-        for inst in self.config.get("other_instances", []):
+        for inst in _non_grinder_instances(self.config):
             db_path = _get_db_path(inst.get("db_path", ""), source)
             inst_name = inst.get("name", "")
             if db_path and Path(db_path).exists():
@@ -355,7 +368,7 @@ class Dashboard:
                 logger.warning("Failed to read trades from main DB")
 
         # Other instances trades
-        for inst in self.config.get("other_instances", []):
+        for inst in _non_grinder_instances(self.config):
             db_path = _get_db_path(inst.get("db_path", ""), source)
             inst_name = inst.get("name", "???")
             if db_path and Path(db_path).exists():
@@ -436,7 +449,7 @@ class Dashboard:
                 pnl_by_key[key][instance_name] = pnl_by_key[key].get(instance_name, 0) + d["pnl"]
 
         # Other instances
-        for inst in self.config.get("other_instances", []):
+        for inst in _non_grinder_instances(self.config):
             db_path = _get_db_path(inst.get("db_path", ""), source)
             inst_name = inst.get("name", "???")
             if db_path and Path(db_path).exists():
@@ -487,7 +500,7 @@ class Dashboard:
 
         main_db_path = _get_db_path(str(self.db.db_path), source)
         all_dbs = [(main_db_path, instance_name)]
-        for inst in self.config.get("other_instances", []):
+        for inst in _non_grinder_instances(self.config):
             db_path = _get_db_path(inst.get("db_path", ""), source)
             if db_path and Path(db_path).exists():
                 all_dbs.append((db_path, inst.get("name", "???")))
@@ -587,7 +600,7 @@ class Dashboard:
                 })
 
         # Other instances — open trades from DB
-        for inst in self.config.get("other_instances", []):
+        for inst in _non_grinder_instances(self.config):
             inst_name = inst.get("name", "???")
             db_path = _get_db_path(inst.get("db_path", ""), source)
             if db_path and Path(db_path).exists():
@@ -652,7 +665,7 @@ class Dashboard:
         inst_upper = (self.config.get("instance_name") or "SCALP").upper()
         exit_ratios = {inst_upper: main_exit_ratio}
         timeframes = {inst_upper: main_timeframe}
-        for inst in self.config.get("other_instances", []):
+        for inst in _non_grinder_instances(self.config):
             iname = inst.get("name", "").upper()
             exit_ratios[iname] = inst.get("exit_ratio", 0.8)
             tf = inst.get("timeframe", "5").replace("м", "").replace("m", "")
@@ -701,7 +714,7 @@ class Dashboard:
             if not service or action not in ("start", "stop", "restart"):
                 return web.json_response({"ok": False, "error": "Bad request"}, status=400)
             # Whitelist: only known stasik services
-            allowed = {"stasik", "stasik-degen", "stasik-swing", "stasik-tbank-scalp", "stasik-tbank-swing", "stasik-dashboard"}
+            allowed = {"stasik", "stasik-degen", "stasik-swing", "stasik-tbank-scalp", "stasik-tbank-swing", "stasik-dashboard", "stasik-grinder"}
             if service not in allowed:
                 return web.json_response({"ok": False, "error": "Unknown service"}, status=400)
 
@@ -755,7 +768,7 @@ class Dashboard:
             if not db_path:
                 # Fallback: find which DB has this symbol
                 all_dbs = [(str(self.db.db_path), self.config.get("instance_name", "SCALP"))]
-                for inst in self.config.get("other_instances", []):
+                for inst in _non_grinder_instances(self.config):
                     all_dbs.append((inst.get("db_path", ""), inst.get("name", "")))
                 for dp, _ in all_dbs:
                     if dp and Path(dp).exists():
@@ -983,7 +996,7 @@ class Dashboard:
         main_name = self.config.get("instance_name", "SCALP").upper()
         if not instance_upper or instance_upper == main_name:
             return str(self.db.db_path)
-        for inst in self.config.get("other_instances", []):
+        for inst in _non_grinder_instances(self.config):
             if inst.get("name", "").upper() == instance_upper:
                 return inst.get("db_path", "")
         return None
@@ -995,7 +1008,7 @@ class Dashboard:
         main_name = self.config.get("instance_name", "SCALP").upper()
         if instance_upper == main_name:
             return self.config.get("trading", {}).get("pairs", [])
-        for inst in self.config.get("other_instances", []):
+        for inst in _non_grinder_instances(self.config):
             if inst.get("name", "").upper() == instance_upper:
                 return inst.get("pairs", [])
         return []
@@ -1007,7 +1020,7 @@ class Dashboard:
         main_name = self.config.get("instance_name", "SCALP").upper()
         if instance_upper == main_name:
             return int(self.config.get("trading", {}).get("leverage", 10))
-        for inst in self.config.get("other_instances", []):
+        for inst in _non_grinder_instances(self.config):
             if inst.get("name", "").upper() == instance_upper:
                 # Try loading the actual config file for accurate leverage
                 svc = inst.get("service", "")
@@ -1169,7 +1182,7 @@ class Dashboard:
             })
 
         # Other instances
-        for inst in self.config.get("other_instances", []):
+        for inst in _non_grinder_instances(self.config):
             data = await self._read_instance_data(inst, source)
             instances.append(data)
 
@@ -1267,6 +1280,260 @@ class Dashboard:
             "leverage": inst.get("leverage", "?"),
             "pairs": inst.get("pairs", []),
         }
+
+    # ── Grinder page & API ────────────────────────────────────────
+
+    _GRINDER_DB = "/root/stasik/data/grinder.db"
+    _GRINDER_CONFIG = "/root/stasik/config/grinder.yaml"
+
+    async def _grinder_page(self, request: web.Request) -> web.Response:
+        return web.Response(text=_GRINDER_HTML, content_type="text/html",
+                            headers={"Cache-Control": "no-cache, no-store, must-revalidate"})
+
+    async def _api_grinder_stats(self, request: web.Request) -> web.Response:
+        try:
+            import yaml as _yaml
+            stats = {
+                "balance": 0, "daily_pnl": 0, "total_pnl": 0,
+                "total_trades": 0, "wins": 0, "losses": 0,
+                "win_rate": 0, "open_positions": 0, "settings": {},
+            }
+            # Read settings from config
+            try:
+                with open(self._GRINDER_CONFIG) as f:
+                    cfg = _yaml.safe_load(f) or {}
+                grinder_cfg = cfg.get("grinder", {})
+                stats["settings"] = {
+                    "position_size_usdt": grinder_cfg.get("position_size_usdt", 5000),
+                    "sl_pct": grinder_cfg.get("sl_pct", 0.1),
+                    "tp_mode": grinder_cfg.get("tp_mode", "auto"),
+                    "tp_pct": grinder_cfg.get("tp_pct", 0.22),
+                    "auto_reentry": grinder_cfg.get("auto_reentry", True),
+                    "leverage": cfg.get("trading", {}).get("leverage", 5),
+                    "pairs": cfg.get("trading", {}).get("pairs", []),
+                }
+            except Exception:
+                pass
+            # Get balance from Bybit
+            client = self._get_client()
+            if client:
+                try:
+                    stats["balance"] = client.get_balance()
+                except Exception:
+                    pass
+            # Read from DB
+            db_path = self._GRINDER_DB
+            if Path(db_path).exists():
+                async with aiosqlite.connect(db_path) as db:
+                    db.row_factory = aiosqlite.Row
+                    # Daily PnL
+                    today = date.today().isoformat()
+                    cur = await db.execute(
+                        "SELECT COALESCE(SUM(pnl), 0) FROM trades WHERE status='closed' AND date(closed_at)=?",
+                        (today,),
+                    )
+                    row = await cur.fetchone()
+                    stats["daily_pnl"] = float(row[0]) if row else 0
+                    # Total PnL
+                    cur = await db.execute("SELECT COALESCE(SUM(pnl), 0) FROM trades WHERE status='closed'")
+                    row = await cur.fetchone()
+                    stats["total_pnl"] = float(row[0]) if row else 0
+                    # Trade counts
+                    cur = await db.execute(
+                        "SELECT COUNT(*) as total, "
+                        "SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) as wins, "
+                        "SUM(CASE WHEN pnl <= 0 THEN 1 ELSE 0 END) as losses "
+                        "FROM trades WHERE status='closed'"
+                    )
+                    row = await cur.fetchone()
+                    if row:
+                        stats["total_trades"] = int(row["total"])
+                        stats["wins"] = int(row["wins"] or 0)
+                        stats["losses"] = int(row["losses"] or 0)
+                        if stats["total_trades"] > 0:
+                            stats["win_rate"] = round(stats["wins"] / stats["total_trades"] * 100, 1)
+                    # Open positions
+                    cur = await db.execute("SELECT COUNT(*) FROM trades WHERE status='open'")
+                    row = await cur.fetchone()
+                    stats["open_positions"] = int(row[0]) if row else 0
+            # Service status
+            stats["running"] = self._check_service_active("stasik-grinder")
+            return web.json_response(stats)
+        except Exception as e:
+            logger.exception("grinder stats error")
+            return web.json_response({"error": str(e)}, status=500)
+
+    async def _api_grinder_trades(self, request: web.Request) -> web.Response:
+        try:
+            page = int(request.query.get("page", 1))
+            per_page = int(request.query.get("per_page", 50))
+            offset = (page - 1) * per_page
+            trades = []
+            total = 0
+            db_path = self._GRINDER_DB
+            if Path(db_path).exists():
+                async with aiosqlite.connect(db_path) as db:
+                    db.row_factory = aiosqlite.Row
+                    cur = await db.execute("SELECT COUNT(*) FROM trades WHERE status='closed'")
+                    row = await cur.fetchone()
+                    total = int(row[0]) if row else 0
+                    cur = await db.execute(
+                        "SELECT * FROM trades WHERE status='closed' ORDER BY closed_at DESC LIMIT ? OFFSET ?",
+                        (per_page, offset),
+                    )
+                    rows = await cur.fetchall()
+                    commission_rate = 0.055 / 100
+                    for r in rows:
+                        entry = float(r["entry_price"])
+                        qty = float(r["qty"])
+                        gross_pnl = float(r["pnl"]) if r["pnl"] else 0
+                        pos_value = entry * qty
+                        fee = pos_value * commission_rate * 2
+                        trades.append({
+                            "id": r["id"],
+                            "symbol": r["symbol"],
+                            "side": r["side"],
+                            "entry_price": entry,
+                            "exit_price": float(r["exit_price"]) if r["exit_price"] else 0,
+                            "qty": qty,
+                            "gross_pnl": round(gross_pnl, 2),
+                            "fee": round(fee, 2),
+                            "net_pnl": round(gross_pnl - fee, 2),
+                            "opened_at": str(r["opened_at"]) if r["opened_at"] else "",
+                            "closed_at": str(r["closed_at"]) if r["closed_at"] else "",
+                        })
+            return web.json_response({"trades": trades, "total": total, "page": page, "per_page": per_page})
+        except Exception as e:
+            logger.exception("grinder trades error")
+            return web.json_response({"error": str(e)}, status=500)
+
+    async def _api_grinder_positions(self, request: web.Request) -> web.Response:
+        try:
+            positions = []
+            db_path = self._GRINDER_DB
+            client = self._get_client()
+            if Path(db_path).exists():
+                async with aiosqlite.connect(db_path) as db:
+                    db.row_factory = aiosqlite.Row
+                    cur = await db.execute("SELECT * FROM trades WHERE status='open'")
+                    rows = await cur.fetchall()
+                    for r in rows:
+                        entry = float(r["entry_price"])
+                        qty = float(r["qty"])
+                        side = r["side"]
+                        cur_price = entry
+                        if client:
+                            try:
+                                cur_price = client.get_last_price(r["symbol"], category="linear")
+                            except Exception:
+                                pass
+                        if side == "Buy":
+                            upnl = (cur_price - entry) * qty
+                        else:
+                            upnl = (entry - cur_price) * qty
+                        positions.append({
+                            "symbol": r["symbol"],
+                            "side": side,
+                            "qty": qty,
+                            "entry_price": entry,
+                            "current_price": cur_price,
+                            "take_profit": float(r["take_profit"]) if r["take_profit"] else 0,
+                            "stop_loss": float(r["stop_loss"]) if r["stop_loss"] else 0,
+                            "pnl": round(upnl, 2),
+                            "opened_at": str(r["opened_at"]) if r["opened_at"] else "",
+                        })
+            return web.json_response({"positions": positions})
+        except Exception as e:
+            logger.exception("grinder positions error")
+            return web.json_response({"error": str(e)}, status=500)
+
+    async def _api_grinder_pnl(self, request: web.Request) -> web.Response:
+        try:
+            data = []
+            db_path = self._GRINDER_DB
+            if Path(db_path).exists():
+                async with aiosqlite.connect(db_path) as db:
+                    db.row_factory = aiosqlite.Row
+                    cur = await db.execute(
+                        "SELECT closed_at, pnl, entry_price, qty FROM trades "
+                        "WHERE status='closed' ORDER BY closed_at ASC"
+                    )
+                    rows = await cur.fetchall()
+                    commission_rate = 0.055 / 100
+                    cumulative = 0
+                    for r in rows:
+                        gross = float(r["pnl"]) if r["pnl"] else 0
+                        fee = float(r["entry_price"]) * float(r["qty"]) * commission_rate * 2
+                        net = gross - fee
+                        cumulative += net
+                        data.append({
+                            "time": str(r["closed_at"]) if r["closed_at"] else "",
+                            "net_pnl": round(net, 2),
+                            "cumulative": round(cumulative, 2),
+                        })
+            return web.json_response({"pnl": data})
+        except Exception as e:
+            logger.exception("grinder pnl error")
+            return web.json_response({"error": str(e)}, status=500)
+
+    async def _api_grinder_pairs(self, request: web.Request) -> web.Response:
+        try:
+            pairs = []
+            db_path = self._GRINDER_DB
+            if Path(db_path).exists():
+                async with aiosqlite.connect(db_path) as db:
+                    db.row_factory = aiosqlite.Row
+                    cur = await db.execute(
+                        "SELECT symbol, COUNT(*) as trades, "
+                        "SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) as wins, "
+                        "SUM(pnl) as gross_pnl, "
+                        "SUM(entry_price * qty) as volume "
+                        "FROM trades WHERE status='closed' GROUP BY symbol ORDER BY SUM(pnl) DESC"
+                    )
+                    rows = await cur.fetchall()
+                    cr = 0.055 / 100
+                    for r in rows:
+                        trades = int(r["trades"])
+                        wins = int(r["wins"]) if r["wins"] else 0
+                        gross = float(r["gross_pnl"]) if r["gross_pnl"] else 0
+                        vol = float(r["volume"]) if r["volume"] else 0
+                        fee = vol * cr * 2
+                        net = gross - fee
+                        wr = round(wins / trades * 100) if trades > 0 else 0
+                        pairs.append({
+                            "symbol": r["symbol"], "trades": trades, "wins": wins,
+                            "win_rate": wr, "gross_pnl": round(gross, 4),
+                            "fee": round(fee, 4), "net_pnl": round(net, 4),
+                        })
+            return web.json_response({"pairs": pairs})
+        except Exception as e:
+            logger.exception("grinder pairs error")
+            return web.json_response({"error": str(e)}, status=500)
+
+    async def _api_grinder_settings(self, request: web.Request) -> web.Response:
+        try:
+            import yaml as _yaml
+            data = await request.json()
+            with open(self._GRINDER_CONFIG) as f:
+                cfg = _yaml.safe_load(f) or {}
+            if "grinder" not in cfg:
+                cfg["grinder"] = {}
+            # Update grinder settings
+            for key in ("position_size_usdt", "sl_pct", "tp_pct", "auto_reentry", "tp_mode"):
+                if key in data:
+                    cfg["grinder"][key] = data[key]
+            if "leverage" in data:
+                if "trading" not in cfg:
+                    cfg["trading"] = {}
+                cfg["trading"]["leverage"] = int(data["leverage"])
+            with open(self._GRINDER_CONFIG, "w") as f:
+                _yaml.dump(cfg, f, default_flow_style=False, allow_unicode=True)
+            # Restart grinder service
+            subprocess.run(["systemctl", "restart", "stasik-grinder"], capture_output=True, timeout=10)
+            return web.json_response({"ok": True, "message": "Settings saved, service restarted"})
+        except Exception as e:
+            logger.exception("grinder settings error")
+            return web.json_response({"ok": False, "error": str(e)}, status=500)
 
 
 # ── Login page ────────────────────────────────────────────────────
@@ -1707,6 +1974,7 @@ body.archive-mode .header{background:#fff;border-bottom-color:rgba(245,158,11,0.
       <button class="active" onclick="setSource('live')" data-source="live">Live</button>
       <button onclick="setSource('archive')" data-source="archive">Архив</button>
     </div>
+    <a href="/grinder" class="logout-btn" style="background:rgba(99,102,241,0.08);color:#6366f1;border-color:rgba(99,102,241,0.25)">Grinder</a>
     <div id="status-badge" class="off">...</div>
     <a href="/logout" class="logout-btn">Выход</a>
   </div>
@@ -2718,5 +2986,294 @@ updateMarketBar();setInterval(updateMarketBar,1000);
 
 loadAll();
 setInterval(async()=>{if(slEditing)return;await loadInstances();loadStats();loadChart();loadPositions()},10000);
+</script>
+</body></html>"""
+
+
+# ── Grinder page ─────────────────────────────────────────────────
+
+_GRINDER_HTML = """<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<title>Grinder — Ping-Pong Scalper</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
+<style>
+:root{--bg:#0f1117;--bg2:#1a1d2e;--bg3:#232740;--green:#22c55e;--red:#ef4444;--purple:#818cf8;--text:#e2e8f0;--muted:#64748b;--border:#2d3154}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:'Segoe UI',-apple-system,sans-serif;background:var(--bg);color:var(--text);min-height:100vh}
+.header{background:var(--bg2);border-bottom:1px solid var(--border);padding:14px 24px;display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;z-index:100}
+.header-left{display:flex;align-items:center;gap:14px}
+.header h1{font-size:20px;font-weight:700;color:#fff}
+.header h1 span{color:var(--purple);font-weight:400}
+.back-btn{color:var(--purple);text-decoration:none;font-size:14px;padding:6px 14px;border:1px solid var(--border);border-radius:8px;transition:all 0.2s}
+.back-btn:hover{background:var(--bg3);border-color:var(--purple)}
+#status-badge{padding:5px 14px;border-radius:20px;font-size:12px;font-weight:600;letter-spacing:0.5px}
+#status-badge.on{background:rgba(34,197,94,0.15);color:var(--green);border:1px solid rgba(34,197,94,0.3)}
+#status-badge.off{background:rgba(239,68,68,0.1);color:var(--red);border:1px solid rgba(239,68,68,0.25)}
+.container{max-width:1200px;margin:0 auto;padding:24px}
+.btn{padding:8px 20px;border-radius:8px;border:none;font-size:13px;font-weight:600;cursor:pointer;transition:all 0.2s}
+.btn-primary{background:var(--purple);color:#fff}.btn-primary:hover{opacity:0.85}
+.btn-green{background:var(--green);color:#fff}.btn-green:hover{opacity:0.85}
+.btn-red{background:var(--red);color:#fff}.btn-red:hover{opacity:0.85}
+.btn-outline{background:transparent;color:var(--text);border:1px solid var(--border)}.btn-outline:hover{border-color:var(--purple)}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:14px;margin-bottom:24px}
+.card{background:var(--bg2);border:1px solid var(--border);border-radius:12px;padding:18px;position:relative;overflow:hidden}
+.card::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;background:linear-gradient(90deg,var(--purple),transparent)}
+.card h3{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:1px}
+.card .val{font-size:24px;font-weight:700;margin-top:6px}
+.g{color:var(--green)}.r{color:var(--red)}
+.section{background:var(--bg2);border:1px solid var(--border);border-radius:12px;padding:20px;margin-bottom:24px}
+.section h2{font-size:16px;color:#fff;margin-bottom:14px;display:flex;align-items:center;gap:8px}
+.chart-wrap{height:300px;position:relative}
+table{width:100%;border-collapse:collapse}
+th{text-align:left;padding:10px 12px;color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:1px;border-bottom:1px solid var(--border)}
+td{padding:10px 12px;font-size:13px;border-bottom:1px solid rgba(45,49,84,0.5)}
+tr:hover{background:rgba(129,140,248,0.04)}
+.side-long{color:var(--green);font-weight:600}.side-short{color:var(--red);font-weight:600}
+.close-btn{background:none;border:1px solid var(--red);color:var(--red);width:28px;height:28px;border-radius:6px;cursor:pointer;font-size:16px;display:flex;align-items:center;justify-content:center;transition:all 0.2s}
+.close-btn:hover{background:var(--red);color:#fff}
+.pagination{display:flex;align-items:center;justify-content:center;gap:12px;margin-top:14px}
+.pagination button{background:var(--bg3);border:1px solid var(--border);color:var(--text);padding:8px 18px;border-radius:8px;font-size:13px;cursor:pointer;transition:all 0.2s}
+.pagination button:hover:not(:disabled){border-color:var(--purple);color:var(--purple)}
+.pagination button:disabled{opacity:0.3;cursor:default}
+</style>
+</head><body>
+
+<div class="header">
+  <div class="header-left">
+    <a href="/" class="back-btn">Dashboard</a>
+    <h1>Grinder <span>Ping-Pong</span></h1>
+  </div>
+  <div style="display:flex;align-items:center;gap:12px">
+    <span id="status-badge" class="off">OFFLINE</span>
+    <button class="btn btn-green" onclick="svcAction('start')">Start</button>
+    <button class="btn btn-red" onclick="svcAction('stop')">Stop</button>
+    <button class="btn btn-outline" onclick="svcAction('restart')">Restart</button>
+    <a href="/logout" class="back-btn" style="margin-left:8px">Logout</a>
+  </div>
+</div>
+
+<div class="container">
+  <!-- Stats cards -->
+  <div class="cards">
+    <div class="card"><h3>Balance</h3><div class="val" id="c-balance">—</div></div>
+    <div class="card"><h3>Daily PnL</h3><div class="val" id="c-daily">—</div></div>
+    <div class="card"><h3>Total PnL</h3><div class="val" id="c-total">—</div></div>
+    <div class="card"><h3>Trades</h3><div class="val" id="c-trades">—</div></div>
+    <div class="card"><h3>Win Rate</h3><div class="val" id="c-winrate">—</div></div>
+    <div class="card"><h3>Open Positions</h3><div class="val" id="c-open">—</div></div>
+  </div>
+
+  <!-- Pairs PnL -->
+  <div class="section">
+    <h2>Pairs</h2>
+    <div style="overflow-x:auto"><table>
+      <thead><tr><th>Pair</th><th>Trades</th><th>Wins</th><th>Win Rate</th><th>Gross PnL</th><th>Fee</th><th>Net PnL</th></tr></thead>
+      <tbody id="pairs-body"></tbody>
+    </table></div>
+  </div>
+
+  <!-- Open positions -->
+  <div class="section">
+    <h2 style="justify-content:space-between">Open Positions <button class="btn btn-red" style="font-size:12px;padding:5px 14px" onclick="closeAll()">Close All</button></h2>
+    <div style="overflow-x:auto"><table>
+      <thead><tr><th>Pair</th><th>Side</th><th>Size</th><th>TP $</th><th>SL $</th><th>Fee</th><th>Net PnL</th><th></th></tr></thead>
+      <tbody id="pos-body"></tbody>
+    </table></div>
+  </div>
+
+  <!-- PnL chart -->
+  <div class="section">
+    <h2>Cumulative PnL</h2>
+    <div class="chart-wrap"><canvas id="pnl-chart"></canvas></div>
+  </div>
+
+  <!-- Trade history -->
+  <div class="section">
+    <h2>Trade History</h2>
+    <div style="overflow-x:auto"><table>
+      <thead><tr><th>Time</th><th>Pair</th><th>Side</th><th>Gross PnL</th><th>Fee</th><th>Net PnL</th></tr></thead>
+      <tbody id="hist-body"></tbody>
+    </table></div>
+    <div class="pagination">
+      <button id="prev-btn" onclick="changePage(-1)" disabled>Prev</button>
+      <span id="page-info">1</span>
+      <button id="next-btn" onclick="changePage(1)">Next</button>
+    </div>
+  </div>
+</div>
+
+<script>
+let pnlChart=null, currentPage=1, totalPages=1;
+const PER_PAGE=50;
+
+
+async function loadStats(){
+  try{
+    const r=await fetch('/api/grinder/stats');
+    const d=await r.json();
+    if(d.error)return;
+    document.getElementById('c-balance').textContent='$'+Number(d.balance).toLocaleString('en',{maximumFractionDigits:0});
+    const daily=d.daily_pnl;
+    const de=document.getElementById('c-daily');
+    de.textContent=(daily>=0?'+':'')+daily.toFixed(2);
+    de.className='val '+(daily>=0?'g':'r');
+    const total=d.total_pnl;
+    const te=document.getElementById('c-total');
+    te.textContent=(total>=0?'+':'')+total.toFixed(2);
+    te.className='val '+(total>=0?'g':'r');
+    document.getElementById('c-trades').textContent=d.total_trades;
+    document.getElementById('c-winrate').textContent=d.win_rate+'%';
+    document.getElementById('c-open').textContent=d.open_positions;
+    // Status badge
+    const badge=document.getElementById('status-badge');
+    if(d.running){badge.textContent='ONLINE';badge.className='on'}
+    else{badge.textContent='OFFLINE';badge.className='off'}
+  }catch(e){console.error(e)}
+}
+
+async function loadPositions(){
+  try{
+    const r=await fetch('/api/grinder/positions');
+    const d=await r.json();
+    const tbody=document.getElementById('pos-body');
+    if(!d.positions||d.positions.length===0){tbody.innerHTML='<tr><td colspan="10" style="text-align:center;color:var(--muted)">No open positions</td></tr>';return}
+    const CR=0.00055;
+    tbody.innerHTML=d.positions.map(p=>{
+      const cls=p.side==='Buy'?'side-long':'side-short';
+      const size=p.entry_price*p.qty;
+      const fee=size*CR*2;
+      const net=p.pnl-fee;
+      const netCls=net>=0?'g':'r';
+      const isLong=p.side==='Buy';
+      const tpUsd=p.take_profit?(isLong?(p.take_profit-p.entry_price):(p.entry_price-p.take_profit))*p.qty:0;
+      const slUsd=p.stop_loss?(isLong?(p.entry_price-p.stop_loss):(p.stop_loss-p.entry_price))*p.qty:0;
+      return `<tr>
+        <td>${p.symbol}</td>
+        <td class="${cls}">${isLong?'LONG':'SHORT'}</td>
+        <td>$${size.toFixed(0)}</td>
+        <td style="color:var(--muted)">+$${tpUsd.toFixed(4)}</td>
+        <td style="color:var(--muted)">-$${slUsd.toFixed(4)}</td>
+        <td style="color:var(--muted)">$${fee.toFixed(4)}</td>
+        <td class="${netCls}">${net>=0?'+$':'-$'}${Math.abs(net).toFixed(4)}</td>
+        <td><button class="close-btn" onclick="closePos('${p.symbol}')" title="Close">&times;</button></td>
+      </tr>`}).join('');
+  }catch(e){console.error(e)}
+}
+
+async function loadPnlChart(){
+  try{
+    const r=await fetch('/api/grinder/pnl');
+    const d=await r.json();
+    if(!d.pnl||d.pnl.length===0)return;
+    const labels=d.pnl.map((_,i)=>i+1);
+    const values=d.pnl.map(p=>p.cumulative);
+    const ctx=document.getElementById('pnl-chart').getContext('2d');
+    if(pnlChart)pnlChart.destroy();
+    pnlChart=new Chart(ctx,{
+      type:'line',
+      data:{labels,datasets:[{
+        label:'Cumulative Net PnL',
+        data:values,
+        borderColor:'#818cf8',
+        backgroundColor:'rgba(129,140,248,0.1)',
+        fill:true,borderWidth:2,pointRadius:0,tension:0.3
+      }]},
+      options:{
+        responsive:true,maintainAspectRatio:false,
+        plugins:{legend:{display:false},datalabels:{display:false}},
+        scales:{
+          x:{display:true,grid:{color:'rgba(45,49,84,0.3)'},ticks:{color:'#64748b',maxTicksLimit:10}},
+          y:{grid:{color:'rgba(45,49,84,0.3)'},ticks:{color:'#64748b',callback:v=>'$'+v}}
+        }
+      }
+    });
+  }catch(e){console.error(e)}
+}
+
+async function loadHistory(page){
+  try{
+    const r=await fetch('/api/grinder/trades?page='+page+'&per_page='+PER_PAGE);
+    const d=await r.json();
+    const tbody=document.getElementById('hist-body');
+    if(!d.trades||d.trades.length===0){tbody.innerHTML='<tr><td colspan="8" style="text-align:center;color:var(--muted)">No trades yet</td></tr>';return}
+    totalPages=Math.ceil(d.total/PER_PAGE)||1;
+    document.getElementById('page-info').textContent=page+'/'+totalPages;
+    document.getElementById('prev-btn').disabled=page<=1;
+    document.getElementById('next-btn').disabled=page>=totalPages;
+    tbody.innerHTML=d.trades.map(t=>{
+      const cls=t.side==='Buy'?'side-long':'side-short';
+      const netCls=t.net_pnl>=0?'g':'r';
+      const time=t.closed_at?new Date(t.closed_at).toLocaleString('en-GB',{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'}):'';
+      return `<tr>
+        <td>${time}</td>
+        <td>${t.symbol}</td>
+        <td class="${cls}">${t.side==='Buy'?'LONG':'SHORT'}</td>
+        <td class="${t.gross_pnl>=0?'g':'r'}">${t.gross_pnl>=0?'+$':'-$'}${Math.abs(t.gross_pnl).toFixed(4)}</td>
+        <td style="color:var(--muted)">$${t.fee.toFixed(4)}</td>
+        <td class="${netCls}">${t.net_pnl>=0?'+$':'-$'}${Math.abs(t.net_pnl).toFixed(4)}</td>
+      </tr>`}).join('');
+  }catch(e){console.error(e)}
+}
+
+function changePage(delta){currentPage+=delta;if(currentPage<1)currentPage=1;loadHistory(currentPage)}
+
+async function svcAction(action){
+  try{
+    const r=await fetch('/api/toggle-service',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({service:'stasik-grinder',action})});
+    const d=await r.json();
+    if(!d.ok)alert('Error: '+(d.error||'unknown'));
+    setTimeout(loadStats,1500);
+  }catch(e){alert('Error: '+e)}
+}
+
+async function closePos(symbol){
+  if(!confirm('Close '+symbol+'?'))return;
+  try{
+    const r=await fetch('/api/close-position',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({symbol,instance:'GRINDER'})});
+    const d=await r.json();
+    if(!d.ok)alert('Error: '+(d.error||'unknown'));
+    setTimeout(loadPositions,1000);
+  }catch(e){alert('Error: '+e)}
+}
+
+async function closeAll(){
+  if(!confirm('Close ALL grinder positions?'))return;
+  try{
+    const r=await fetch('/api/grinder/positions');
+    const d=await r.json();
+    if(!d.positions||d.positions.length===0){alert('No open positions');return}
+    for(const p of d.positions){
+      await fetch('/api/close-position',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({symbol:p.symbol,instance:'GRINDER'})});
+    }
+    setTimeout(()=>{loadPositions();loadStats()},1500);
+  }catch(e){alert('Error: '+e)}
+}
+
+async function loadPairs(){
+  try{
+    const r=await fetch('/api/grinder/pairs');
+    const d=await r.json();
+    const tbody=document.getElementById('pairs-body');
+    if(!d.pairs||d.pairs.length===0){tbody.innerHTML='<tr><td colspan="7" style="text-align:center;color:var(--muted)">No data</td></tr>';return}
+    tbody.innerHTML=d.pairs.map(p=>{
+      const netCls=p.net_pnl>=0?'g':'r';
+      return `<tr>
+        <td>${p.symbol}</td>
+        <td>${p.trades}</td>
+        <td>${p.wins}</td>
+        <td>${p.win_rate}%</td>
+        <td class="${p.gross_pnl>=0?'g':'r'}">${p.gross_pnl>=0?'+$':'-$'}${Math.abs(p.gross_pnl).toFixed(4)}</td>
+        <td style="color:var(--muted)">$${p.fee.toFixed(4)}</td>
+        <td class="${netCls}">${p.net_pnl>=0?'+$':'-$'}${Math.abs(p.net_pnl).toFixed(4)}</td>
+      </tr>`}).join('');
+  }catch(e){console.error(e)}
+}
+
+// Initial load
+loadStats();loadPositions();loadPairs();loadPnlChart();loadHistory(1);
+setInterval(()=>{loadStats();loadPositions()},2000);
+setInterval(()=>{loadPairs();loadPnlChart();loadHistory(currentPage)},30000);
 </script>
 </body></html>"""
