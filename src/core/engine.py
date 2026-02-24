@@ -220,6 +220,19 @@ class TradingEngine:
             return SMCGenerator(config)
         return SignalGenerator(config)
 
+    def _calc_net_pnl(self, side: str, entry: float, exit_price: float, qty: float) -> float:
+        """Calculate net PnL after round-trip commission (entry + exit sides)."""
+        if side == "Buy":
+            gross = (exit_price - entry) * qty
+        else:
+            gross = (entry - exit_price) * qty
+        fee = (entry * qty + exit_price * qty) * self.risk.commission_rate
+        return gross - fee
+
+    def _calc_fee(self, entry: float, exit_price: float, qty: float) -> float:
+        """Calculate round-trip commission fee."""
+        return (entry * qty + exit_price * qty) * self.risk.commission_rate
+
     def _update_market_bias(self):
         """Detect market regime from BTC daily chart (EMA20 vs EMA50 + price position)."""
         import time as _time
@@ -719,11 +732,8 @@ class TradingEngine:
                 self._smc_pnl_tracker.pop(symbol, None)
                 continue
 
-            # Calculate PnL for closed part
-            if side == "Buy":
-                partial_pnl = (cur_price - entry) * close_qty
-            else:
-                partial_pnl = (entry - cur_price) * close_qty
+            # Calculate net PnL for closed part (after commission)
+            partial_pnl = self._calc_net_pnl(side, entry, cur_price, close_qty)
 
             opened_at = trade.get("opened_at", datetime.utcnow().isoformat())
 
@@ -836,11 +846,8 @@ class TradingEngine:
                 logger.exception("SMC graduated TP: failed to close %s stage %d", symbol, stage)
                 continue
 
-            # PnL for closed portion
-            if side == "Buy":
-                partial_pnl = (cur_price - entry) * close_qty
-            else:
-                partial_pnl = (entry - cur_price) * close_qty
+            # Net PnL for closed portion (after commission)
+            partial_pnl = self._calc_net_pnl(side, entry, cur_price, close_qty)
 
             opened_at = trade.get("opened_at", datetime.utcnow().isoformat())
             stage_num = stage + 1
@@ -870,11 +877,16 @@ class TradingEngine:
 
                 tracker["stage"] += 1
 
-                # After stage 1: move SL to breakeven
+                # After stage 1: move SL to breakeven on EXCHANGE + DB
                 if stage == 0:
                     try:
+                        if self.exchange_type == "bybit":
+                            self.client.session.set_trading_stop(
+                                category=category, symbol=symbol,
+                                stopLoss=str(round(entry, 6)), positionIdx=0,
+                            )
                         await self.db.update_stop_loss(trade["id"], entry)
-                        logger.info("SMC graduated TP: %s SL → breakeven (%.6f)", symbol, entry)
+                        logger.info("SMC graduated TP: %s SL → breakeven (%.6f) ON EXCHANGE", symbol, entry)
                     except Exception:
                         logger.exception("SMC graduated TP: failed to move SL to breakeven %s", symbol)
 
@@ -2042,11 +2054,8 @@ class TradingEngine:
             remaining_qty = 0
             is_last = True
 
-        # PnL for this partial
-        if side == "Buy":
-            partial_pnl = (cur_price - entry) * close_qty
-        else:
-            partial_pnl = (entry - cur_price) * close_qty
+        # Net PnL for this partial (after commission)
+        partial_pnl = self._calc_net_pnl(side, entry, cur_price, close_qty)
 
         # Close partial on exchange
         close_side = "Sell" if side == "Buy" else "Buy"
@@ -2132,13 +2141,10 @@ class TradingEngine:
             if cur_price <= 0:
                 continue
 
-            # Calculate unrealized PnL
-            if side == "Buy":
-                upnl = (cur_price - entry) * qty
-            else:
-                upnl = (entry - cur_price) * qty
+            # Calculate unrealized net PnL (after commission)
+            upnl = self._calc_net_pnl(side, entry, cur_price, qty)
 
-            # Only hedge if losing more than threshold
+            # Only hedge if losing more than threshold (net)
             if upnl >= -self._grinder_hedge_after_usdt:
                 continue
 
@@ -2545,11 +2551,8 @@ class TradingEngine:
             else:
                 exit_price = self.client.get_last_price(symbol, category="linear")
         if pnl is None:
-            if side == "Buy":
-                pnl = (exit_price - entry_price) * qty
-            else:
-                pnl = (entry_price - exit_price) * qty
-            logger.info("Using calculated PnL for %s: %.2f (fallback)", symbol, pnl)
+            pnl = self._calc_net_pnl(side, entry_price, exit_price, qty)
+            logger.info("Using calculated net PnL for %s: %.2f (fallback)", symbol, pnl)
 
         # Update DB
         balance = self.client.get_balance()
@@ -2644,15 +2647,12 @@ class TradingEngine:
         except Exception:
             return
 
-        if side == "Buy":
-            upnl = (cur_price - entry) * qty
-        else:
-            upnl = (entry - cur_price) * qty
+        net_pnl = self._calc_net_pnl(side, entry, cur_price, qty)
 
-        if upnl <= 0:
+        if net_pnl <= 0:
             return
 
-        # In profit — close it
+        # In net profit — close it
         close_side = "Sell" if side == "Buy" else "Buy"
         try:
             if self.exchange_type == "tbank":
@@ -2666,10 +2666,10 @@ class TradingEngine:
         self._close_at_profit.discard(symbol)
         currency = "RUB" if self.exchange_type == "tbank" else "USDT"
         direction = "ЛОНГ" if side == "Buy" else "ШОРТ"
-        logger.info("✅ Close-at-profit: закрыл %s %s при PnL +%.0f %s", direction, symbol, upnl, currency)
+        logger.info("✅ Close-at-profit: закрыл %s %s при net PnL +%.0f %s", direction, symbol, net_pnl, currency)
         await self._notify(
             f"✅ Закрыл {direction} {symbol} в плюсе\n"
-            f"PnL: +{upnl:,.0f} {currency}"
+            f"Net PnL: +{net_pnl:,.0f} {currency}"
         )
 
     def add_close_at_profit(self, symbol: str) -> str:
@@ -2705,13 +2705,10 @@ class TradingEngine:
         except Exception:
             return
 
-        # Calculate unrealized PnL
-        if side == "Buy":
-            upnl = (cur_price - entry) * qty
-        else:
-            upnl = (entry - cur_price) * qty
+        # Calculate unrealized net PnL (after commission)
+        net_pnl = self._calc_net_pnl(side, entry, cur_price, qty)
 
-        if upnl < target:
+        if net_pnl < target:
             return
 
         # Close the position
@@ -2726,24 +2723,22 @@ class TradingEngine:
             return
 
         # Update DB
-        exit_price = cur_price
-        actual_pnl = upnl
         try:
             balance = self.client.get_balance()
-            await self.db.close_trade(trade["id"], exit_price, actual_pnl)
-            await self.db.update_daily_pnl(actual_pnl)
-            await self._record_pnl(actual_pnl, balance)
+            await self.db.close_trade(trade["id"], cur_price, net_pnl)
+            await self.db.update_daily_pnl(net_pnl)
+            await self._record_pnl(net_pnl, balance)
         except Exception:
             logger.exception("Profit target: DB update failed for %s", symbol)
 
         direction = "ЛОНГ" if side == "Buy" else "ШОРТ"
         logger.info(
-            "💰 Profit target: закрыл %s %s при PnL +%.0f (цель: %d)",
-            direction, symbol, upnl, target,
+            "💰 Profit target: закрыл %s %s при net PnL +%.0f (цель: %d)",
+            direction, symbol, net_pnl, target,
         )
         await self._notify(
             f"💰 Profit target: закрыл {direction} {symbol}\n"
-            f"PnL: +{upnl:,.0f} USDT (цель: {target}$)"
+            f"Net PnL: +{net_pnl:,.0f} USDT (цель: {target}$)"
         )
 
     async def _check_loss_target(self, trade: dict):
@@ -2770,12 +2765,10 @@ class TradingEngine:
         except Exception:
             return
 
-        if side == "Buy":
-            upnl = (cur_price - entry) * qty
-        else:
-            upnl = (entry - cur_price) * qty
+        # Net PnL (loss + commission)
+        net_pnl = self._calc_net_pnl(side, entry, cur_price, qty)
 
-        if upnl > -target:
+        if net_pnl > -target:
             return  # loss not big enough yet
 
         # Close the position
@@ -2789,24 +2782,22 @@ class TradingEngine:
             logger.exception("Loss target: failed to close %s", symbol)
             return
 
-        exit_price = cur_price
-        actual_pnl = upnl
         try:
             balance = self.client.get_balance()
-            await self.db.close_trade(trade["id"], exit_price, actual_pnl)
-            await self.db.update_daily_pnl(actual_pnl)
-            await self._record_pnl(actual_pnl, balance)
+            await self.db.close_trade(trade["id"], cur_price, net_pnl)
+            await self.db.update_daily_pnl(net_pnl)
+            await self._record_pnl(net_pnl, balance)
         except Exception:
             logger.exception("Loss target: DB update failed for %s", symbol)
 
         direction = "ЛОНГ" if side == "Buy" else "ШОРТ"
         logger.info(
-            "🛑 Loss target: закрыл %s %s при PnL %.0f (лимит: -%d)",
-            direction, symbol, upnl, target,
+            "🛑 Loss target: закрыл %s %s при net PnL %.0f (лимит: -%d)",
+            direction, symbol, net_pnl, target,
         )
         await self._notify(
             f"🛑 Loss target: закрыл {direction} {symbol}\n"
-            f"PnL: {upnl:,.0f} USDT (лимит: -{target}$)"
+            f"Net PnL: {net_pnl:,.0f} USDT (лимит: -{target}$)"
         )
 
     async def _check_db_stop_loss(self, trade: dict):
@@ -2851,13 +2842,10 @@ class TradingEngine:
         if not cur_price:
             return
 
-        # Calculate unrealized loss
-        if side == "Buy":
-            unrealized_pnl = (cur_price - entry) * qty
-        else:
-            unrealized_pnl = (entry - cur_price) * qty
+        # Calculate unrealized net loss (after commission)
+        unrealized_pnl = self._calc_net_pnl(side, entry, cur_price, qty)
 
-        # When loss reaches 80% of limit → tighten SL to 60% of TP
+        # When net loss reaches 80% of limit → tighten SL to 60% of TP
         if unrealized_pnl < 0 and abs(unrealized_pnl) >= max_sl_usd * 0.8:
             new_sl_dist = abs(tp - entry) * 0.6
             if side == "Buy":
@@ -2886,11 +2874,8 @@ class TradingEngine:
         if side == "Sell" and cur_price < sl:
             return
 
-        # SL hit — close position
-        if side == "Buy":
-            upnl = (cur_price - entry) * qty
-        else:
-            upnl = (entry - cur_price) * qty
+        # SL hit — close position (net PnL after commission)
+        net_pnl = self._calc_net_pnl(side, entry, cur_price, qty)
 
         # Try to close on exchange (may fail if position is phantom)
         close_side = "Sell" if side == "Buy" else "Buy"
@@ -2905,9 +2890,9 @@ class TradingEngine:
         # Always close in DB
         try:
             balance = self.client.get_balance()
-            await self.db.close_trade(trade["id"], cur_price, upnl)
-            await self.db.update_daily_pnl(upnl)
-            await self._record_pnl(upnl, balance)
+            await self.db.close_trade(trade["id"], cur_price, net_pnl)
+            await self.db.update_daily_pnl(net_pnl)
+            await self._record_pnl(net_pnl, balance)
         except Exception:
             logger.exception("DB stop-loss: DB update failed for %s", symbol)
 
@@ -2916,11 +2901,12 @@ class TradingEngine:
         self._smc_pnl_tracker.pop(symbol, None)
 
         direction = "ЛОНГ" if side == "Buy" else "ШОРТ"
-        logger.info("🛑 SL сработал: %s %s @ %.6f (SL=%.6f, PnL=%.2f)", direction, symbol, cur_price, sl, upnl)
+        fee = self._calc_fee(entry, cur_price, qty)
+        logger.info("🛑 SL сработал: %s %s @ %.6f (SL=%.6f, net PnL=%.2f, fee=%.2f)", direction, symbol, cur_price, sl, net_pnl, fee)
         await self._notify(
             f"🛑 Стоп-лосс: {direction} {symbol}\n"
             f"Цена: {cur_price:,.6f} (SL: {sl:,.6f})\n"
-            f"PnL: {upnl:+,.2f}"
+            f"Net PnL: {net_pnl:+,.2f} (fee: {fee:.2f})"
         )
 
     async def _check_db_take_profit(self, trade: dict):
@@ -2960,11 +2946,8 @@ class TradingEngine:
             await self._grinder_partial_tp(trade, cur_price)
             return
 
-        # TP hit — close position
-        if side == "Buy":
-            upnl = (cur_price - entry) * qty
-        else:
-            upnl = (entry - cur_price) * qty
+        # TP hit — close position (net PnL after commission)
+        net_pnl = self._calc_net_pnl(side, entry, cur_price, qty)
 
         # Try to close on exchange (may fail if position is phantom)
         close_side = "Sell" if side == "Buy" else "Buy"
@@ -2979,18 +2962,19 @@ class TradingEngine:
         # Always close in DB
         try:
             balance = self.client.get_balance()
-            await self.db.close_trade(trade["id"], cur_price, upnl)
-            await self.db.update_daily_pnl(upnl)
-            await self._record_pnl(upnl, balance)
+            await self.db.close_trade(trade["id"], cur_price, net_pnl)
+            await self.db.update_daily_pnl(net_pnl)
+            await self._record_pnl(net_pnl, balance)
         except Exception:
             logger.exception("DB take-profit: DB update failed for %s", symbol)
 
         direction = "ЛОНГ" if side == "Buy" else "ШОРТ"
-        logger.info("🎯 TP сработал: %s %s @ %.6f (TP=%.6f, PnL=%.2f)", direction, symbol, cur_price, tp, upnl)
+        fee = self._calc_fee(entry, cur_price, qty)
+        logger.info("🎯 TP сработал: %s %s @ %.6f (TP=%.6f, net PnL=%.2f, fee=%.2f)", direction, symbol, cur_price, tp, net_pnl, fee)
         await self._notify(
             f"🎯 Тейк-профит: {direction} {symbol}\n"
             f"Цена: {cur_price:,.6f} (TP: {tp:,.6f})\n"
-            f"PnL: {upnl:+,.2f}"
+            f"Net PnL: {net_pnl:+,.2f} (fee: {fee:.2f})"
         )
 
     async def _check_kotegawa_scale_out(self, trade: dict):
@@ -3100,11 +3084,8 @@ class TradingEngine:
             logger.exception("Scale-out stage %d: failed to close %s", current_stage + 1, symbol)
             return
 
-        # Calculate PnL for this partial
-        if side == "Buy":
-            partial_pnl = (cur_price - entry) * close_qty
-        else:
-            partial_pnl = (entry - cur_price) * close_qty
+        # Calculate net PnL for this partial (after commission)
+        partial_pnl = self._calc_net_pnl(side, entry, cur_price, close_qty)
 
         new_stage = current_stage + 1
         opened_at = trade.get("opened_at", datetime.utcnow().isoformat())
@@ -3242,10 +3223,8 @@ class TradingEngine:
         if side == "Sell" and cur_price > target_price:
             return
 
-        if side == "Buy":
-            upnl = (cur_price - entry) * qty
-        else:
-            upnl = (entry - cur_price) * qty
+        # Net PnL (after commission)
+        upnl = self._calc_net_pnl(side, entry, cur_price, qty)
 
         close_side = "Sell" if side == "Buy" else "Buy"
         try:
@@ -3350,11 +3329,8 @@ class TradingEngine:
         if not reached_middle and not force_close:
             return
 
-        # Close position
-        if side == "Buy":
-            upnl = (cur_price - entry) * qty
-        else:
-            upnl = (entry - cur_price) * qty
+        # Close position (net PnL after commission)
+        upnl = self._calc_net_pnl(side, entry, cur_price, qty)
 
         close_side = "Sell" if side == "Buy" else "Buy"
         try:
@@ -3419,13 +3395,10 @@ class TradingEngine:
         except Exception:
             return
 
-        # Calculate unrealized PnL
-        if side == "Buy":
-            upnl = (cur_price - entry) * qty
-        else:
-            upnl = (entry - cur_price) * qty
+        # Calculate unrealized net PnL (after commission)
+        net_pnl = self._calc_net_pnl(side, entry, cur_price, qty)
 
-        if upnl < exit_min or upnl > exit_max:
+        if net_pnl < exit_min or net_pnl > exit_max:
             return
 
         # Check if current signal is opposite to our position
@@ -3461,20 +3434,20 @@ class TradingEngine:
         # Update DB
         try:
             balance = self.client.get_balance()
-            await self.db.close_trade(trade["id"], cur_price, upnl)
-            await self.db.update_daily_pnl(upnl)
-            await self._record_pnl(upnl, balance)
+            await self.db.close_trade(trade["id"], cur_price, net_pnl)
+            await self.db.update_daily_pnl(net_pnl)
+            await self._record_pnl(net_pnl, balance)
         except Exception:
             logger.exception("Smart exit: DB update failed for %s", symbol)
 
         direction = "ЛОНГ" if side == "Buy" else "ШОРТ"
         logger.info(
-            "🧠 Smart exit: закрыл %s %s при PnL +%.0f (сигнал развернулся: score=%d)",
-            direction, symbol, upnl, result.score,
+            "🧠 Smart exit: закрыл %s %s при net PnL +%.0f (сигнал развернулся: score=%d)",
+            direction, symbol, net_pnl, result.score,
         )
         await self._notify(
             f"🧠 Smart exit: закрыл {direction} {symbol}\n"
-            f"PnL: +{upnl:,.0f} (сигнал развернулся, score={result.score})"
+            f"Net PnL: +{net_pnl:,.0f} (сигнал развернулся, score={result.score})"
         )
 
     async def _check_breakeven(self, trade: dict):
@@ -3495,12 +3468,13 @@ class TradingEngine:
         else:
             current_price = self.client.get_last_price(symbol, category="linear")
 
-        if side == "Buy":
-            profit_pct = (current_price - entry) / entry
-        else:
-            profit_pct = (entry - current_price) / entry
+        # Net profit % (after commission)
+        qty = trade["qty"]
+        net_pnl = self._calc_net_pnl(side, entry, current_price, qty)
+        position_value = entry * qty if entry > 0 else 1
+        net_profit_pct = net_pnl / position_value
 
-        if profit_pct < self._breakeven_activation:
+        if net_profit_pct < self._breakeven_activation:
             return
 
         # Move SL to entry (breakeven)
@@ -3520,7 +3494,7 @@ class TradingEngine:
         self._breakeven_done.add(trade_id)
         msg = (
             f"🛡️ Безубыток {symbol}\n"
-            f"Прибыль: {profit_pct*100:.2f}% → SL перенесён на вход ({entry})"
+            f"Net прибыль: {net_profit_pct*100:.2f}% → SL перенесён на вход ({entry})"
         )
         logger.info(msg)
         await self._notify(msg)
@@ -4061,10 +4035,7 @@ class TradingEngine:
                     cur_price = self.client.get_last_price(sym)
                 else:
                     cur_price = self.client.get_last_price(sym, category="linear")
-                if side == "Buy":
-                    upnl = (cur_price - entry) * qty_val
-                else:
-                    upnl = (entry - cur_price) * qty_val
+                upnl = self._calc_net_pnl(side, entry, cur_price, qty_val)
             except Exception:
                 pass
             result.append({
@@ -4100,10 +4071,7 @@ class TradingEngine:
                                 cur_price = prices.get(sym)
                                 upnl = 0.0
                                 if cur_price and entry > 0 and qty_val > 0:
-                                    if r["side"] == "Buy":
-                                        upnl = (cur_price - entry) * qty_val
-                                    else:
-                                        upnl = (entry - cur_price) * qty_val
+                                    upnl = self._calc_net_pnl(r["side"], entry, cur_price, qty_val)
                                 result.append({
                                     "symbol": sym,
                                     "side": r["side"],
@@ -4697,10 +4665,7 @@ class TradingEngine:
                                 qty_val = r["qty"]
                                 cur_price = prices.get(sym)
                                 if cur_price and entry > 0 and qty_val > 0:
-                                    if r["side"] == "Buy":
-                                        upnl = (cur_price - entry) * qty_val
-                                    else:
-                                        upnl = (entry - cur_price) * qty_val
+                                    upnl = self._calc_net_pnl(r["side"], entry, cur_price, qty_val)
                                     pnl_pct = (cur_price / entry - 1) * 100 if r["side"] == "Buy" else (1 - cur_price / entry) * 100
                                     if is_tbank:
                                         tbank_pnl += upnl
