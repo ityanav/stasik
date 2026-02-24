@@ -1142,7 +1142,7 @@ class Dashboard:
 
             instances.append({
                 "name": self.config.get("instance_name", "SCALP"),
-                "service": "stasik",
+                "service": "stasik-smc",
                 "running": False,
                 "daily_pnl": scalp_daily,
                 "total_pnl": scalp_total,
@@ -1164,7 +1164,7 @@ class Dashboard:
 
             instances.append({
                 "name": self.config.get("instance_name", "SCALP"),
-                "service": "stasik",
+                "service": "stasik-smc",
                 "running": running,
                 "daily_pnl": scalp_daily,
                 "total_pnl": scalp_total,
@@ -1844,62 +1844,6 @@ body.archive-mode .header{background:#fff;border-bottom-color:rgba(245,158,11,0.
 
     <!-- Mini-charts grid -->
     <div class="chart-grid" id="chart-grid">
-      <div class="chart-mini" id="mini-scalp">
-        <div class="chart-mini-header">
-          <span class="chart-half-label" style="margin:0"><span class="dot dot-bybit"></span>SCALP</span>
-          <button class="expand-btn" onclick="expandChart('SCALP')">&#x2922;</button>
-        </div>
-        <canvas id="pnlChartScalp"></canvas>
-      </div>
-      <div class="chart-mini" id="mini-degen">
-        <div class="chart-mini-header">
-          <span class="chart-half-label" style="margin:0"><span class="dot dot-degen"></span>DEGEN</span>
-          <button class="expand-btn" onclick="expandChart('DEGEN')">&#x2922;</button>
-        </div>
-        <canvas id="pnlChartDegen"></canvas>
-      </div>
-      <div class="chart-mini" id="mini-swing">
-        <div class="chart-mini-header">
-          <span class="chart-half-label" style="margin:0"><span class="dot dot-swing"></span>SWING</span>
-          <button class="expand-btn" onclick="expandChart('SWING')">&#x2922;</button>
-        </div>
-        <canvas id="pnlChartSwing"></canvas>
-      </div>
-      <div class="chart-mini" id="mini-tbank-scalp">
-        <div class="chart-mini-header">
-          <span class="chart-half-label" style="margin:0"><span class="dot dot-tbank"></span>TB-SCALP</span>
-          <button class="expand-btn" onclick="expandChart('TBANK-SCALP')">&#x2922;</button>
-        </div>
-        <canvas id="pnlChartTbankScalp"></canvas>
-      </div>
-      <div class="chart-mini" id="mini-tbank-swing">
-        <div class="chart-mini-header">
-          <span class="chart-half-label" style="margin:0"><span class="dot dot-tbank"></span>TB-SWING</span>
-          <button class="expand-btn" onclick="expandChart('TBANK-SWING')">&#x2922;</button>
-        </div>
-        <canvas id="pnlChartTbankSwing"></canvas>
-      </div>
-      <div class="chart-mini" id="mini-midas">
-        <div class="chart-mini-header">
-          <span class="chart-half-label" style="margin:0"><span class="dot dot-midas"></span>MIDAS</span>
-          <button class="expand-btn" onclick="expandChart('MIDAS')">&#x2922;</button>
-        </div>
-        <canvas id="pnlChartMidas"></canvas>
-      </div>
-      <div class="chart-mini" id="mini-turtle">
-        <div class="chart-mini-header">
-          <span class="chart-half-label" style="margin:0"><span class="dot dot-turtle"></span>TURTLE</span>
-          <button class="expand-btn" onclick="expandChart('TURTLE')">&#x2922;</button>
-        </div>
-        <canvas id="pnlChartTurtle"></canvas>
-      </div>
-      <div class="chart-mini" id="mini-turtle-tb">
-        <div class="chart-mini-header">
-          <span class="chart-half-label" style="margin:0"><span class="dot dot-turtle"></span>TURTLE-TB</span>
-          <button class="expand-btn" onclick="expandChart('TURTLE-TB')">&#x2922;</button>
-        </div>
-        <canvas id="pnlChartTurtleTb"></canvas>
-      </div>
       <div class="chart-mini" id="mini-smc">
         <div class="chart-mini-header">
           <span class="chart-half-label" style="margin:0"><span class="dot dot-smc"></span>SMC</span>
@@ -2137,11 +2081,11 @@ async function loadStats(){
 }
 
 let chartCombined=null, miniCharts={}, chartFull=null, instanceData={};
-const INST_COLORS={SCALP:'#818cf8',DEGEN:'#f472b6',SWING:'#f59e0b','TBANK-SCALP':'#34d399','TBANK-SWING':'#059669',MIDAS:'#fbbf24',TURTLE:'#10b981','TURTLE-TB':'#059669',SMC:'#a78bfa'};
-const INST_CANVAS={SCALP:'pnlChartScalp',DEGEN:'pnlChartDegen',SWING:'pnlChartSwing','TBANK-SCALP':'pnlChartTbankScalp','TBANK-SWING':'pnlChartTbankSwing',MIDAS:'pnlChartMidas',TURTLE:'pnlChartTurtle','TURTLE-TB':'pnlChartTurtleTb',SMC:'pnlChartSmc'};
-const INST_MINI={SCALP:'mini-scalp',DEGEN:'mini-degen',SWING:'mini-swing','TBANK-SCALP':'mini-tbank-scalp','TBANK-SWING':'mini-tbank-swing',MIDAS:'mini-midas',TURTLE:'mini-turtle','TURTLE-TB':'mini-turtle-tb',SMC:'mini-smc'};
-const INST_CURRENCY={SCALP:'USDT',DEGEN:'USDT',SWING:'USDT','TBANK-SCALP':'RUB','TBANK-SWING':'RUB',MIDAS:'RUB',TURTLE:'USDT','TURTLE-TB':'RUB',SMC:'USDT'};
-const INST_SYM={SCALP:'$',DEGEN:'$',SWING:'$','TBANK-SCALP':'\u20bd','TBANK-SWING':'\u20bd',MIDAS:'\u20bd',TURTLE:'$','TURTLE-TB':'\u20bd',SMC:'$'};
+const INST_COLORS={SMC:'#a78bfa','TBANK-SCALP':'#34d399','TBANK-SWING':'#059669',MIDAS:'#fbbf24'};
+const INST_CANVAS={SMC:'pnlChartSmc'};
+const INST_MINI={SMC:'mini-smc'};
+const INST_CURRENCY={SMC:'USDT','TBANK-SCALP':'RUB','TBANK-SWING':'RUB',MIDAS:'RUB'};
+const INST_SYM={SMC:'$','TBANK-SCALP':'\u20bd','TBANK-SWING':'\u20bd',MIDAS:'\u20bd'};
 
 function buildArea(canvasId, labels, dailyArr, lineColor, currency, sym){
   const ctx=document.getElementById(canvasId).getContext('2d');
@@ -2395,7 +2339,7 @@ async function loadChart(){
     // Parse per-instance data from API response
     // API keys: SCALP, DEGEN, SWING, TBANK-SCALP, TBANK-SWING
     const instDaily={};
-    const KNOWN_INST=['SCALP','DEGEN','SWING','TBANK-SCALP','TBANK-SWING','MIDAS','TURTLE','TURTLE-TB','SMC'];
+    const KNOWN_INST=['SMC','TBANK-SCALP','TBANK-SWING','MIDAS'];
 
     pnl.forEach((d,i)=>{
       const keys=Object.keys(d).filter(k=>!['trade_date','pnl','trades_count'].includes(k));
@@ -2413,13 +2357,9 @@ async function loadChart(){
           // Fuzzy: TBANK_SCALP -> TBANK-SCALP, etc
           if(name.includes('TBANK')&&name.includes('SCALP'))mapped='TBANK-SCALP';
           else if(name.includes('TBANK')&&name.includes('SWING'))mapped='TBANK-SWING';
-          else if(name.includes('TURTLE')&&name.includes('TB'))mapped='TURTLE-TB';
-          else if(name.includes('TURTLE'))mapped='TURTLE';
           else if(name.includes('MIDAS'))mapped='MIDAS';
           else if(name.includes('SMC'))mapped='SMC';
-          else if(name.includes('DEGEN'))mapped='DEGEN';
-          else if(name.includes('SWING'))mapped='SWING';
-          else mapped='SCALP';
+          else mapped='SMC';
         }
         if(!instDaily[mapped])instDaily[mapped]=new Array(pnl.length).fill(0);
         instDaily[mapped][i]+=(d[k]||0);
@@ -2485,7 +2425,7 @@ async function loadChart(){
   }catch(e){console.error('chart',e)}
 }
 
-const ALL_SERVICES=['stasik','stasik-swing','stasik-tbank-scalp','stasik-tbank-swing','stasik-midas','stasik-turtle','stasik-turtle-tbank','stasik-smc'];
+const ALL_SERVICES=['stasik-smc','stasik-tbank-scalp','stasik-tbank-swing','stasik-midas'];
 async function bulkAction(action){
   const label=action==='restart'?'Перезапустить':'Остановить';
   if(!confirm(label+' ВСЕХ ботов ('+ALL_SERVICES.length+')?'))return;
