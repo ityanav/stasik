@@ -11,13 +11,16 @@ from src.strategy.indicators import (
     calculate_bollinger,
     calculate_bollinger_bandwidth,
     calculate_bollinger_pband,
+    calculate_cumulative_delta,
     calculate_donchian,
     calculate_ema,
     calculate_fib_pivots,
     calculate_fibonacci_levels,
     calculate_macd,
+    calculate_murray_math_lines,
     calculate_rsi,
     calculate_sma_deviation,
+    calculate_volume_profile,
     calculate_volume_signal,
     detect_candlestick_patterns,
     detect_displacement,
@@ -603,6 +606,22 @@ class SMCGenerator:
         self.fib_pivots_enabled = smc.get("fib_pivots", False)
         self.fib_pivot_proximity_pct = smc.get("fib_pivot_proximity_pct", 0.3)
 
+        # Volume Profile
+        self.vol_profile_enabled = smc.get("volume_profile_enabled", False)
+        self.vol_profile_bins = smc.get("volume_profile_bins", 50)
+        self.vol_profile_value_area_pct = smc.get("volume_profile_value_area_pct", 70.0)
+        self.vol_profile_proximity_pct = smc.get("volume_profile_proximity_pct", 0.3)
+
+        # Cumulative Delta
+        self.cum_delta_enabled = smc.get("cum_delta_enabled", False)
+        self.cum_delta_lookback = smc.get("cum_delta_lookback", 50)
+        self.cum_delta_divergence_lookback = smc.get("cum_delta_divergence_lookback", 20)
+
+        # Murray Math Lines
+        self.murray_enabled = smc.get("murray_enabled", False)
+        self.murray_period = smc.get("murray_period", 64)
+        self.murray_proximity_pct = smc.get("murray_proximity_pct", 0.3)
+
         # ADX max (optional regime filter)
         self.adx_max = smc.get("adx_max", 0)
 
@@ -831,6 +850,50 @@ class SMCGenerator:
                             break
         scores["pivot_bonus"] = pivot_bonus
 
+        # ── 10. Volume Profile ──
+        vp_score = 0
+        if self.vol_profile_enabled:
+            vp = calculate_volume_profile(
+                df,
+                num_bins=self.vol_profile_bins,
+                value_area_pct=self.vol_profile_value_area_pct,
+                proximity_pct=self.vol_profile_proximity_pct,
+            )
+            vp_score = vp["score"]
+            if vp_score != 0:
+                details["vp_poc"] = vp["poc"]
+                details["vp_vah"] = vp["vah"]
+                details["vp_val"] = vp["val"]
+        scores["vol_profile"] = vp_score
+
+        # ── 11. Cumulative Delta ──
+        cd_score = 0
+        if self.cum_delta_enabled:
+            cd = calculate_cumulative_delta(
+                df,
+                lookback=self.cum_delta_lookback,
+                divergence_lookback=self.cum_delta_divergence_lookback,
+            )
+            cd_score = cd["score"]
+            if cd_score != 0:
+                details["cd_delta"] = cd["current_delta"]
+                details["cd_divergence"] = cd["divergence_type"]
+        scores["cum_delta"] = cd_score
+
+        # ── 12. Murray Math Lines ──
+        mm_score = 0
+        if self.murray_enabled:
+            mm = calculate_murray_math_lines(
+                df,
+                period=self.murray_period,
+                proximity_pct=self.murray_proximity_pct,
+            )
+            mm_score = mm["score"]
+            if mm_score != 0:
+                details["mm_level"] = mm["nearest_level"]
+                details["mm_price"] = mm["nearest_price"]
+        scores["murray"] = mm_score
+
         total = sum(scores.values())
 
         if total >= self.min_score:
@@ -850,7 +913,7 @@ class SMCGenerator:
         details["fib_direction"] = direction
 
         logger.info(
-            "SMC %s: %s (score=%d, fib=%d[%s], ote=%d, sweep=%d[%s], fvg=%d, ob=%d, disp=%d, vol=%d, rsi_div=%d, cluster=%d, pivot=%d)",
+            "SMC %s: %s (score=%d, fib=%d[%s], ote=%d, sweep=%d[%s], fvg=%d, ob=%d, disp=%d, vol=%d, rsi_div=%d, cluster=%d, pivot=%d, vp=%d, cd=%d, mm=%d)",
             symbol, signal.value, total,
             scores["fib_zone"], fib_zone_name,
             scores.get("ote_bonus", 0),
@@ -858,6 +921,7 @@ class SMCGenerator:
             scores["fvg"], scores["order_block"],
             scores["displacement"], scores["volume"], scores["rsi_div"],
             scores.get("cluster_bonus", 0), scores.get("pivot_bonus", 0),
+            scores.get("vol_profile", 0), scores.get("cum_delta", 0), scores.get("murray", 0),
         )
         return SignalResult(signal=signal, score=total, details={**details, **scores})
 

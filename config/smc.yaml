@@ -80,6 +80,19 @@ smc:
   # Fibonacci Pivot Points (daily S/R levels)
   fib_pivots: true
   fib_pivot_proximity_pct: 0.3
+  # Volume Profile (POC/VAH/VAL from price-volume distribution)
+  volume_profile_enabled: true
+  volume_profile_bins: 50
+  volume_profile_value_area_pct: 70.0
+  volume_profile_proximity_pct: 0.3
+  # Cumulative Delta (buy/sell pressure divergence)
+  cum_delta_enabled: true
+  cum_delta_lookback: 50
+  cum_delta_divergence_lookback: 20
+  # Murray Math Lines (harmonic support/resistance)
+  murray_enabled: true
+  murray_period: 64
+  murray_proximity_pct: 0.3
 
 risk:
   risk_per_trade: 0.5
