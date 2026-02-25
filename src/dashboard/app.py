@@ -685,7 +685,7 @@ class Dashboard:
             if not service or action not in ("start", "stop", "restart"):
                 return web.json_response({"ok": False, "error": "Bad request"}, status=400)
             # Whitelist: only known stasik services
-            allowed = {"stasik", "stasik-degen", "stasik-tbank-scalp", "stasik-tbank-swing", "stasik-dashboard", "stasik-midas", "stasik-turtle", "stasik-turtle-tbank", "stasik-smc", "stasik-fiba", "stasik-accountant"}
+            allowed = {"stasik", "stasik-degen", "stasik-tbank-scalp", "stasik-tbank-swing", "stasik-dashboard", "stasik-midas", "stasik-turtle", "stasik-turtle-tbank", "stasik-smc", "stasik-fiba", "stasik-buba", "stasik-accountant"}
             if service not in allowed:
                 return web.json_response({"ok": False, "error": "Unknown service"}, status=400)
 
@@ -1545,6 +1545,7 @@ tr:hover{background:rgba(0,229,255,0.05)}
 .instance-card.midas::before{background:linear-gradient(90deg,#ffe600,#fff176)}
 .instance-card.turtle::before{background:linear-gradient(90deg,#39ff14,#76ff03)}
 .instance-card.smc::before{background:linear-gradient(90deg,#bf00ff,#e040fb)}
+.instance-card.buba::before{background:linear-gradient(90deg,#6366f1,#a78bfa)}
 .instance-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px}
 .instance-name{font-size:18px;font-weight:700;color:var(--text);display:flex;align-items:center;gap:8px;flex:1;min-width:0}
 .instance-name .badge{
@@ -2079,11 +2080,12 @@ async function loadInstances(){
       const isMidas=key.includes('MIDAS');
       const isTurtle=key.includes('TURTLE')&&!isTbank;
       const isSmc=key.includes('FIBA');
-      const cardCls=isTbank?'tbank':isDegen?'degen':isScalp?'scalp':isMidas?'midas':isTurtle?'turtle':isSmc?'smc':'swing';
-      const badgeCls=isTbank?'badge-tbank':isDegen?'badge-degen':isScalp?'badge-scalp':isMidas?'badge-midas':isTurtle?'badge-turtle':isSmc?'badge-smc':'badge-swing';
+      const isBuba=key.includes('BUBA');
+      const cardCls=isTbank?'tbank':isDegen?'degen':isScalp?'scalp':isMidas?'midas':isTurtle?'turtle':isBuba?'buba':isSmc?'smc':'swing';
+      const badgeCls=isTbank?'badge-tbank':isDegen?'badge-degen':isScalp?'badge-scalp':isMidas?'badge-midas':isTurtle?'badge-turtle':isBuba?'badge-buba':isSmc?'badge-smc':'badge-swing';
       const tf=i.timeframe;
       const cur=(isTbank||isMidas)?'RUB':'USDT';
-      const icon=isTbank?'🏦':isDegen?'🎰':isScalp?'⚡':isMidas?'🥇':isTurtle?'🐢':isSmc?'🧠':'🌊';
+      const icon=isTbank?'🏦':isDegen?'🎰':isScalp?'⚡':isMidas?'🥇':isTurtle?'🐢':isBuba?'🔮':isSmc?'🧠':'🌊';
       const svc=i.service||'';
       const toggleBtn=svc&&currentSource==='live'?
         (i.running?`<button class="btn-icon btn-icon-stop" onclick="toggleService('${svc}','stop',this)" title="Остановить">&#9632;</button>`

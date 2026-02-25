@@ -327,7 +327,7 @@ class Accountant:
                 t = dict(t)
                 t["instance"] = db_cfg["instance"]
                 t["db_path"] = path
-                t["commission_rate"] = db_cfg["commission_rate"]
+                t["commission_rate"] = db_cfg["commission_rate"] / 100
 
                 symbol = t["symbol"]
                 try:
@@ -408,7 +408,7 @@ class Accountant:
             f"Направление: {direction}\n"
             f"Вход: {entry:.4f}, Текущая: {cur:.4f}\n"
             f"Безубыток (вход+комиссия): {breakeven:.4f}\n"
-            f"PnL: {pos['net_pnl_pct']:.2f}% ({pos['net_pnl']:.2f}$)\n"
+            f"Net PnL (после комиссии): {pos['net_pnl_pct']:.2f}% ({pos['net_pnl']:.2f}$)\n"
             f"Время в сделке: {time_in_trade}\n"
             f"TP: {tp:.4f} ({tp_dist_pct:.2f}% от текущей)\n"
             f"SL: {sl:.4f} ({sl_dist_pct:.2f}% от текущей)\n"
@@ -578,7 +578,7 @@ class Accountant:
                 entry = trade.get("entry_price", 0)
                 exit_p = trade.get("exit_price", 0)
                 qty = trade.get("qty", 0)
-                comm = db_cfg["commission_rate"]
+                comm = db_cfg["commission_rate"] / 100
                 if entry and exit_p and qty:
                     final_net = _calc_net_pnl(trade["side"], entry, exit_p, qty, comm)
                     notional = entry * qty
@@ -770,8 +770,8 @@ class Accountant:
 
         await self._notify(
             f"\U0001f4b0 Бухгалтер зафиксировал: {symbol} ({pos['instance']})\n"
-            f"PnL: {'+' if net_pnl >= 0 else ''}{net_pnl:.2f}$ "
-            f"({pos['net_pnl_pct']:.2f}%)\n"
+            f"Net PnL: {'+' if net_pnl >= 0 else ''}{net_pnl:.2f}$ "
+            f"({pos['net_pnl_pct']:.2f}% после комиссии)\n"
             f"Причина: {reasoning}"
         )
 

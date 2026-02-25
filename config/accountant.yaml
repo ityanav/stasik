@@ -12,17 +12,20 @@ trading:
 
 accountant:
   check_interval: 10
-  min_profit_pct: 0.5
+  min_profit_pct: 0.1
   min_confidence: 8
   timeframe: "15"
 
 databases:
   - path: "/root/stasik/data/trades.db"
     instance: "SCALP"
-    commission_rate: 0.00055
+    commission_rate: 0.055
   - path: "/root/stasik/data/fiba.db"
     instance: "FIBA"
-    commission_rate: 0.00055
+    commission_rate: 0.055
+  - path: "/root/stasik/data/buba.db"
+    instance: "BUBA"
+    commission_rate: 0.055
 
 ai:
   api_key: "sk-2dec36c8752d48b6b2cfdedd21337126"

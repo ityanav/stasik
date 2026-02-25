@@ -1,8 +1,8 @@
-instance_name: "FIBA"
+instance_name: "BUBA"
 initial_balance: 164235
 
 database:
-  path: "/root/stasik/data/fiba.db"
+  path: "/root/stasik/data/buba.db"
 
 bybit:
   testnet: false
@@ -13,15 +13,15 @@ bybit:
 trading:
   pairs: ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "AVAXUSDT", "LINKUSDT", "SUIUSDT", "APTUSDT"]
   market_type: "futures"
-  timeframe: "15"          # 15m entry
-  htf_timeframe: "60"      # 1H structure (swings + fib)
+  timeframe: "60"           # 1H entry
+  htf_timeframe: "240"      # 4H structure (swings + fib)
   leverage: 3
   trading_hours: [0, 24]
-  tick_interval: 60          # every minute
+  tick_interval: 300         # every 5 min
 
 strategy:
   strategy_mode: "smc"
-  min_score: 3
+  min_score: 4              # stricter on 1H — fewer but better signals
   adx_min: 0
   adx_max: 0
   adx_period: 14
@@ -66,54 +66,47 @@ smc:
   tp_extension_1: 1.0
   tp_extension_2: 1.272
   adx_max: 0
-  # OTE 0.705 bonus (+1 score near optimal trade entry)
   ote_bonus: true
   ote_proximity_pct: 0.3
-  # ZigZag ATR-based swing detection (adaptive to volatility)
   zigzag_enabled: true
   zigzag_atr_period: 14
   zigzag_atr_mult: 2.0
-  # Fibonacci Clusters (multi-swing confluence zones)
   cluster_enabled: true
   cluster_threshold_pct: 1.0
   cluster_min_levels: 3
-  # Fibonacci Pivot Points (daily S/R levels)
   fib_pivots: true
   fib_pivot_proximity_pct: 0.3
-  # Volume Profile (POC/VAH/VAL from price-volume distribution)
   volume_profile_enabled: true
   volume_profile_bins: 50
   volume_profile_value_area_pct: 70.0
   volume_profile_proximity_pct: 0.3
-  # Cumulative Delta (buy/sell pressure divergence)
   cum_delta_enabled: true
   cum_delta_lookback: 50
   cum_delta_divergence_lookback: 20
-  # Murray Math Lines (harmonic support/resistance)
   murray_enabled: true
   murray_period: 64
   murray_proximity_pct: 0.3
 
 risk:
-  risk_per_trade: 0.5
+  risk_per_trade: 1.0       # higher risk — fewer but higher conviction trades
   max_open_positions: 4
   max_per_group: 1
   commission_rate: 0.055
-  max_margin_usdt: 20000             # Max initial margin for this instance ($)
+  max_margin_usdt: 20000
   min_tp_net: 0
-  cooldown_after_loss: 5
-  stop_loss: 2.0
-  take_profit: 4.0
+  cooldown_after_loss: 30   # 30 min cooldown (half a candle on 1H)
+  stop_loss: 3.0
+  take_profit: 6.0
   atr_period: 14
-  atr_sl_multiplier: 1.5
-  atr_tp_multiplier: 1.5
-  atr_trailing_multiplier: 1.0
-  atr_sl_max: 5.0
-  atr_sl_min: 0.5
-  atr_tp_max: 5.0
-  atr_tp_min: 1.0
-  atr_trail_max: 3.0
-  atr_trail_min: 0.3
+  atr_sl_multiplier: 2.0    # wider SL for 1H — more room to breathe
+  atr_tp_multiplier: 2.5    # wider TP — bigger moves on higher TF
+  atr_trailing_multiplier: 1.5
+  atr_sl_max: 6.0
+  atr_sl_min: 1.0
+  atr_tp_max: 8.0
+  atr_tp_min: 2.0
+  atr_trail_max: 4.0
+  atr_trail_min: 0.5
   trailing_stop: 0
   trailing_activation: 0
   breakeven_activation: 0
@@ -142,7 +135,7 @@ ai:
   timeout: 10
   review_interval: 9999
   style: smc
-  extra_timeframes: ["5", "15", "60"]
+  extra_timeframes: ["15", "60", "240"]
 
 telegram:
   token: "7852966698:AAFA_L6ovqXtTmMO05DBZg3UYbx4DklIY7k"
@@ -151,33 +144,3 @@ telegram:
 
 dashboard:
   enabled: false
-  port: 8080
-  username: "ityanav"
-  password_hash: "$2b$12$nkNYfoUba3r6SkwXealnduvAay.TzvkLvLNfBRxvICjfLxC.osU1e"
-  secret: "f390917c31c0730992cef29d79739f023c15e555ed045b9cc5b5282298fa29eb"
-
-other_instances:
-  - name: "TBANK-SCALP"
-    db_path: "/root/stasik/data/tbank_scalp.db"
-    service: "stasik-tbank-scalp"
-    timeframe: "15м"
-    leverage: "1x"
-    pairs: ["SBER", "GAZP", "YDEX", "LKOH", "ROSN"]
-  - name: "TBANK-SWING"
-    db_path: "/root/stasik/data/tbank_swing.db"
-    service: "stasik-tbank-swing"
-    timeframe: "D"
-    leverage: "1x"
-    pairs: ["SBER", "GAZP", "LKOH"]
-  - name: "BUBA"
-    db_path: "/root/stasik/data/buba.db"
-    service: "stasik-buba"
-    timeframe: "1H"
-    leverage: "3x"
-    pairs: ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "AVAXUSDT", "LINKUSDT", "SUIUSDT", "APTUSDT"]
-  - name: "MIDAS"
-    db_path: "/root/stasik/data/midas.db"
-    service: "stasik-midas"
-    timeframe: "5м"
-    leverage: "1x"
-    pairs: ["GLDRUB_TOM", "SLVRUB_TOM", "PLTRUB_TOM", "CNYRUB_TOM", "USD000UTSTOM", "KZTRUB_TOM"]
