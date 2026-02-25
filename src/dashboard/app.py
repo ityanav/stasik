@@ -1337,7 +1337,8 @@ body{
 }
 .login-box:hover{box-shadow:0 4px 24px rgba(0,0,0,0.4),0 0 60px rgba(0,229,255,0.12)}
 .logo{text-align:center;margin-bottom:28px}
-.logo .icon{font-size:48px;display:block;margin-bottom:8px}
+.logo .cyber-logo{width:72px;height:72px;margin:0 auto 12px;filter:drop-shadow(0 0 12px rgba(0,229,255,0.6)) drop-shadow(0 0 24px rgba(191,0,255,0.3));animation:logoPulse 3s ease-in-out infinite}
+@keyframes logoPulse{0%,100%{filter:drop-shadow(0 0 12px rgba(0,229,255,0.6)) drop-shadow(0 0 24px rgba(191,0,255,0.3))}50%{filter:drop-shadow(0 0 20px rgba(0,229,255,0.9)) drop-shadow(0 0 40px rgba(191,0,255,0.5))}}
 .logo h1{font-size:22px;font-weight:700;color:#e0e0f0;letter-spacing:2px;text-shadow:0 0 10px rgba(0,229,255,0.5)}
 .logo p{font-size:13px;color:#667;margin-top:4px}
 .error{
@@ -1373,7 +1374,20 @@ button:disabled{opacity:0.4;cursor:not-allowed}
 </head><body>
 <div class="login-box">
   <div class="logo">
-    <div class="icon">🤖</div>
+    <svg class="cyber-logo" viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg">
+      <defs>
+        <linearGradient id="cg" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#00e5ff"/><stop offset="100%" stop-color="#bf00ff"/></linearGradient>
+        <filter id="glow"><feGaussianBlur stdDeviation="2" result="blur"/><feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
+      </defs>
+      <polygon points="50,8 90,28 90,72 50,92 10,72 10,28" fill="none" stroke="url(#cg)" stroke-width="2" filter="url(#glow)"/>
+      <polygon points="50,16 82,32 82,68 50,84 18,68 18,32" fill="rgba(0,229,255,0.05)" stroke="url(#cg)" stroke-width="0.5"/>
+      <rect x="28" y="38" width="16" height="10" rx="2" fill="#00e5ff" opacity="0.9"><animate attributeName="opacity" values="0.9;0.4;0.9" dur="2s" repeatCount="indefinite"/></rect>
+      <rect x="56" y="38" width="16" height="10" rx="2" fill="#bf00ff" opacity="0.9"><animate attributeName="opacity" values="0.9;0.4;0.9" dur="2s" begin="0.3s" repeatCount="indefinite"/></rect>
+      <line x1="30" y1="58" x2="70" y2="58" stroke="#00e5ff" stroke-width="1" opacity="0.4"/>
+      <line x1="35" y1="62" x2="65" y2="62" stroke="#bf00ff" stroke-width="1" opacity="0.3"/>
+      <line x1="40" y1="66" x2="60" y2="66" stroke="#00e5ff" stroke-width="1" opacity="0.2"/>
+      <circle cx="50" cy="50" r="3" fill="none" stroke="url(#cg)" stroke-width="0.5" opacity="0.6"><animate attributeName="r" values="3;5;3" dur="3s" repeatCount="indefinite"/></circle>
+    </svg>
     <h1>Stasik Trading Bot</h1>
     <p>Авторизация в панели управления</p>
   </div>
@@ -1428,7 +1442,8 @@ body{font-family:'Share Tech Mono','JetBrains Mono',monospace;background:linear-
   position:sticky;top:0;z-index:100;gap:16px;flex-wrap:wrap;
 }
 .header-left{display:flex;align-items:center;gap:12px;flex-shrink:0}
-.header .icon{font-size:32px}
+.header .cyber-logo-sm{width:36px;height:36px;filter:drop-shadow(0 0 8px rgba(0,229,255,0.5));animation:logoPulse 3s ease-in-out infinite}
+@keyframes logoPulse{0%,100%{filter:drop-shadow(0 0 8px rgba(0,229,255,0.5))}50%{filter:drop-shadow(0 0 16px rgba(0,229,255,0.8))}}
 .header h1{font-size:20px;font-weight:700;color:var(--text);white-space:nowrap}
 .header h1 span{color:var(--neon-cyan);font-weight:400}
 .header-stats{font-size:13px;color:var(--muted);display:flex;align-items:center;gap:6px;border-left:1px solid var(--border);padding-left:12px;white-space:nowrap}
@@ -1752,7 +1767,15 @@ body.archive-mode .header{background:var(--bg2);border-bottom-color:rgba(255,152
 
 <div class="header">
   <div class="header-left">
-    <div class="icon">🤖</div>
+    <svg class="cyber-logo-sm" viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg">
+      <defs><linearGradient id="hg" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#00e5ff"/><stop offset="100%" stop-color="#bf00ff"/></linearGradient></defs>
+      <polygon points="50,8 90,28 90,72 50,92 10,72 10,28" fill="none" stroke="url(#hg)" stroke-width="3"/>
+      <rect x="28" y="38" width="16" height="10" rx="2" fill="#00e5ff" opacity="0.9"><animate attributeName="opacity" values="0.9;0.4;0.9" dur="2s" repeatCount="indefinite"/></rect>
+      <rect x="56" y="38" width="16" height="10" rx="2" fill="#bf00ff" opacity="0.9"><animate attributeName="opacity" values="0.9;0.4;0.9" dur="2s" begin="0.3s" repeatCount="indefinite"/></rect>
+      <line x1="30" y1="58" x2="70" y2="58" stroke="#00e5ff" stroke-width="1.5" opacity="0.4"/>
+      <line x1="35" y1="62" x2="65" y2="62" stroke="#bf00ff" stroke-width="1.5" opacity="0.3"/>
+      <line x1="40" y1="66" x2="60" y2="66" stroke="#00e5ff" stroke-width="1.5" opacity="0.2"/>
+    </svg>
     <h1>Stasik <span>Trading Bot</span></h1>
     <div class="header-stats" id="header-stats"></div>
   </div>
