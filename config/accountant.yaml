@@ -20,8 +20,8 @@ databases:
   - path: "/root/stasik/data/trades.db"
     instance: "SCALP"
     commission_rate: 0.00055
-  - path: "/root/stasik/data/smc.db"
-    instance: "SMC"
+  - path: "/root/stasik/data/fiba.db"
+    instance: "FIBA"
     commission_rate: 0.00055
 
 ai:

@@ -175,7 +175,7 @@ class TradingEngine:
             logger.info("Strategy mode: Turtle Trading (Donchian breakout)")
             return TurtleGenerator(config)
         if mode == "smc":
-            logger.info("Strategy mode: SMC/ICT (Fibonacci + Liquidity Sweep)")
+            logger.info("Strategy mode: FIBA (Fibonacci + Liquidity Sweep)")
             return SMCGenerator(config)
         return SignalGenerator(config)
 
@@ -727,7 +727,7 @@ class TradingEngine:
                 self._smc_htf_structure_cache[symbol] = (swings, now)
 
                 if not swings.get("last_swing_high") or not swings.get("last_swing_low"):
-                    logger.debug("SMC %s: no swing structure found on HTF", symbol)
+                    logger.debug("FIBA %s: no swing structure found on HTF", symbol)
                     return
 
                 # 2. Update signal generator with HTF structure
@@ -748,7 +748,7 @@ class TradingEngine:
                             self._smc_daily_klines_cache[symbol] = (daily_df, now)
                             self.signal_gen.update_pivots(symbol, daily_df)
                     except Exception:
-                        logger.debug("SMC %s: failed to fetch daily klines for pivots", symbol)
+                        logger.debug("FIBA %s: failed to fetch daily klines for pivots", symbol)
 
             # 3. Fetch entry TF klines (15m)
             df = self.client.get_klines(
@@ -784,7 +784,7 @@ class TradingEngine:
                     if self._corr_groups.get(t["symbol"]) == group
                 )
                 if group_open >= self._max_per_group:
-                    logger.info("SMC корреляция: отклонён %s — %d/%d в группе '%s'",
+                    logger.info("FIBA корреляция: отклонён %s — %d/%d в группе '%s'",
                                 symbol, group_open, self._max_per_group, group)
                     return
 
@@ -797,7 +797,7 @@ class TradingEngine:
             if atr > 0 and price > 0:
                 atr_pct = atr / price * 100
                 if atr_pct < 0.3:
-                    logger.info("SMC %s: skip — ATR=%.4f (%.3f%%) too small, commission would eat profits",
+                    logger.info("FIBA %s: skip — ATR=%.4f (%.3f%%) too small, commission would eat profits",
                                 symbol, atr, atr_pct)
                     return
 
@@ -1208,7 +1208,7 @@ class TradingEngine:
                         smc_sl = round(price - min_sl_dist, 6)
                     else:
                         smc_sl = round(price + min_sl_dist, 6)
-                    logger.info("SMC SL widened: %s %.6f → %.6f (min 1 ATR=%.6f)",
+                    logger.info("FIBA SL widened: %s %.6f → %.6f (min 1 ATR=%.6f)",
                                 symbol, sweep_level - atr_buf if side == "Buy" else sweep_level + atr_buf,
                                 smc_sl, min_sl_dist)
             if tp1_level and tp1_level > 0:
@@ -1219,20 +1219,20 @@ class TradingEngine:
                     if side == "Buy":
                         atr_cap = round(price + max_tp_dist, 6)
                         if smc_tp > atr_cap:
-                            logger.info("SMC TP capped: %s %.6f → %.6f (ATR cap %.2f%%)",
+                            logger.info("FIBA TP capped: %s %.6f → %.6f (ATR cap %.2f%%)",
                                         symbol, smc_tp, atr_cap, max_tp_dist / price * 100)
                             smc_tp = atr_cap
                     else:
                         atr_cap = round(price - max_tp_dist, 6)
                         if smc_tp < atr_cap:
-                            logger.info("SMC TP capped: %s %.6f → %.6f (ATR cap %.2f%%)",
+                            logger.info("FIBA TP capped: %s %.6f → %.6f (ATR cap %.2f%%)",
                                         symbol, smc_tp, atr_cap, max_tp_dist / price * 100)
                             smc_tp = atr_cap
 
         if smc_sl is not None:
             sl = smc_sl
             sl_dist_pct = abs(price - sl) / price * 100
-            sl_source = f"SMC:sweep({sl_dist_pct:.2f}%)"
+            sl_source = f"FIBA:sweep({sl_dist_pct:.2f}%)"
         elif ai_sl_pct is not None and 0.3 <= ai_sl_pct <= 5.0:
             sl = price * (1 - ai_sl_pct / 100) if side == "Buy" else price * (1 + ai_sl_pct / 100)
             sl = round(sl, 6)
@@ -1259,7 +1259,7 @@ class TradingEngine:
         if smc_tp is not None:
             tp = smc_tp
             tp_dist_pct = abs(tp - price) / price * 100
-            tp_source = f"SMC:fib_ext({tp_dist_pct:.2f}%)"
+            tp_source = f"FIBA:fib_ext({tp_dist_pct:.2f}%)"
         elif ai_tp_pct is not None and 0.5 <= ai_tp_pct <= 10.0:
             tp = price * (1 + ai_tp_pct / 100) if side == "Buy" else price * (1 - ai_tp_pct / 100)
             tp = round(tp, 6)

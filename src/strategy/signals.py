@@ -708,7 +708,7 @@ class SMCGenerator:
         if self.adx_max > 0 and len(df) >= 30:
             adx = calculate_adx(df, period=14)
             if adx > self.adx_max:
-                logger.info("SMC %s: HOLD (ADX=%.1f > %d)", symbol, adx, self.adx_max)
+                logger.info("FIBA %s: HOLD (ADX=%.1f > %d)", symbol, adx, self.adx_max)
                 return SignalResult(signal=Signal.HOLD, score=0,
                                     details={"regime_filter": True, "adx": round(adx, 1)})
 
@@ -913,7 +913,7 @@ class SMCGenerator:
         details["fib_direction"] = direction
 
         logger.info(
-            "SMC %s: %s (score=%d, fib=%d[%s], ote=%d, sweep=%d[%s], fvg=%d, ob=%d, disp=%d, vol=%d, rsi_div=%d, cluster=%d, pivot=%d, vp=%d, cd=%d, mm=%d)",
+            "FIBA %s: %s (score=%d, fib=%d[%s], ote=%d, sweep=%d[%s], fvg=%d, ob=%d, disp=%d, vol=%d, rsi_div=%d, cluster=%d, pivot=%d, vp=%d, cd=%d, mm=%d)",
             symbol, signal.value, total,
             scores["fib_zone"], fib_zone_name,
             scores.get("ote_bonus", 0),
@@ -944,7 +944,7 @@ class SMCGenerator:
 
         symbol = df.attrs.get("symbol", "?")
         logger.info(
-            "SMC HTF %s: %s (EMA%d=%.4f, EMA%d=%.4f, price=%.4f)",
+            "FIBA HTF %s: %s (EMA%d=%.4f, EMA%d=%.4f, price=%.4f)",
             symbol, trend.value, self.ema_fast, fast_val, self.ema_slow, slow_val, price,
         )
         return trend

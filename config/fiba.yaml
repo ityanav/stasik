@@ -1,8 +1,8 @@
-instance_name: "SMC"
+instance_name: "FIBA"
 initial_balance: 164235
 
 database:
-  path: "/root/stasik/data/smc.db"
+  path: "/root/stasik/data/fiba.db"
 
 bybit:
   testnet: false

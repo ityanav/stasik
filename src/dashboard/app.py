@@ -1496,7 +1496,7 @@ tr:hover{background:rgba(0,229,255,0.05)}
 .inst-tbank{background:rgba(0,255,136,0.1);color:#00ff88}
 .inst-midas{background:rgba(255,230,0,0.1);color:#ffe600}
 .inst-turtle{background:rgba(57,255,20,0.1);color:#39ff14}
-.inst-smc{background:rgba(191,0,255,0.1);color:#bf00ff}
+.inst-fiba{background:rgba(191,0,255,0.1);color:#bf00ff}
 .so-badge{font-size:9px;padding:1px 5px;border-radius:6px;font-weight:700;background:rgba(255,230,0,0.12);color:#ffe600;border:1px solid rgba(255,230,0,0.3);margin-left:4px;vertical-align:middle}
 .tbl-wrap{overflow-x:auto}
 
@@ -1590,7 +1590,7 @@ tr:hover{background:rgba(0,229,255,0.05)}
 .dot-swing{background:#ff9800;box-shadow:0 0 6px rgba(255,152,0,0.4)}
 .dot-midas{background:#ffe600;box-shadow:0 0 6px rgba(255,230,0,0.4)}
 .dot-turtle{background:#39ff14;box-shadow:0 0 6px rgba(57,255,20,0.4)}
-.dot-smc{background:#bf00ff;box-shadow:0 0 6px rgba(191,0,255,0.4)}
+.dot-fiba{background:#bf00ff;box-shadow:0 0 6px rgba(191,0,255,0.4)}
 .chart-legend-custom{display:flex;gap:12px;font-size:12px;color:var(--muted)}
 .chart-legend-custom .leg-item{display:flex;align-items:center;gap:5px}
 .leg-bar{width:12px;height:10px;border-radius:2px}
@@ -1894,12 +1894,12 @@ body.archive-mode .header{background:var(--bg2);border-bottom-color:rgba(255,152
 
     <!-- Mini-charts grid -->
     <div class="chart-grid" id="chart-grid">
-      <div class="chart-mini" id="mini-smc">
+      <div class="chart-mini" id="mini-fiba">
         <div class="chart-mini-header">
-          <span class="chart-half-label" style="margin:0"><span class="dot dot-smc"></span>SMC</span>
-          <button class="expand-btn" onclick="expandChart('SMC')">&#x2922;</button>
+          <span class="chart-half-label" style="margin:0"><span class="dot dot-fiba"></span>FIBA</span>
+          <button class="expand-btn" onclick="expandChart('FIBA')">&#x2922;</button>
         </div>
-        <canvas id="pnlChartSmc"></canvas>
+        <canvas id="pnlChartFiba"></canvas>
       </div>
     </div>
   </div>
@@ -2051,7 +2051,7 @@ async function loadInstances(){
       const isSwing=key.includes('SWING')&&!isTbank;
       const isMidas=key.includes('MIDAS');
       const isTurtle=key.includes('TURTLE')&&!isTbank;
-      const isSmc=key.includes('SMC');
+      const isSmc=key.includes('FIBA');
       const cardCls=isTbank?'tbank':isDegen?'degen':isScalp?'scalp':isMidas?'midas':isTurtle?'turtle':isSmc?'smc':'swing';
       const badgeCls=isTbank?'badge-tbank':isDegen?'badge-degen':isScalp?'badge-scalp':isMidas?'badge-midas':isTurtle?'badge-turtle':isSmc?'badge-smc':'badge-swing';
       const tf=i.timeframe;
@@ -2137,11 +2137,11 @@ async function loadStats(){
 }
 
 let chartCombined=null, miniCharts={}, chartFull=null, instanceData={};
-const INST_COLORS={SMC:'#bf00ff','TBANK-SCALP':'#00ff88','TBANK-SWING':'#39ff14',MIDAS:'#ffe600'};
-const INST_CANVAS={SMC:'pnlChartSmc'};
-const INST_MINI={SMC:'mini-smc'};
-const INST_CURRENCY={SMC:'USDT','TBANK-SCALP':'RUB','TBANK-SWING':'RUB',MIDAS:'RUB'};
-const INST_SYM={SMC:'$','TBANK-SCALP':'\u20bd','TBANK-SWING':'\u20bd',MIDAS:'\u20bd'};
+const INST_COLORS={FIBA:'#bf00ff','TBANK-SCALP':'#00ff88','TBANK-SWING':'#39ff14',MIDAS:'#ffe600'};
+const INST_CANVAS={FIBA:'pnlChartFiba'};
+const INST_MINI={FIBA:'mini-fiba'};
+const INST_CURRENCY={FIBA:'USDT','TBANK-SCALP':'RUB','TBANK-SWING':'RUB',MIDAS:'RUB'};
+const INST_SYM={FIBA:'$','TBANK-SCALP':'\u20bd','TBANK-SWING':'\u20bd',MIDAS:'\u20bd'};
 
 function buildArea(canvasId, labels, dailyArr, lineColor, currency, sym){
   const ctx=document.getElementById(canvasId).getContext('2d');
@@ -2395,7 +2395,7 @@ async function loadChart(){
     // Parse per-instance data from API response
     // API keys: SCALP, DEGEN, SWING, TBANK-SCALP, TBANK-SWING
     const instDaily={};
-    const KNOWN_INST=['SMC','TBANK-SCALP','TBANK-SWING','MIDAS'];
+    const KNOWN_INST=['FIBA','TBANK-SCALP','TBANK-SWING','MIDAS'];
 
     pnl.forEach((d,i)=>{
       const keys=Object.keys(d).filter(k=>!['trade_date','pnl','trades_count'].includes(k));
@@ -2414,8 +2414,8 @@ async function loadChart(){
           if(name.includes('TBANK')&&name.includes('SCALP'))mapped='TBANK-SCALP';
           else if(name.includes('TBANK')&&name.includes('SWING'))mapped='TBANK-SWING';
           else if(name.includes('MIDAS'))mapped='MIDAS';
-          else if(name.includes('SMC'))mapped='SMC';
-          else mapped='SMC';
+          else if(name.includes('FIBA'))mapped='FIBA';
+          else mapped='FIBA';
         }
         if(!instDaily[mapped])instDaily[mapped]=new Array(pnl.length).fill(0);
         instDaily[mapped][i]+=(d[k]||0);
@@ -2645,8 +2645,8 @@ async function loadPositions(){
     body.innerHTML=pos.map(p=>{
       const grossPnl=parseFloat(p.unrealised_pnl)||0;
       const inst=(p.instance||'').toUpperCase();
-      const isCls=inst.includes('TBANK')?'inst-tbank':inst.includes('DEGEN')?'inst-degen':inst.includes('SCALP')?'inst-scalp':inst.includes('MIDAS')?'inst-midas':inst.includes('TURTLE')?'inst-turtle':inst.includes('SMC')?'inst-smc':'inst-swing';
-      const iLabel=inst.includes('TBANK-SCALP')?'TB-SCALP':inst.includes('TBANK-SWING')?'TB-SWING':inst.includes('DEGEN')?'DEGEN':inst.includes('SCALP')?'SCALP':inst.includes('MIDAS')?'MIDAS':inst.includes('TURTLE-TB')?'TURTLE-TB':inst.includes('TURTLE')?'TURTLE':inst.includes('SMC')?'SMC':'SWING';
+      const isCls=inst.includes('TBANK')?'inst-tbank':inst.includes('DEGEN')?'inst-degen':inst.includes('SCALP')?'inst-scalp':inst.includes('MIDAS')?'inst-midas':inst.includes('TURTLE')?'inst-turtle':inst.includes('FIBA')?'inst-fiba':'inst-swing';
+      const iLabel=inst.includes('TBANK-SCALP')?'TB-SCALP':inst.includes('TBANK-SWING')?'TB-SWING':inst.includes('DEGEN')?'DEGEN':inst.includes('SCALP')?'SCALP':inst.includes('MIDAS')?'MIDAS':inst.includes('TURTLE-TB')?'TURTLE-TB':inst.includes('TURTLE')?'TURTLE':inst.includes('FIBA')?'FIBA':'SWING';
       const cur=inst.includes('TBANK')?'RUB':'USDT';
       const closeBtn=currentSource==='live'?`<button class="btn-close-x" onclick="closePosition('${p.symbol}','${p.instance||''}',this)" title="Закрыть позицию">&times;</button>`:'';
       const entryAmt=parseFloat(p.entry_amount)||0;
@@ -2687,8 +2687,8 @@ async function loadTrades(page){
     document.getElementById('tbody').innerHTML=r.trades.map(t=>{
       const p=t.pnl||0;
       const inst=(t.instance||'').toUpperCase();
-      const isCls=inst.includes('TBANK')?'inst-tbank':inst.includes('DEGEN')?'inst-degen':inst.includes('SCALP')?'inst-scalp':inst.includes('MIDAS')?'inst-midas':inst.includes('TURTLE')?'inst-turtle':inst.includes('SMC')?'inst-smc':'inst-swing';
-      const iLabel=inst.includes('TBANK-SCALP')?'TB-SCALP':inst.includes('TBANK-SWING')?'TB-SWING':inst.includes('DEGEN')?'DEGEN':inst.includes('SCALP')?'SCALP':inst.includes('MIDAS')?'MIDAS':inst.includes('TURTLE-TB')?'TURTLE-TB':inst.includes('TURTLE')?'TURTLE':inst.includes('SMC')?'SMC':'SWING';
+      const isCls=inst.includes('TBANK')?'inst-tbank':inst.includes('DEGEN')?'inst-degen':inst.includes('SCALP')?'inst-scalp':inst.includes('MIDAS')?'inst-midas':inst.includes('TURTLE')?'inst-turtle':inst.includes('FIBA')?'inst-fiba':'inst-swing';
+      const iLabel=inst.includes('TBANK-SCALP')?'TB-SCALP':inst.includes('TBANK-SWING')?'TB-SWING':inst.includes('DEGEN')?'DEGEN':inst.includes('SCALP')?'SCALP':inst.includes('MIDAS')?'MIDAS':inst.includes('TURTLE-TB')?'TURTLE-TB':inst.includes('TURTLE')?'TURTLE':inst.includes('FIBA')?'FIBA':'SWING';
       const tTime=t.closed_at||t.opened_at||'';
       const tFmt=tTime?tTime.replace('T',' ').slice(5,16):'—';
       const tpc=t.partial_closed||0;

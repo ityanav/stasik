@@ -38,7 +38,7 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
 
 # Instance definitions: name, db_path, service, currency
 INSTANCES = [
-    {"name": "SMC", "db": "/root/stasik/data/smc.db", "service": "stasik-smc", "currency": "USDT"},
+    {"name": "FIBA", "db": "/root/stasik/data/fiba.db", "service": "stasik-fiba", "currency": "USDT"},
     {"name": "TBANK-SCALP", "db": "/root/stasik/data/tbank_scalp.db", "service": "stasik-tbank-scalp", "currency": "RUB"},
     {"name": "TBANK-SWING", "db": "/root/stasik/data/tbank_swing.db", "service": "stasik-tbank-swing", "currency": "RUB"},
     {"name": "MIDAS", "db": "/root/stasik/data/midas.db", "service": "stasik-midas", "currency": "RUB"},
