@@ -151,3 +151,27 @@ telegram:
 
 dashboard:
   enabled: false
+  port: 8080
+  username: "ityanav"
+  password_hash: "$2b$12$nkNYfoUba3r6SkwXealnduvAay.TzvkLvLNfBRxvICjfLxC.osU1e"
+  secret: "f390917c31c0730992cef29d79739f023c15e555ed045b9cc5b5282298fa29eb"
+
+other_instances:
+  - name: "TBANK-SCALP"
+    db_path: "/root/stasik/data/tbank_scalp.db"
+    service: "stasik-tbank-scalp"
+    timeframe: "15м"
+    leverage: "1x"
+    pairs: ["SBER", "GAZP", "YDEX", "LKOH", "ROSN"]
+  - name: "TBANK-SWING"
+    db_path: "/root/stasik/data/tbank_swing.db"
+    service: "stasik-tbank-swing"
+    timeframe: "D"
+    leverage: "1x"
+    pairs: ["SBER", "GAZP", "LKOH"]
+  - name: "MIDAS"
+    db_path: "/root/stasik/data/midas.db"
+    service: "stasik-midas"
+    timeframe: "5м"
+    leverage: "1x"
+    pairs: ["GLDRUB_TOM", "SLVRUB_TOM", "PLTRUB_TOM", "CNYRUB_TOM", "USD000UTSTOM", "KZTRUB_TOM"]

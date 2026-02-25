@@ -225,9 +225,8 @@ class Dashboard:
                 pass
             # Check if any trading service is running
             _all_services = [
-                "stasik", "stasik-tbank-scalp", "stasik-tbank-swing",
-                "stasik-midas", "stasik-turtle", "stasik-turtle-tbank", "stasik-smc",
-                "stasik-accountant",
+                "stasik-fiba", "stasik-tbank-scalp", "stasik-tbank-swing",
+                "stasik-midas", "stasik-accountant",
             ]
             running = any(self._check_service_active(s) for s in _all_services)
 
@@ -2414,7 +2413,7 @@ async function loadChart(){
           if(name.includes('TBANK')&&name.includes('SCALP'))mapped='TBANK-SCALP';
           else if(name.includes('TBANK')&&name.includes('SWING'))mapped='TBANK-SWING';
           else if(name.includes('MIDAS'))mapped='MIDAS';
-          else if(name.includes('FIBA'))mapped='FIBA';
+          else if(name.includes('FIBA')||name.includes('SMC'))mapped='FIBA';
           else mapped='FIBA';
         }
         if(!instDaily[mapped])instDaily[mapped]=new Array(pnl.length).fill(0);

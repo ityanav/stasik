@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 
 async def main():
-    config_path = Path(__file__).resolve().parent.parent / "config" / "config.yaml"
+    config_path = Path(__file__).resolve().parent.parent / "config" / "fiba.yaml"
     with open(config_path) as f:
         config = yaml.safe_load(f)
 
