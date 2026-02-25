@@ -12,8 +12,8 @@ trading:
 
 accountant:
   check_interval: 10
-  min_profit_pct: 0.15
-  min_confidence: 6
+  min_profit_pct: 0.5
+  min_confidence: 8
   timeframe: "15"
 
 databases:

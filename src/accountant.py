@@ -37,7 +37,9 @@ ACCOUNTANT_PROMPT = """\
 - Время в сделке
 - Расстояние до TP и SL в %
 - RSI (14), EMA 9 vs 21 (тренд), объём
-- Последние 10 свечей 15m
+- Анализ объёма: тренд (растёт/падает), давление покупка/продажа %
+- Анализ теней: rejection сверху/снизу, doji, средний размер теней
+- Последние 10 свечей 15m (с пометками UPPER_REJECTION, LOWER_REJECTION, DOJI)
 
 Решения:
 - **HOLD** — ничего не делать
@@ -56,18 +58,31 @@ ACCOUNTANT_PROMPT = """\
 - Убыток от HOLD хуже чем упущенная прибыль от раннего CLOSE.
 
 Правила заработка:
-- PnL > 0.5% и тренд слабеет → CLOSE. Забери деньги со стола.
+- HOLD если PnL < 0.5% — НЕ ТРОГАЙ. Дай сделке развиться.
+- PnL 0.5-1.0% и тренд слабеет → CLOSE. Забери деньги со стола.
 - PnL > 1% → MOVE_SL в безубыток ОБЯЗАТЕЛЬНО. Защити прибыль.
 - PnL > 1.5% и RSI экстремальный (>70 лонг, <30 шорт) → CLOSE. Не будь жадным.
 - PnL > 2% → серьёзно думай о CLOSE. Это отличный результат.
-- HOLD только если тренд ОЧЕНЬ сильный (EMA расходятся + объём растёт + RSI ещё не экстремальный)
-- HOLD если PnL < 0.3% — не стоит фиксировать копейки
+- HOLD если тренд сильный (EMA расходятся + объём растёт + RSI ещё не экстремальный)
 - Цена разворачивается от TP → CLOSE немедленно. Разворот = потеря денег.
-- Объём падает + цена стоит → CLOSE. Импульс иссяк.
-- Время в сделке > 2 часов и PnL < 0.5% → CLOSE. Капитал заморожен.
-- Лучше 10 сделок по +0.5% чем 1 сделка +5% и 9 стопов.
+- Объём падает + цена стоит при PnL > 0.5% → CLOSE. Импульс иссяк.
+- Время в сделке > 3 часов и PnL < 1% → CLOSE. Капитал заморожен.
 - MOVE_SL трейлинг если PnL > 1% и тренд сильный — подтяни SL за ценой.
 - Учитывай уроки из прошлых ошибок. Не повторяй те же ошибки.
+
+Правила по ОБЪЁМУ:
+- Объём растёт + цена идёт в нашу сторону → HOLD. Тренд подтверждён.
+- Объём падает + цена идёт в нашу сторону → осторожно, тренд слабеет.
+- Давление покупок > 65% → бычий сигнал. Давление продаж > 65% → медвежий.
+- Всплеск объёма (>2x avg) на развороте → CLOSE. Крупный игрок вошёл против.
+
+Правила по ТЕНЯМ (wicks/shadows):
+- UPPER_REJECTION на свечах → продавцы давят сверху. Плохо для LONG, хорошо для SHORT.
+- LOWER_REJECTION на свечах → покупатели подбирают снизу. Хорошо для LONG, плохо для SHORT.
+- Несколько rejection подряд в нашу сторону → HOLD, защита работает.
+- Несколько rejection ПРОТИВ нашей позиции → CLOSE или MOVE_SL. Давление нарастает.
+- DOJI (маленькое тело, большие тени) → нерешительность, если PnL > 0.5% → готовься к CLOSE.
+- Длинная тень от TP уровня → цена отвергает TP, CLOSE. До TP не дойдёт.
 
 JSON (без markdown):
 CLOSE/HOLD: {"decision":"CLOSE","confidence":1-10,"reasoning":"кратко"}
@@ -86,11 +101,100 @@ def _summarize_candles(df: pd.DataFrame, n: int = 10) -> str:
     for _, row in tail.iterrows():
         ts = row["timestamp"]
         ts_str = ts.strftime("%H:%M") if hasattr(ts, "strftime") else str(ts)
+        o, h, l, c = row["open"], row["high"], row["low"], row["close"]
+        body = abs(c - o)
+        full = h - l
+        upper_wick = h - max(o, c)
+        lower_wick = min(o, c) - l
+        wick_note = ""
+        if full > 0:
+            uw_pct = upper_wick / full * 100
+            lw_pct = lower_wick / full * 100
+            if uw_pct > 60:
+                wick_note = " [UPPER_REJECTION]"
+            elif lw_pct > 60:
+                wick_note = " [LOWER_REJECTION]"
+            elif body / full < 0.2:
+                wick_note = " [DOJI]"
         lines.append(
-            f"{ts_str} O={row['open']:.2f} H={row['high']:.2f} "
-            f"L={row['low']:.2f} C={row['close']:.2f} V={row['volume']:.0f}"
+            f"{ts_str} O={o:.2f} H={h:.2f} L={l:.2f} C={c:.2f} V={row['volume']:.0f}{wick_note}"
         )
     return "\n".join(lines)
+
+
+def _analyze_volume(df: pd.DataFrame, n: int = 10) -> str:
+    """Analyze volume trend and buying/selling pressure."""
+    if len(df) < n:
+        return "Недостаточно данных"
+    tail = df.tail(n)
+    avg_vol = float(df["volume"].tail(20).mean()) if len(df) >= 20 else float(tail["volume"].mean())
+
+    # Volume trend: compare last 5 avg vs previous 5 avg
+    if len(tail) >= 10:
+        recent_5 = float(tail.tail(5)["volume"].mean())
+        prev_5 = float(tail.head(5)["volume"].mean())
+        if prev_5 > 0:
+            vol_change = (recent_5 - prev_5) / prev_5 * 100
+            vol_trend = f"{'растёт' if vol_change > 10 else 'падает' if vol_change < -10 else 'стабильный'} ({vol_change:+.0f}%)"
+        else:
+            vol_trend = "н/д"
+    else:
+        vol_trend = "н/д"
+
+    # Buy vs sell volume (green vs red candles)
+    buy_vol = float(tail.loc[tail["close"] >= tail["open"], "volume"].sum())
+    sell_vol = float(tail.loc[tail["close"] < tail["open"], "volume"].sum())
+    total = buy_vol + sell_vol
+    buy_pct = (buy_vol / total * 100) if total > 0 else 50.0
+
+    return (
+        f"Тренд объёма (5 свечей): {vol_trend}\n"
+        f"Давление: покупка {buy_pct:.0f}% / продажа {100 - buy_pct:.0f}%"
+    )
+
+
+def _analyze_shadows(df: pd.DataFrame, n: int = 5) -> str:
+    """Analyze recent candle shadows for rejection signals."""
+    if len(df) < n:
+        return "Недостаточно данных"
+    tail = df.tail(n)
+
+    upper_rejections = 0
+    lower_rejections = 0
+    avg_upper_ratio = 0.0
+    avg_lower_ratio = 0.0
+
+    for _, row in tail.iterrows():
+        o, h, l, c = row["open"], row["high"], row["low"], row["close"]
+        full = h - l
+        if full <= 0:
+            continue
+        upper_wick = h - max(o, c)
+        lower_wick = min(o, c) - l
+        uw_ratio = upper_wick / full
+        lw_ratio = lower_wick / full
+        avg_upper_ratio += uw_ratio
+        avg_lower_ratio += lw_ratio
+        if uw_ratio > 0.5:
+            upper_rejections += 1
+        if lw_ratio > 0.5:
+            lower_rejections += 1
+
+    avg_upper_ratio /= n
+    avg_lower_ratio /= n
+
+    signals = []
+    if upper_rejections >= 2:
+        signals.append(f"REJECTION СВЕРХУ ({upper_rejections}/{n} свечей) — давление продавцов, медвежий сигнал")
+    if lower_rejections >= 2:
+        signals.append(f"REJECTION СНИЗУ ({lower_rejections}/{n} свечей) — давление покупателей, бычий сигнал")
+    if not signals:
+        signals.append("Нет выраженных rejection-паттернов")
+
+    return (
+        f"Верхние тени avg: {avg_upper_ratio:.0%}, нижние avg: {avg_lower_ratio:.0%}\n"
+        + "\n".join(signals)
+    )
 
 
 def _calc_net_pnl(side: str, entry: float, exit_price: float,
@@ -266,6 +370,8 @@ class Accountant:
         avg_vol = float(df["volume"].tail(20).mean()) if len(df) >= 20 else last_vol
 
         candles = _summarize_candles(df, n=10)
+        vol_analysis = _analyze_volume(df, n=10)
+        shadow_analysis = _analyze_shadows(df, n=5)
 
         side = pos["side"]
         direction = "LONG" if side == "Buy" else "SHORT"
@@ -310,6 +416,8 @@ class Accountant:
             f"Объём: {last_vol:.0f} (avg20: {avg_vol:.0f}, "
             f"ratio: {last_vol / avg_vol:.2f}x)\n"
             f"Инстанс: {pos['instance']}\n\n"
+            f"Анализ объёма:\n{vol_analysis}\n\n"
+            f"Анализ теней (последние 5 свечей):\n{shadow_analysis}\n\n"
             f"Свечи {self.timeframe}m (последние 10):\n{candles}"
         )
 

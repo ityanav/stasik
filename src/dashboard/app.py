@@ -685,7 +685,7 @@ class Dashboard:
             if not service or action not in ("start", "stop", "restart"):
                 return web.json_response({"ok": False, "error": "Bad request"}, status=400)
             # Whitelist: only known stasik services
-            allowed = {"stasik", "stasik-degen", "stasik-tbank-scalp", "stasik-tbank-swing", "stasik-dashboard", "stasik-midas", "stasik-turtle", "stasik-turtle-tbank", "stasik-smc", "stasik-accountant"}
+            allowed = {"stasik", "stasik-degen", "stasik-tbank-scalp", "stasik-tbank-swing", "stasik-dashboard", "stasik-midas", "stasik-turtle", "stasik-turtle-tbank", "stasik-smc", "stasik-fiba", "stasik-accountant"}
             if service not in allowed:
                 return web.json_response({"ok": False, "error": "Unknown service"}, status=400)
 
@@ -1165,9 +1165,10 @@ class Dashboard:
                 except Exception:
                     logger.warning("Failed to read archive instances from %s", archive_path)
 
+            inst_name = self.config.get("instance_name", "SCALP")
             instances.append({
-                "name": self.config.get("instance_name", "SCALP"),
-                "service": "stasik-smc",
+                "name": inst_name,
+                "service": "stasik-" + inst_name.lower(),
                 "running": False,
                 "daily_pnl": scalp_daily,
                 "total_pnl": scalp_total,
@@ -1185,11 +1186,13 @@ class Dashboard:
             scalp_total = await self.db.get_total_pnl()
             scalp_stats = await self.db.get_trade_stats()
             scalp_open = await self.db.get_open_trades()
-            running = self._check_service_active("stasik")
+            inst_name = self.config.get("instance_name", "SCALP")
+            main_service = "stasik-" + inst_name.lower()
+            running = self._check_service_active(main_service)
 
             instances.append({
-                "name": self.config.get("instance_name", "SCALP"),
-                "service": "stasik-smc",
+                "name": inst_name,
+                "service": main_service,
                 "running": running,
                 "daily_pnl": scalp_daily,
                 "total_pnl": scalp_total,
@@ -1546,6 +1549,8 @@ tr:hover{background:rgba(0,229,255,0.05)}
 .instance-stat h4{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:1px;margin-bottom:4px}
 .instance-stat .val{font-size:20px;font-weight:700}
 .instance-meta{margin-top:12px;font-size:11px;color:var(--muted);display:flex;gap:14px;flex-wrap:wrap;align-items:center}
+.instance-pairs{margin-top:8px;display:flex;gap:4px;flex-wrap:wrap}
+.pair-tag{font-size:10px;padding:2px 6px;border-radius:4px;background:rgba(0,229,255,0.08);border:1px solid rgba(0,229,255,0.2);color:var(--cyan);font-family:inherit;letter-spacing:0.5px}
 .lev-select{
   background:var(--bg3);border:1px solid var(--border);border-radius:6px;
   padding:2px 6px;font-size:11px;font-weight:600;color:var(--text);font-family:inherit;
@@ -2082,9 +2087,9 @@ async function loadInstances(){
         <div class="instance-meta">
           <span>📊 Позиции: ${i.open_positions}</span>
           <span>🔢 Сделок: ${i.total_trades} (${i.wins}W / ${i.losses}L)</span>
-          <span>🪙 ${i.pairs.length} пар</span>
           <span>⚡ ${i.leverage}x</span>
         </div>
+        <div class="instance-pairs">${i.pairs.map(p=>`<span class="pair-tag">${p}</span>`).join('')}</div>
       </div>`;
     }).join('');
     // Summary widget

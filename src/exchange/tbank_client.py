@@ -208,34 +208,43 @@ class TBankClient(ExchangeClient):
 
         max_days = _MAX_RANGE_DAYS.get(interval, 1)
         now = datetime.now(timezone.utc)
-        from_dt = now - timedelta(days=max_days)
+        skip_incomplete = interval not in ("D", "W", "M")
 
-        with self._new_client() as client:
-            resp = client.market_data.get_candles(
-                instrument_id=figi,
-                from_=from_dt,
-                to=now,
-                interval=candle_interval,
-            )
-
+        # For short timeframes (<=15m) fetch multiple days to collect enough candles
+        max_fetch_days = 7 if max_days <= 1 else 1
         rows = []
-        for c in resp.candles:
-            if not c.is_complete and interval not in ("D", "W", "M"):
-                continue
-            rows.append({
-                "timestamp": c.time,
-                "open": _quotation_to_float(c.open),
-                "high": _quotation_to_float(c.high),
-                "low": _quotation_to_float(c.low),
-                "close": _quotation_to_float(c.close),
-                "volume": float(c.volume),
-            })
+        for day_offset in range(max_fetch_days):
+            to_dt = now - timedelta(days=day_offset)
+            from_dt = to_dt - timedelta(days=max_days)
+
+            with self._new_client() as client:
+                resp = client.market_data.get_candles(
+                    instrument_id=figi,
+                    from_=from_dt,
+                    to=to_dt,
+                    interval=candle_interval,
+                )
+
+            for c in resp.candles:
+                if skip_incomplete and not c.is_complete:
+                    continue
+                rows.append({
+                    "timestamp": c.time,
+                    "open": _quotation_to_float(c.open),
+                    "high": _quotation_to_float(c.high),
+                    "low": _quotation_to_float(c.low),
+                    "close": _quotation_to_float(c.close),
+                    "volume": float(c.volume),
+                })
+
+            if len(rows) >= limit:
+                break
 
         df = pd.DataFrame(rows)
         if df.empty:
             return df
         df["timestamp"] = pd.to_datetime(df["timestamp"])
-        df = df.sort_values("timestamp").reset_index(drop=True)
+        df = df.drop_duplicates(subset="timestamp").sort_values("timestamp").reset_index(drop=True)
         if len(df) > limit:
             df = df.tail(limit).reset_index(drop=True)
         return df
