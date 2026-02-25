@@ -10,9 +10,11 @@ import json
 import logging
 import signal
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+import aiosqlite
 import httpx
 import pandas as pd
 import yaml
@@ -26,14 +28,26 @@ logger = logging.getLogger(__name__)
 # ── AI system prompt ───────────────────────────────────────────────
 
 ACCOUNTANT_PROMPT = """\
-Ты — бухгалтер трейдинг-бота. Решаешь: фиксировать прибыль СЕЙЧАС или держать.
+Ты — бухгалтер трейдинг-бота. Решаешь: фиксировать прибыль, держать, или двигать SL/TP.
 
 Данные:
 - Позиция: символ, LONG/SHORT, вход, текущая цена, PnL в % и $
+- Безубыток (вход + комиссия round-trip)
 - Время в сделке
 - Расстояние до TP и SL в %
 - RSI (14), EMA 9 vs 21 (тренд), объём
 - Последние 10 свечей 15m
+
+Решения:
+- **HOLD** — ничего не делать
+- **CLOSE** — закрыть позицию целиком
+- **MOVE_SL** — передвинуть стоп-лосс. Указать `new_sl` (цена). Варианты:
+  - Безубыток: SL = цена безубытка (дана в данных)
+  - Трейлинг: SL = текущая - X% (лонг) / текущая + X% (шорт)
+  - Двигай SL ТОЛЬКО В СТОРОНУ ПРИБЫЛИ (ближе к цене, никогда дальше от неё)
+- **MOVE_TP** — передвинуть тейк-профит. Указать `new_tp` (цена).
+  - Расширить TP если тренд сильный и momentum растёт
+  - Сузить TP если momentum слабеет и цена замедляется
 
 Правила:
 - HOLD если тренд сильный и PnL растёт (EMA 9 > 21 для лонга)
@@ -41,9 +55,15 @@ ACCOUNTANT_PROMPT = """\
 - CLOSE если: цена была ближе к TP, теперь отдаляется (разворот)
 - CLOSE если: объём падает и цена стоит на месте
 - HOLD если PnL слишком мал (< 0.3%) — не стоит фиксировать
+- MOVE_SL в безубыток если PnL > 0.5% и тренд неуверенный
+- MOVE_SL трейлинг если PnL > 1% и тренд сильный — подтяни SL за ценой
 - Лучше зафиксировать +0.5% чем получить -1.5% по SL
+- Учитывай уроки из прошлых ошибок. Не повторяй те же ошибки.
 
-JSON (без markdown): {"decision":"CLOSE"/"HOLD","confidence":1-10,"reasoning":"кратко"}\
+JSON (без markdown):
+CLOSE/HOLD: {"decision":"CLOSE","confidence":1-10,"reasoning":"кратко"}
+MOVE_SL: {"decision":"MOVE_SL","confidence":1-10,"reasoning":"кратко","new_sl":12345.0}
+MOVE_TP: {"decision":"MOVE_TP","confidence":1-10,"reasoning":"кратко","new_tp":12345.0}\
 """
 
 DEEPSEEK_URL = "https://api.deepseek.com/chat/completions"
@@ -97,6 +117,9 @@ class Accountant:
 
         self._http: httpx.AsyncClient | None = None
         self._dbs: dict[str, Database] = {}  # path -> Database
+        self._own_db: aiosqlite.Connection | None = None
+        self._last_hold_log: dict[tuple, float] = {}  # (trade_id, instance) -> timestamp
+        self._evaluated_trades: set[tuple] = set()  # (trade_id, instance)
 
     # ── lifecycle ──────────────────────────────────────────────
 
@@ -107,12 +130,15 @@ class Accountant:
             db = Database(Path(path), instance_name=db_cfg["instance"])
             await db.connect()
             self._dbs[path] = db
+        await self._init_own_db()
         instances = [d["instance"] for d in self.databases]
         logger.info("Accountant started: monitoring %s", instances)
 
     async def stop(self):
         for db in self._dbs.values():
             await db.close()
+        if self._own_db:
+            await self._own_db.close()
         if self._http:
             await self._http.aclose()
         logger.info("Accountant stopped")
@@ -132,6 +158,8 @@ class Accountant:
     # ── main tick ──────────────────────────────────────────────
 
     async def _tick(self):
+        await self._evaluate_closed_trades()
+
         positions = await self._collect_open_trades()
         if not positions:
             return
@@ -156,8 +184,18 @@ class Accountant:
                 decision, pos["symbol"], net_pnl_pct, confidence, reasoning,
             )
 
+            await self._log_decision(pos, decision, confidence, reasoning)
+
             if decision == "CLOSE" and confidence >= self.min_confidence:
                 await self._close_position(pos, reasoning)
+            elif decision == "MOVE_SL" and confidence >= self.min_confidence:
+                new_sl = verdict.get("new_sl")
+                if new_sl:
+                    await self._move_sl(pos, float(new_sl), reasoning)
+            elif decision == "MOVE_TP" and confidence >= self.min_confidence:
+                new_tp = verdict.get("new_tp")
+                if new_tp:
+                    await self._move_tp(pos, float(new_tp), reasoning)
 
     # ── collect trades ─────────────────────────────────────────
 
@@ -242,10 +280,17 @@ class Accountant:
             except Exception:
                 time_in_trade = "?"
 
+        comm = pos["commission_rate"]
+        if side == "Buy":
+            breakeven = entry * (1 + 2 * comm)
+        else:
+            breakeven = entry * (1 - 2 * comm)
+
         user_msg = (
             f"Символ: {symbol}\n"
             f"Направление: {direction}\n"
             f"Вход: {entry:.4f}, Текущая: {cur:.4f}\n"
+            f"Безубыток (вход+комиссия): {breakeven:.4f}\n"
             f"PnL: {pos['net_pnl_pct']:.2f}% ({pos['net_pnl']:.2f}$)\n"
             f"Время в сделке: {time_in_trade}\n"
             f"TP: {tp:.4f} ({tp_dist_pct:.2f}% от текущей)\n"
@@ -258,6 +303,12 @@ class Accountant:
             f"Инстанс: {pos['instance']}\n\n"
             f"Свечи {self.timeframe}m (последние 10):\n{candles}"
         )
+
+        lessons = await self._get_recent_lessons(limit=10)
+        if lessons:
+            user_msg += "\n\nУроки из прошлых ошибок:\n" + "\n".join(
+                f"- {l}" for l in lessons
+            )
 
         return await self._call_deepseek(user_msg)
 
@@ -288,6 +339,280 @@ class Accountant:
         except (httpx.HTTPError, json.JSONDecodeError, KeyError) as e:
             logger.warning("DeepSeek error: %s", e)
             return None
+
+    # ── self-learning ─────────────────────────────────────────
+
+    async def _init_own_db(self):
+        db_path = Path(__file__).resolve().parent.parent / "data" / "accountant.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._own_db = await aiosqlite.connect(str(db_path))
+        self._own_db.row_factory = aiosqlite.Row
+        await self._own_db.executescript("""
+            CREATE TABLE IF NOT EXISTS decisions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                trade_id INTEGER NOT NULL,
+                instance TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                side TEXT NOT NULL,
+                decision TEXT NOT NULL,
+                confidence INTEGER,
+                reasoning TEXT,
+                price_at_decision REAL,
+                net_pnl_pct REAL,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS lessons (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                trade_id INTEGER NOT NULL,
+                instance TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                lesson TEXT NOT NULL,
+                lesson_type TEXT NOT NULL,
+                pnl_at_decision REAL,
+                pnl_at_close REAL,
+                created_at TEXT NOT NULL
+            );
+        """)
+        await self._own_db.commit()
+        logger.info("Accountant own DB initialized: %s", db_path)
+
+    async def _log_decision(self, pos: dict, decision: str,
+                            confidence: int, reasoning: str):
+        trade_id = pos["id"]
+        instance = pos["instance"]
+        key = (trade_id, instance)
+
+        # Deduplicate HOLD: max once per 60s per (trade_id, instance)
+        if decision == "HOLD":
+            now = time.monotonic()
+            last = self._last_hold_log.get(key, 0)
+            if now - last < 60:
+                return
+            self._last_hold_log[key] = now
+
+        await self._own_db.execute(
+            """INSERT INTO decisions
+               (trade_id, instance, symbol, side, decision, confidence,
+                reasoning, price_at_decision, net_pnl_pct, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (trade_id, instance, pos["symbol"], pos["side"],
+             decision, confidence, reasoning,
+             pos["cur_price"], pos["net_pnl_pct"],
+             datetime.utcnow().isoformat()),
+        )
+        await self._own_db.commit()
+
+    async def _evaluate_closed_trades(self):
+        """Check trades that were tracked in decisions and are now closed."""
+        for db_cfg in self.databases:
+            path = db_cfg["path"]
+            db = self._dbs.get(path)
+            instance = db_cfg["instance"]
+            if not db:
+                continue
+
+            # Get distinct trade_ids we have decisions for in this instance
+            cursor = await self._own_db.execute(
+                "SELECT DISTINCT trade_id FROM decisions WHERE instance = ?",
+                (instance,),
+            )
+            tracked_ids = [row[0] for row in await cursor.fetchall()]
+
+            for trade_id in tracked_ids:
+                key = (trade_id, instance)
+                if key in self._evaluated_trades:
+                    continue
+
+                # Check if trade is closed in trades DB
+                try:
+                    t_cursor = await db._db.execute(
+                        "SELECT * FROM trades WHERE id = ? AND status = 'closed'",
+                        (trade_id,),
+                    )
+                    row = await t_cursor.fetchone()
+                except Exception:
+                    continue
+
+                if not row:
+                    continue  # still open
+
+                trade = dict(row)
+                self._evaluated_trades.add(key)
+
+                # Get the last decision for this trade
+                d_cursor = await self._own_db.execute(
+                    """SELECT * FROM decisions
+                       WHERE trade_id = ? AND instance = ?
+                       ORDER BY created_at DESC LIMIT 1""",
+                    (trade_id, instance),
+                )
+                last_dec = await d_cursor.fetchone()
+                if not last_dec:
+                    continue
+
+                last_dec = dict(last_dec)
+                pnl_at_decision = last_dec["net_pnl_pct"] or 0.0
+                decision = last_dec["decision"]
+                symbol = last_dec["symbol"]
+
+                # Calculate final PnL % from trade
+                entry = trade.get("entry_price", 0)
+                exit_p = trade.get("exit_price", 0)
+                qty = trade.get("qty", 0)
+                comm = db_cfg["commission_rate"]
+                if entry and exit_p and qty:
+                    final_net = _calc_net_pnl(trade["side"], entry, exit_p, qty, comm)
+                    notional = entry * qty
+                    pnl_at_close = (final_net / notional * 100) if notional else 0.0
+                else:
+                    pnl_at_close = 0.0
+
+                lesson, lesson_type = self._derive_lesson(
+                    decision, pnl_at_decision, pnl_at_close, symbol,
+                )
+
+                await self._own_db.execute(
+                    """INSERT INTO lessons
+                       (trade_id, instance, symbol, lesson, lesson_type,
+                        pnl_at_decision, pnl_at_close, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (trade_id, instance, symbol, lesson, lesson_type,
+                     pnl_at_decision, pnl_at_close,
+                     datetime.utcnow().isoformat()),
+                )
+                await self._own_db.commit()
+                logger.info(
+                    "Lesson [%s] %s: decision_pnl=%.2f%% close_pnl=%.2f%% — %s",
+                    lesson_type, symbol, pnl_at_decision, pnl_at_close, lesson,
+                )
+
+    @staticmethod
+    def _derive_lesson(decision: str, pnl_at_dec: float,
+                       pnl_at_close: float, symbol: str) -> tuple[str, str]:
+        diff = pnl_at_close - pnl_at_dec
+
+        if decision == "CLOSE":
+            if diff > 0.3:
+                # Closed too early — price went further in profit
+                return (
+                    f"{symbol}: закрыл при {pnl_at_dec:.2f}%, но цена дошла до "
+                    f"{pnl_at_close:.2f}% — потерял {diff:.2f}% прибыли. "
+                    f"Не спеши закрывать при сильном тренде.",
+                    "early_close",
+                )
+            else:
+                # Good close — price reversed or stayed
+                return (
+                    f"{symbol}: закрыл при {pnl_at_dec:.2f}%, финал "
+                    f"{pnl_at_close:.2f}% — правильное решение.",
+                    "good_close",
+                )
+        else:  # HOLD
+            if pnl_at_close < 0 and pnl_at_dec > 0:
+                # Held but went negative — missed exit
+                return (
+                    f"{symbol}: держал при +{pnl_at_dec:.2f}%, финал "
+                    f"{pnl_at_close:.2f}% — упущена прибыль, нужно было "
+                    f"закрывать. Фиксируй при развороте.",
+                    "missed_close",
+                )
+            elif pnl_at_close < pnl_at_dec - 0.3:
+                # Held but lost significant profit
+                return (
+                    f"{symbol}: держал при +{pnl_at_dec:.2f}%, финал "
+                    f"{pnl_at_close:.2f}% — потерял {abs(diff):.2f}% прибыли. "
+                    f"Нужно было фиксировать раньше.",
+                    "missed_close",
+                )
+            else:
+                # Good hold — price went further or stayed positive
+                return (
+                    f"{symbol}: держал при {pnl_at_dec:.2f}%, финал "
+                    f"{pnl_at_close:.2f}% — правильно держал.",
+                    "good_hold",
+                )
+
+    async def _get_recent_lessons(self, limit: int = 10) -> list[str]:
+        cursor = await self._own_db.execute(
+            "SELECT lesson FROM lessons ORDER BY created_at DESC LIMIT ?",
+            (limit,),
+        )
+        rows = await cursor.fetchall()
+        return [row[0] for row in rows]
+
+    # ── move SL / TP ─────────────────────────────────────────────
+
+    async def _move_sl(self, pos: dict, new_sl: float, reasoning: str):
+        symbol = pos["symbol"]
+        side = pos["side"]
+        old_sl = pos.get("stop_loss") or 0.0
+        cur = pos["cur_price"]
+
+        # Validate: SL moves only toward profit
+        if side == "Buy":
+            if old_sl and new_sl <= old_sl:
+                logger.warning("MOVE_SL rejected %s: new_sl %.4f <= old %.4f", symbol, new_sl, old_sl)
+                return
+            if new_sl >= cur:
+                logger.warning("MOVE_SL rejected %s: new_sl %.4f >= cur %.4f", symbol, new_sl, cur)
+                return
+        else:  # Sell
+            if old_sl and new_sl >= old_sl:
+                logger.warning("MOVE_SL rejected %s: new_sl %.4f >= old %.4f", symbol, new_sl, old_sl)
+                return
+            if new_sl <= cur:
+                logger.warning("MOVE_SL rejected %s: new_sl %.4f <= cur %.4f", symbol, new_sl, cur)
+                return
+
+        db = self._dbs.get(pos["db_path"])
+        if db:
+            try:
+                await db.update_trade(pos["id"], stop_loss=new_sl)
+            except Exception:
+                logger.exception("DB update_trade failed for %s SL", symbol)
+                return
+
+        logger.info(
+            "Accountant moved SL %s %s: %.4f → %.4f (%s)",
+            symbol, pos["instance"], old_sl, new_sl, reasoning,
+        )
+        await self._notify(
+            f"\U0001f6e1 Бухгалтер двинул SL: {symbol} ({pos['instance']})\n"
+            f"SL: {old_sl:.4f} → {new_sl:.4f}\n"
+            f"Причина: {reasoning}"
+        )
+
+    async def _move_tp(self, pos: dict, new_tp: float, reasoning: str):
+        symbol = pos["symbol"]
+        side = pos["side"]
+        cur = pos["cur_price"]
+
+        # Validate: TP must be on the correct side of current price
+        if side == "Buy" and new_tp <= cur:
+            logger.warning("MOVE_TP rejected %s: new_tp %.4f <= cur %.4f", symbol, new_tp, cur)
+            return
+        if side == "Sell" and new_tp >= cur:
+            logger.warning("MOVE_TP rejected %s: new_tp %.4f >= cur %.4f", symbol, new_tp, cur)
+            return
+
+        db = self._dbs.get(pos["db_path"])
+        if db:
+            try:
+                await db.update_trade(pos["id"], take_profit=new_tp)
+            except Exception:
+                logger.exception("DB update_trade failed for %s TP", symbol)
+                return
+
+        old_tp = pos.get("take_profit") or 0.0
+        logger.info(
+            "Accountant moved TP %s %s: %.4f → %.4f (%s)",
+            symbol, pos["instance"], old_tp, new_tp, reasoning,
+        )
+        await self._notify(
+            f"\U0001f3af Бухгалтер двинул TP: {symbol} ({pos['instance']})\n"
+            f"TP: {old_tp:.4f} → {new_tp:.4f}\n"
+            f"Причина: {reasoning}"
+        )
 
     # ── close position ─────────────────────────────────────────
 
