@@ -1814,11 +1814,6 @@ body.archive-mode .header{background:var(--bg2);border-bottom-color:rgba(255,152
   <div class="archive-banner" id="archive-banner" style="display:none">АРХИВ — данные до перехода на стратегию Котегавы</div>
 
   <div class="summary-bar" id="summary-bar">
-    <div class="summary-main">
-      <div class="summary-label">Сегодня</div>
-      <div class="summary-value" id="summary-total">—</div>
-    </div>
-    <div class="summary-divider"></div>
     <div class="summary-details">
       <div class="summary-item">
         <span class="summary-item-label">Bybit</span>
@@ -2120,15 +2115,13 @@ async function loadInstances(){
     // Summary widget
     let bybitDay=0,tbankDay=0,bybitAll=0,tbankAll=0,totalTrades=0,totalPos=0,totalWins=0,totalLosses=0;
     list.forEach(i=>{
-      const tb=i.name.toUpperCase().includes('TBANK');
+      const nm=i.name.toUpperCase();
+      const tb=nm.includes('TBANK')||nm.includes('MIDAS');
       if(tb){tbankDay+=i.daily_pnl;tbankAll+=i.total_pnl}
       else{bybitDay+=i.daily_pnl;bybitAll+=i.total_pnl}
       totalTrades+=i.total_trades;totalPos+=i.open_positions;
       totalWins+=i.wins;totalLosses+=i.losses;
     });
-    const totalDay=bybitDay+tbankDay;
-    document.getElementById('summary-total').className='summary-value '+(totalDay>=0?'g':'r');
-    document.getElementById('summary-total').textContent=(totalDay>=0?'+':'')+totalDay.toFixed(2)+' USDT';
     document.getElementById('summary-bybit').className='summary-item-val '+(bybitDay>=0?'g':'r');
     document.getElementById('summary-bybit').textContent=(bybitDay>=0?'+':'')+bybitDay.toFixed(2)+' USDT';
     document.getElementById('summary-tbank').className='summary-item-val '+(tbankDay>=0?'g':'r');
@@ -2137,8 +2130,11 @@ async function loadInstances(){
     document.getElementById('summary-positions').textContent=totalPos;
     const wr=totalTrades>0?(totalWins/totalTrades*100).toFixed(1)+'%':'—';
     document.getElementById('summary-wr').textContent=wr;
-    document.getElementById('summary-all').className='summary-item-val '+(bybitAll+tbankAll>=0?'g':'r');
-    document.getElementById('summary-all').textContent=(bybitAll>=0?'+':'')+bybitAll.toFixed(0)+' USDT';
+    const allEl=document.getElementById('summary-all');
+    let allParts=[];
+    if(bybitAll!==0){const c=bybitAll>=0?'#00ff88':'#ff2255';allParts.push(`<span style="color:${c}">${bybitAll>0?'+':''}${bybitAll.toFixed(0)}$</span>`)}
+    if(tbankAll!==0){const c=tbankAll>=0?'#00ff88':'#ff2255';allParts.push(`<span style="color:${c}">${tbankAll>0?'+':''}${tbankAll.toFixed(0)}\u20bd</span>`)}
+    allEl.innerHTML=allParts.length?allParts.join(' / '):'0';
   }catch(e){console.error('instances',e)}
 }
 
@@ -2160,8 +2156,8 @@ async function loadStats(){
     const bPnl=s.today_pnl_usdt||0;const tPnl=s.today_pnl_rub||0;
     const bpEl=document.getElementById('bybit-pnl');
     const tpEl=document.getElementById('tbank-pnl');
-    if(bPnl!==0){bpEl.textContent=(bPnl>0?'+':'')+bPnl.toFixed(2)+'$';bpEl.style.color=bPnl>=0?'var(--neon-green)':'var(--neon-red)'}else{bpEl.textContent=''}
-    if(tPnl!==0){tpEl.textContent=(tPnl>0?'+':'')+tPnl.toFixed(0)+'\u20bd';tpEl.style.color=tPnl>=0?'var(--neon-green)':'var(--neon-red)'}else{tpEl.textContent=''}
+    if(bPnl!==0){bpEl.textContent=(bPnl>0?'+':'')+bPnl.toFixed(2)+'$';bpEl.style.color=bPnl>=0?'#00ff88':'#ff2255'}else{bpEl.textContent=''}
+    if(tPnl!==0){tpEl.textContent=(tPnl>0?'+':'')+tPnl.toFixed(0)+'\u20bd';tpEl.style.color=tPnl>=0?'#00ff88':'#ff2255'}else{tpEl.textContent=''}
   }catch(e){console.error('stats',e)}
 }
 
@@ -2683,19 +2679,19 @@ async function loadPositions(){
       const fee=Math.round(entryAmt*feeRate*2);
       const pnl=grossPnl-fee;
       const tpPnl=p.tp_pnl!=null?p.tp_pnl:null;
-      const tpTxt=tpPnl!=null?`<strong class="g">${fmt(tpPnl)}</strong>`:'—';
+      const tpTxt=tpPnl!=null?fmt(tpPnl):'—';
       const slPnl=p.sl_pnl!=null?p.sl_pnl:null;
-      const slTxt=slPnl!=null?`<strong class="r">${fmt(slPnl)}</strong>`:'—';
+      const slTxt=slPnl!=null?fmt(slPnl):'—';
       const pc=p.partial_closed||0;
       const soBadge=pc>0?` <span class="so-badge">${pc}/3</span>`:'';
       const isTbankPos=inst.includes('TBANK');
       return`<tr class="fade-in">
         <td><span class="inst-tag ${isCls}">${iLabel}</span></td>
-        <td><strong>${p.symbol}</strong>${soBadge}</td>
-        <td class="${p.side==='Buy'?'side-long':'side-short'}">${p.side==='Buy'?'LONG':'SHORT'}</td>
-        <td>${Math.round(entryAmt).toLocaleString()}</td>
-        <td>${tpTxt}</td>
-        <td>${slTxt}</td>
+        <td style="color:var(--muted)">${p.symbol}${soBadge}</td>
+        <td style="color:var(--muted)">${p.side==='Buy'?'LONG':'SHORT'}</td>
+        <td style="color:var(--muted)">${Math.round(entryAmt).toLocaleString()}</td>
+        <td style="color:var(--muted)">${tpTxt}</td>
+        <td style="color:var(--muted)">${slTxt}</td>
         <td class="${cls(grossPnl)}"><strong>${fmt(grossPnl)}</strong></td>
         <td style="color:#ff9800">${fee.toLocaleString()}</td>
         <td class="${cls(pnl)}"><strong>${fmt(pnl)}</strong></td>
@@ -2731,10 +2727,10 @@ async function loadTrades(page){
       const psFmt=ps>=1000?(ps/1000).toFixed(1)+'k':ps.toFixed(0);
       return`<tr class="fade-in">
         <td><span class="inst-tag ${isCls}">${iLabel}</span></td>
-        <td><strong>${t.symbol}</strong>${tSoBadge}</td>
-        <td class="${t.side==='Buy'?'side-long':'side-short'}">${t.side==='Buy'?'LONG':'SHORT'}</td>
-        <td style="font-size:12px">${qty}</td>
-        <td>${t.entry_price||'-'}</td><td>${t.exit_price||'-'}</td>
+        <td style="color:var(--muted)">${t.symbol}${tSoBadge}</td>
+        <td style="color:var(--muted)">${t.side==='Buy'?'LONG':'SHORT'}</td>
+        <td style="color:var(--muted);font-size:12px">${qty}</td>
+        <td style="color:var(--muted)">${t.entry_price||'-'}</td><td style="color:var(--muted)">${t.exit_price||'-'}</td>
         <td style="font-size:12px;color:var(--muted)">$${psFmt}</td>
         <td class="${cls(p)}"><strong>${p?p.toFixed(2):'-'}</strong></td>
         <td class="${cls(netPnl)}"><strong>${p?netPnl.toFixed(2):'-'}</strong></td>

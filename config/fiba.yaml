@@ -21,7 +21,7 @@ trading:
 
 strategy:
   strategy_mode: "smc"
-  min_score: 4
+  min_score: 3
   adx_min: 0
   adx_max: 0
   adx_period: 14
