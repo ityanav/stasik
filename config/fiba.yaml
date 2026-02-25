@@ -11,7 +11,7 @@ bybit:
   api_secret: "CNzK2w9eQ41j4A4dszBLvvOkAH61Z5BQG9oq"
 
 trading:
-  pairs: ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "AVAXUSDT", "LINKUSDT", "SUIUSDT", "APTUSDT"]
+  pairs: ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "AVAXUSDT", "LINKUSDT", "SUIUSDT", "APTUSDT", "DOGEUSDT", "DOTUSDT", "NEARUSDT", "RENDERUSDT", "WLDUSDT", "ARBUSDT"]
   market_type: "futures"
   timeframe: "15"          # 15m entry
   htf_timeframe: "60"      # 1H structure (swings + fib)
@@ -96,7 +96,7 @@ smc:
 
 risk:
   risk_per_trade: 0.5
-  max_open_positions: 4
+  max_open_positions: 6
   max_per_group: 1
   commission_rate: 0.055
   max_margin_usdt: 20000             # Max initial margin for this instance ($)
@@ -129,9 +129,16 @@ risk:
       - AVAXUSDT
       - APTUSDT
       - SUIUSDT
+      - NEARUSDT
     mid_cap:
       - XRPUSDT
       - LINKUSDT
+      - DOTUSDT
+      - ARBUSDT
+    ai_meme:
+      - DOGEUSDT
+      - WLDUSDT
+      - RENDERUSDT
 
 ai:
   enabled: false
