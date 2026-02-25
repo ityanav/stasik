@@ -13,11 +13,11 @@ bybit:
 trading:
   pairs: ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "AVAXUSDT", "LINKUSDT", "SUIUSDT", "APTUSDT"]
   market_type: "futures"
-  timeframe: "15"          # 15m entry
-  htf_timeframe: "60"      # 1H structure (swings + fib)
+  timeframe: "5"           # 5m entry
+  htf_timeframe: "15"      # 15m structure (swings + fib)
   leverage: 3
   trading_hours: [0, 24]
-  tick_interval: 60         # every minute
+  tick_interval: 30          # every 30s
 
 strategy:
   strategy_mode: "smc"
