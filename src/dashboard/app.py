@@ -93,6 +93,7 @@ class Dashboard:
         self.app.router.add_post("/api/set-sl", self._api_set_sl)
         self.app.router.add_post("/api/set-tp", self._api_set_tp)
         self.app.router.add_get("/api/instances", self._api_instances)
+        self.app.router.add_get("/api/pair-pnl", self._api_pair_pnl)
         self.app.router.add_post("/api/set-leverage", self._api_set_leverage)
         self.app.router.add_get("/api/events", self._api_events)
 
@@ -1123,6 +1124,38 @@ class Dashboard:
             pass
         return resp
 
+    async def _api_pair_pnl(self, request: web.Request) -> web.Response:
+        """Per-pair PnL across all instances."""
+        import sqlite3 as _sql
+        pairs: dict[str, dict] = {}
+        main_db = self.cfg.get("database", "data/trades.db")
+        other = self.cfg.get("other_instances", [])
+        all_dbs = [{"db": main_db, "name": self.cfg.get("instance_name", "MAIN")}] + other
+        for inst in all_dbs:
+            db_path = inst.get("db", "")
+            inst_name = inst.get("name", "")
+            if not db_path or not Path(db_path).exists():
+                continue
+            is_tbank = "TBANK" in inst_name.upper() or "MIDAS" in inst_name.upper()
+            cur = "RUB" if is_tbank else "USDT"
+            try:
+                conn = _sql.connect(db_path)
+                rows = conn.execute(
+                    "SELECT symbol, COUNT(*) as cnt, COALESCE(SUM(pnl),0) as total "
+                    "FROM trades WHERE status='closed' GROUP BY symbol"
+                ).fetchall()
+                conn.close()
+                for symbol, cnt, total in rows:
+                    key = f"{symbol}_{cur}"
+                    if key not in pairs:
+                        pairs[key] = {"symbol": symbol, "cur": cur, "trades": 0, "pnl": 0.0}
+                    pairs[key]["trades"] += cnt
+                    pairs[key]["pnl"] += total
+            except Exception:
+                continue
+        result = sorted(pairs.values(), key=lambda x: x["pnl"], reverse=True)
+        return web.json_response(result)
+
     async def _api_instances(self, request: web.Request) -> web.Response:
         source = request.query.get("source", "live")
         is_archive = source == "archive"
@@ -1746,6 +1779,11 @@ body.archive-mode .header{background:var(--bg2);border-bottom-color:rgba(255,152
 .summary-item{display:flex;align-items:center;gap:8px}
 .summary-item-label{font-size:11px;color:var(--muted);min-width:56px}
 .summary-item-val{font-size:15px;font-weight:700;font-variant-numeric:tabular-nums}
+.pair-pnl-bar{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:20px}
+.pair-chip{display:flex;align-items:center;gap:6px;background:var(--bg2);border:1px solid var(--border);border-radius:8px;padding:6px 12px;font-size:12px}
+.pair-chip-symbol{color:var(--muted);font-weight:600}
+.pair-chip-cnt{color:var(--muted);font-size:10px}
+.pair-chip-pnl{font-weight:800;font-variant-numeric:tabular-nums}
 @media(max-width:600px){
   .summary-bar{padding:14px 16px;gap:14px}
   .summary-value{font-size:24px}
@@ -1847,6 +1885,8 @@ body.archive-mode .header{background:var(--bg2);border-bottom-color:rgba(255,152
       </div>
     </div>
   </div>
+
+  <div class="pair-pnl-bar" id="pair-pnl-bar"></div>
 
   <div class="section">
     <h2>📊 Открытые позиции</h2>
@@ -2136,6 +2176,19 @@ async function loadInstances(){
     if(tbankAll!==0){const c=tbankAll>=0?'#00ff88':'#ff2255';allParts.push(`<span style="color:${c}">${tbankAll>0?'+':''}${tbankAll.toFixed(0)}\u20bd</span>`)}
     allEl.innerHTML=allParts.length?allParts.join(' / '):'0';
   }catch(e){console.error('instances',e)}
+}
+
+async function loadPairPnl(){
+  try{
+    const pairs=await(await fetch('/api/pair-pnl?source='+currentSource)).json();
+    const el=document.getElementById('pair-pnl-bar');
+    el.innerHTML=pairs.map(p=>{
+      const c=p.pnl>=0?'#00ff88':'#ff2255';
+      const sign=p.pnl>0?'+':'';
+      const val=p.cur==='USDT'?`${sign}${p.pnl.toFixed(2)}$`:`${sign}${p.pnl.toFixed(0)}\u20bd`;
+      return`<div class="pair-chip"><span class="pair-chip-symbol">${p.symbol}</span><span class="pair-chip-cnt">${p.trades}</span><span class="pair-chip-pnl" style="color:${c}">${val}</span></div>`;
+    }).join('');
+  }catch(e){console.error('pair-pnl',e)}
 }
 
 async function loadStats(){
@@ -2744,7 +2797,7 @@ function changePage(d){loadTrades(currentPage+d)}
 
 async function loadAll(){
   await loadInstances();
-  await Promise.all([loadStats(),loadChart(),loadPositions(),loadTrades(currentPage)]);
+  await Promise.all([loadStats(),loadChart(),loadPositions(),loadTrades(currentPage),loadPairPnl()]);
   document.getElementById('last-update').textContent=
     'Обновлено: '+new Date().toLocaleTimeString('ru-RU')+' (автообновление каждые 10 сек)';
 }
@@ -2782,7 +2835,7 @@ function updateMarketBar(){
 updateMarketBar();setInterval(updateMarketBar,1000);
 
 loadAll();
-setInterval(async()=>{if(slEditing)return;await loadInstances();loadStats();loadChart();loadPositions();loadTrades(currentPage)},10000);
+setInterval(async()=>{if(slEditing)return;await loadInstances();loadStats();loadChart();loadPositions();loadTrades(currentPage);loadPairPnl()},10000);
 
 // SSE: instant trade updates
 function connectSSE(){

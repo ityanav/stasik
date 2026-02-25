@@ -1287,19 +1287,19 @@ class TradingEngine:
                 logger.info("TP adjusted for commission: %s $%.0f → $%.0f (net=$%.0f + fee=$%.2f)",
                             symbol, current_tp_profit, min_gross_profit, min_tp_net, round_trip_fee)
 
-        # SL cap: SL distance must not exceed 70% of TP distance
+        # SL cap: SL distance must not exceed 50% of TP distance (R:R >= 2:1)
         if tp > 0 and sl > 0:
             sl_dist = abs(price - sl)
             tp_dist = abs(tp - price)
-            max_sl_dist = tp_dist * 0.7
+            max_sl_dist = tp_dist * 0.5
             if tp_dist > 0 and sl_dist > max_sl_dist:
                 old_sl = sl
                 if side == "Buy":
                     sl = round(price - max_sl_dist, 6)
                 else:
                     sl = round(price + max_sl_dist, 6)
-                sl_source += f"→70%TP"
-                logger.info("SL tightened to 70%% TP: %s %.6f → %.6f (SL %.2f%% → %.2f%%, TP %.2f%%)",
+                sl_source += f"→50%TP"
+                logger.info("SL tightened to 50%% TP: %s %.6f → %.6f (SL %.2f%% → %.2f%%, TP %.2f%%)",
                             symbol, old_sl, sl, sl_dist / price * 100, max_sl_dist / price * 100, tp_dist / price * 100)
 
         # Place order with retry on qty rejection
