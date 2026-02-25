@@ -17,8 +17,7 @@ logger = logging.getLogger(__name__)
 _ARCHIVE_MAP = {
     "trades.db": "archive_scalp.db",
     "degen.db": "archive_degen.db",
-    "swing.db": "archive_swing.db",
-    "tbank_scalp.db": "archive_tbank_scalp.db",
+"tbank_scalp.db": "archive_tbank_scalp.db",
     "tbank_swing.db": "archive_tbank_swing.db",
 }
 
@@ -226,19 +225,27 @@ class Dashboard:
                 pass
             # Check if any trading service is running
             _all_services = [
-                "stasik", "stasik-swing", "stasik-tbank-scalp", "stasik-tbank-swing",
+                "stasik", "stasik-tbank-scalp", "stasik-tbank-swing",
                 "stasik-midas", "stasik-turtle", "stasik-turtle-tbank", "stasik-smc",
+                "stasik-accountant",
             ]
             running = any(self._check_service_active(s) for s in _all_services)
 
         exchange = self.config.get("exchange", "bybit")
         currency = "RUB" if exchange == "tbank" else "USDT"
 
-        # Total trades across all instances
+        # Total trades across all instances + today's net PnL per currency
         all_trades = total
+        today_pnl_usdt = daily_pnl  # main instance (SCALP) is USDT
+        today_pnl_rub = 0.0
+        _today_sql = (
+            "SELECT COALESCE(SUM(pnl), 0) as total FROM trades "
+            "WHERE status = 'closed' AND date(closed_at) = date('now')"
+        )
         for inst in _other_instances(self.config):
             db_path = _get_db_path(inst.get("db_path", ""), source)
             inst_name = inst.get("name", "")
+            is_rub = "TBANK" in inst_name.upper() or "MIDAS" in inst_name.upper()
             if db_path and Path(db_path).exists():
                 try:
                     async with aiosqlite.connect(db_path) as db:
@@ -247,6 +254,15 @@ class Dashboard:
                         row = await cur.fetchone()
                         if row:
                             all_trades += int(row["cnt"])
+                        if not is_archive:
+                            cur = await db.execute(_today_sql)
+                            row = await cur.fetchone()
+                            if row:
+                                pnl_val = float(row["total"])
+                                if is_rub:
+                                    today_pnl_rub += pnl_val
+                                else:
+                                    today_pnl_usdt += pnl_val
                 except Exception:
                     pass
             # Get TBank balance (only for live mode)
@@ -270,6 +286,8 @@ class Dashboard:
             "tbank_balance": tbank_balance,
             "daily_pnl": daily_pnl,
             "total_pnl": total_pnl,
+            "today_pnl_usdt": round(today_pnl_usdt, 2),
+            "today_pnl_rub": round(today_pnl_rub, 2),
             "open_positions": open_count,
             "total_trades": total,
             "all_trades": all_trades,
@@ -361,8 +379,8 @@ class Dashboard:
                 except Exception:
                     logger.warning("Failed to read trades from %s", inst_name)
 
-        # Sort by opened_at descending
-        all_trades.sort(key=lambda t: t.get("opened_at", ""), reverse=True)
+        # Sort by closed_at descending (newest closed first), open trades on top
+        all_trades.sort(key=lambda t: t.get("closed_at") or "9999", reverse=True)
 
         # Paginate
         offset = (page - 1) * per_page
@@ -668,7 +686,7 @@ class Dashboard:
             if not service or action not in ("start", "stop", "restart"):
                 return web.json_response({"ok": False, "error": "Bad request"}, status=400)
             # Whitelist: only known stasik services
-            allowed = {"stasik", "stasik-degen", "stasik-swing", "stasik-tbank-scalp", "stasik-tbank-swing", "stasik-dashboard", "stasik-midas", "stasik-turtle", "stasik-turtle-tbank", "stasik-smc"}
+            allowed = {"stasik", "stasik-degen", "stasik-tbank-scalp", "stasik-tbank-swing", "stasik-dashboard", "stasik-midas", "stasik-turtle", "stasik-turtle-tbank", "stasik-smc", "stasik-accountant"}
             if service not in allowed:
                 return web.json_response({"ok": False, "error": "Unknown service"}, status=400)
 
@@ -979,7 +997,6 @@ class Dashboard:
                 # Try loading the actual config file for accurate leverage
                 svc = inst.get("service", "")
                 cfg_map = {
-                    "stasik-swing": "config/swing.yaml",
                     "stasik-degen": "config/degen.yaml",
                 }
                 cfg_path = cfg_map.get(svc, "")
@@ -1693,6 +1710,7 @@ body.archive-mode .header{background:var(--bg2);border-bottom-color:rgba(255,152
 .market-status.closed{color:var(--red)}
 .market-hours{color:var(--muted);font-size:11px}
 .market-bal{font-weight:700;font-size:13px;color:var(--neon-cyan);background:var(--bg3);padding:2px 8px;border-radius:6px;font-variant-numeric:tabular-nums}
+.today-pnl{font-weight:700;font-size:12px;padding:2px 6px;border-radius:6px;font-variant-numeric:tabular-nums}
 
 .summary-bar{
   background:var(--bg2);border:1px solid var(--border);border-radius:12px;
@@ -1742,6 +1760,7 @@ body.archive-mode .header{background:var(--bg2);border-bottom-color:rgba(255,152
       <span class="hm-label">Bybit</span>
       <span class="market-status open">24/7</span>
       <span class="market-bal" id="bybit-bal">—</span>
+      <span class="today-pnl" id="bybit-pnl"></span>
     </div>
     <span class="hsep">|</span>
     <div class="hmarket">
@@ -1750,6 +1769,7 @@ body.archive-mode .header{background:var(--bg2);border-bottom-color:rgba(255,152
       <span class="market-status" id="moex-status">—</span>
       <span class="market-hours" id="moex-hours"></span>
       <span class="market-bal" id="tbank-bal">—</span>
+      <span class="today-pnl" id="tbank-pnl"></span>
     </div>
   </div>
   <div class="header-right">
@@ -2107,6 +2127,12 @@ async function loadStats(){
     const tbankBal=document.getElementById('tbank-bal');
     bybitBal.textContent=s.balance?s.balance.toLocaleString('ru-RU',{maximumFractionDigits:0})+' USDT':'—';
     tbankBal.textContent=tb?tb.toLocaleString('ru-RU',{maximumFractionDigits:0})+' RUB':'—';
+    // Today's net PnL
+    const bPnl=s.today_pnl_usdt||0;const tPnl=s.today_pnl_rub||0;
+    const bpEl=document.getElementById('bybit-pnl');
+    const tpEl=document.getElementById('tbank-pnl');
+    if(bPnl!==0){bpEl.textContent=(bPnl>0?'+':'')+bPnl.toFixed(2)+'$';bpEl.style.color=bPnl>=0?'var(--neon-green)':'var(--neon-red)'}else{bpEl.textContent=''}
+    if(tPnl!==0){tpEl.textContent=(tPnl>0?'+':'')+tPnl.toFixed(0)+'\u20bd';tpEl.style.color=tPnl>=0?'var(--neon-green)':'var(--neon-red)'}else{tpEl.textContent=''}
   }catch(e){console.error('stats',e)}
 }
 

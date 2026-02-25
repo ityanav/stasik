@@ -104,13 +104,6 @@ dashboard:
   secret: "f390917c31c0730992cef29d79739f023c15e555ed045b9cc5b5282298fa29eb"
 
 other_instances:
-  - name: "SWING"
-    db_path: "/root/stasik/data/swing.db"
-    service: "stasik-swing"
-    timeframe: "D"
-    leverage: "2x"
-    exit_ratio: 0.7
-    pairs: ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "ADAUSDT", "AVAXUSDT", "LINKUSDT", "NEARUSDT", "SUIUSDT", "APTUSDT"]
   - name: "DEGEN"
     db_path: "/root/stasik/data/degen.db"
     service: "stasik-degen"

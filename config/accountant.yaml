@@ -1,0 +1,35 @@
+instance_name: "ACCOUNTANT"
+
+bybit:
+  testnet: false
+  demo: true
+  api_key: "Ct24OvPFimR3vLSlcW"
+  api_secret: "CNzK2w9eQ41j4A4dszBLvvOkAH61Z5BQG9oq"
+
+# Dummy trading section for BybitClient init
+trading:
+  leverage: 1
+
+accountant:
+  check_interval: 30
+  min_profit_pct: 0.15
+  min_confidence: 6
+  timeframe: "15"
+
+databases:
+  - path: "/root/stasik/data/trades.db"
+    instance: "SCALP"
+    commission_rate: 0.00055
+  - path: "/root/stasik/data/smc.db"
+    instance: "SMC"
+    commission_rate: 0.00055
+
+ai:
+  api_key: "sk-2dec36c8752d48b6b2cfdedd21337126"
+  provider: deepseek
+  model: deepseek-chat
+  timeout: 15
+
+telegram:
+  token: "7852966698:AAFA_L6ovqXtTmMO05DBZg3UYbx4DklIY7k"
+  chat_id: "885025581"

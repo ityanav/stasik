@@ -128,13 +128,6 @@ other_instances:
     timeframe: "5м"
     leverage: "10x"
     pairs: ["BTCUSDT", "ETHUSDT", "XRPUSDT", "ADAUSDT", "AVAXUSDT", "LINKUSDT", "NEARUSDT", "SUIUSDT", "APTUSDT"]
-  - name: "SWING"
-    db_path: "/root/stasik/data/swing.db"
-    service: "stasik-swing"
-    timeframe: "D"
-    leverage: "2x"
-    pairs: ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "ADAUSDT", "AVAXUSDT", "LINKUSDT", "NEARUSDT", "SUIUSDT", "APTUSDT"]
-
 telegram:
   token: "7852966698:AAFA_L6ovqXtTmMO05DBZg3UYbx4DklIY7k"
   chat_id: "885025581"

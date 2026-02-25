@@ -1287,14 +1287,20 @@ class TradingEngine:
                 logger.info("TP adjusted for commission: %s $%.0f → $%.0f (net=$%.0f + fee=$%.2f)",
                             symbol, current_tp_profit, min_gross_profit, min_tp_net, round_trip_fee)
 
-        # R:R filter for SMC: reject if SL distance > TP distance (only when DB TP is set)
-        if isinstance(self.signal_gen, SMCGenerator) and tp > 0 and sl > 0:
+        # SL cap: SL distance must not exceed 70% of TP distance
+        if tp > 0 and sl > 0:
             sl_dist = abs(price - sl)
             tp_dist = abs(tp - price)
-            if tp_dist > 0 and sl_dist / tp_dist > 1.0:
-                logger.info("SMC R:R reject: %s SL=%.2f%% TP=%.2f%% R:R=%.2f (need >= 1.0)",
-                            symbol, sl_dist / price * 100, tp_dist / price * 100, tp_dist / sl_dist)
-                return
+            max_sl_dist = tp_dist * 0.7
+            if tp_dist > 0 and sl_dist > max_sl_dist:
+                old_sl = sl
+                if side == "Buy":
+                    sl = round(price - max_sl_dist, 6)
+                else:
+                    sl = round(price + max_sl_dist, 6)
+                sl_source += f"→70%TP"
+                logger.info("SL tightened to 70%% TP: %s %.6f → %.6f (SL %.2f%% → %.2f%%, TP %.2f%%)",
+                            symbol, old_sl, sl, sl_dist / price * 100, max_sl_dist / price * 100, tp_dist / price * 100)
 
         # Place order with retry on qty rejection
         order = None
