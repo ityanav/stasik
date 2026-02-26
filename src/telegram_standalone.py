@@ -99,7 +99,7 @@ def _get_positions() -> tuple[str, list[dict]]:
             continue
         rows = _query_db(
             inst["db"],
-            "SELECT id, symbol, side, entry_price, qty, pnl, opened_at FROM trades WHERE status='open'",
+            "SELECT id, symbol, side, entry_price, qty, pnl, opened_at FROM trades WHERE status='open' ORDER BY opened_at DESC",
         )
         for r in rows:
             r["instance"] = inst["name"]

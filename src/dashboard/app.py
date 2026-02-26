@@ -379,8 +379,17 @@ class Dashboard:
                 except Exception:
                     logger.warning("Failed to read trades from %s", inst_name)
 
-        # Sort by closed_at descending (newest closed first), open trades on top
-        all_trades.sort(key=lambda t: t.get("closed_at") or "9999", reverse=True)
+        # Sort: open trades on top (newest first), then closed (newest first)
+        all_trades.sort(key=lambda t: (
+            0 if t.get("status") == "open" else 1,
+            t.get("closed_at") or t.get("opened_at") or "",
+        ), reverse=False)
+        # Reverse within groups: newest open first, newest closed first
+        open_trades = [t for t in all_trades if t.get("status") == "open"]
+        closed_trades = [t for t in all_trades if t.get("status") != "open"]
+        open_trades.sort(key=lambda t: t.get("opened_at") or "", reverse=True)
+        closed_trades.sort(key=lambda t: t.get("closed_at") or "", reverse=True)
+        all_trades = open_trades + closed_trades
 
         # Paginate
         offset = (page - 1) * per_page
@@ -559,7 +568,7 @@ class Dashboard:
                     async with aiosqlite.connect(main_archive) as db:
                         db.row_factory = aiosqlite.Row
                         cur = await db.execute(
-                            "SELECT symbol, side, entry_price, qty, stop_loss, take_profit, partial_closed FROM trades WHERE status = 'open'"
+                            "SELECT symbol, side, entry_price, qty, stop_loss, take_profit, partial_closed, opened_at FROM trades WHERE status = 'open' ORDER BY opened_at DESC"
                         )
                         rows = await cur.fetchall()
                         for r in rows:
@@ -573,6 +582,7 @@ class Dashboard:
                                 "unrealised_pnl": 0.0,
                                 "instance": instance_name,
                                 "partial_closed": int(r["partial_closed"] or 0),
+                                "opened_at": r["opened_at"] or "",
                             })
                 except Exception:
                     logger.warning("Failed to read archive positions from %s", main_archive)
@@ -590,6 +600,7 @@ class Dashboard:
                     "unrealised_pnl": 0.0,
                     "instance": instance_name,
                     "partial_closed": t.get("partial_closed", 0) or 0,
+                    "opened_at": t.get("opened_at") or "",
                 })
 
         # Other instances — open trades from DB
@@ -601,7 +612,7 @@ class Dashboard:
                     async with aiosqlite.connect(db_path) as db:
                         db.row_factory = aiosqlite.Row
                         cur = await db.execute(
-                            "SELECT symbol, side, entry_price, qty, stop_loss, take_profit, partial_closed FROM trades WHERE status = 'open'"
+                            "SELECT symbol, side, entry_price, qty, stop_loss, take_profit, partial_closed, opened_at FROM trades WHERE status = 'open' ORDER BY opened_at DESC"
                         )
                         rows = await cur.fetchall()
                         for r in rows:
@@ -615,9 +626,13 @@ class Dashboard:
                                 "unrealised_pnl": 0.0,
                                 "instance": inst_name,
                                 "partial_closed": int(r["partial_closed"] or 0),
+                                "opened_at": r["opened_at"] or "",
                             })
                 except Exception:
                     logger.warning("Failed to read positions from %s", inst_name)
+
+        # Sort all positions: newest first (by opened_at descending)
+        positions.sort(key=lambda p: p.get("opened_at") or "", reverse=True)
 
         # Enrich positions with live unrealised PnL (calculated per-instance)
         if not is_archive and positions:
@@ -2700,7 +2715,7 @@ async function closePosition(symbol,instance,btn){
   try{
     const r=await fetch('/api/close-position',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({symbol,instance})});
     const d=await r.json();
-    if(d.ok){btn.textContent='&times;';loadAll()}
+    if(d.ok){btn.innerHTML='&#10003;';loadAll()}
     else{alert(d.error||'Ошибка');btn.disabled=false;btn.innerHTML='&times;'}
   }catch(e){alert('Ошибка: '+e);btn.disabled=false;btn.innerHTML='&times;'}
 }
@@ -2766,8 +2781,8 @@ async function loadPositions(){
     body.innerHTML=pos.map(p=>{
       const grossPnl=parseFloat(p.unrealised_pnl)||0;
       const inst=(p.instance||'').toUpperCase();
-      const isCls=inst.includes('TBANK')?'inst-tbank':inst.includes('DEGEN')?'inst-degen':inst.includes('SCALP')?'inst-scalp':inst.includes('MIDAS')?'inst-midas':inst.includes('TURTLE')?'inst-turtle':inst.includes('FIBA')?'inst-fiba':'inst-swing';
-      const iLabel=inst.includes('TBANK-SCALP')?'TB-SCALP':inst.includes('TBANK-SWING')?'TB-SWING':inst.includes('DEGEN')?'DEGEN':inst.includes('SCALP')?'SCALP':inst.includes('MIDAS')?'MIDAS':inst.includes('TURTLE-TB')?'TURTLE-TB':inst.includes('TURTLE')?'TURTLE':inst.includes('FIBA')?'FIBA':'SWING';
+      const isCls=inst.includes('TBANK')?'inst-tbank':inst.includes('DEGEN')?'inst-degen':inst.includes('SCALP')?'inst-scalp':inst.includes('MIDAS')?'inst-midas':inst.includes('TURTLE')?'inst-turtle':inst.includes('FIBA')?'inst-fiba':inst.includes('BUBA')?'inst-buba':'inst-other';
+      const iLabel=inst.includes('TBANK-SCALP')?'TB-SCALP':inst.includes('TBANK-SWING')?'TB-SWING':inst.includes('DEGEN')?'DEGEN':inst.includes('SCALP')?'SCALP':inst.includes('MIDAS')?'MIDAS':inst.includes('TURTLE-TB')?'TURTLE-TB':inst.includes('TURTLE')?'TURTLE':inst.includes('FIBA')?'FIBA':inst.includes('BUBA')?'BUBA':inst;
       const cur=inst.includes('TBANK')?'RUB':'USDT';
       const closeBtn=currentSource==='live'?`<button class="btn-close-x" onclick="closePosition('${p.symbol}','${p.instance||''}',this)" title="Закрыть позицию">&times;</button>`:'';
       const entryAmt=parseFloat(p.entry_amount)||0;
@@ -2808,8 +2823,8 @@ async function loadTrades(page){
     document.getElementById('tbody').innerHTML=r.trades.map(t=>{
       const p=t.pnl||0;
       const inst=(t.instance||'').toUpperCase();
-      const isCls=inst.includes('TBANK')?'inst-tbank':inst.includes('DEGEN')?'inst-degen':inst.includes('SCALP')?'inst-scalp':inst.includes('MIDAS')?'inst-midas':inst.includes('TURTLE')?'inst-turtle':inst.includes('FIBA')?'inst-fiba':'inst-swing';
-      const iLabel=inst.includes('TBANK-SCALP')?'TB-SCALP':inst.includes('TBANK-SWING')?'TB-SWING':inst.includes('DEGEN')?'DEGEN':inst.includes('SCALP')?'SCALP':inst.includes('MIDAS')?'MIDAS':inst.includes('TURTLE-TB')?'TURTLE-TB':inst.includes('TURTLE')?'TURTLE':inst.includes('FIBA')?'FIBA':'SWING';
+      const isCls=inst.includes('TBANK')?'inst-tbank':inst.includes('DEGEN')?'inst-degen':inst.includes('SCALP')?'inst-scalp':inst.includes('MIDAS')?'inst-midas':inst.includes('TURTLE')?'inst-turtle':inst.includes('FIBA')?'inst-fiba':inst.includes('BUBA')?'inst-buba':'inst-other';
+      const iLabel=inst.includes('TBANK-SCALP')?'TB-SCALP':inst.includes('TBANK-SWING')?'TB-SWING':inst.includes('DEGEN')?'DEGEN':inst.includes('SCALP')?'SCALP':inst.includes('MIDAS')?'MIDAS':inst.includes('TURTLE-TB')?'TURTLE-TB':inst.includes('TURTLE')?'TURTLE':inst.includes('FIBA')?'FIBA':inst.includes('BUBA')?'BUBA':inst;
       const tTime=t.closed_at||t.opened_at||'';
       let tFmt='—';
       if(tTime){const utcD=new Date(tTime.replace(' ','T')+'Z');const mskD=new Date(utcD.getTime()+3*3600000);tFmt=String(mskD.getMonth()+1).padStart(2,'0')+'/'+String(mskD.getDate()).padStart(2,'0')+' '+String(mskD.getHours()).padStart(2,'0')+':'+String(mskD.getMinutes()).padStart(2,'0')}
