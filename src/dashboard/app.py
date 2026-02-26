@@ -2563,7 +2563,7 @@ body.archive-mode .header{background:var(--bg2);border-bottom-color:rgba(255,152
       </table>
     </div>
     <div id="close-all-wrap" style="display:none;margin-top:14px;text-align:right">
-      <button class="btn-close-all" onclick="closeAllPositions()">Flatten All</button>
+      <button class="btn-close-all" onclick="closeAllPositions()">CLOSE ALL</button>
     </div>
   </div>
 
@@ -3408,7 +3408,7 @@ async function closeAllPositions(){
     const r=await fetch('/api/close-all',{method:'POST',headers:{'Content-Type':'application/json'}});
     const d=await r.json();
     if(d.ok){btn.textContent='Done';loadAll()}
-    else{alert(d.error||'Error');btn.disabled=false;btn.textContent='Flatten All'}
+    else{alert(d.error||'Error');btn.disabled=false;btn.textContent='CLOSE ALL'}
   }catch(e){alert('Ошибка: '+e);btn.disabled=false;btn.textContent='Закрыть все позиции'}
 }
 
