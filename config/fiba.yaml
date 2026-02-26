@@ -96,7 +96,8 @@ smc:
 
 risk:
   risk_per_trade: 0.5
-  max_open_positions: 4
+  max_open_positions: 8
+  max_per_symbol: 3
   max_per_group: 1
   commission_rate: 0.055
   max_margin_usdt: 20000             # Max initial margin for this instance ($)

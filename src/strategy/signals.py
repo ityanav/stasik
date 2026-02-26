@@ -750,14 +750,14 @@ class SMCGenerator:
         scores["fib_zone"] = fib_score
         details["fib_zone_name"] = fib_zone_name
 
-        # ── OTE 0.705 bonus ──
+        # ── OTE 0.705 bonus (independent) ──
         ote_bonus_val = 0
-        if self.ote_bonus and retracement and fib_score != 0:
+        if self.ote_bonus and retracement:
             ote_level = retracement.get(0.705, 0)
             if ote_level > 0:
                 prox = close * self.ote_proximity_pct / 100
                 if abs(close - ote_level) <= prox:
-                    ote_bonus_val = 1 if fib_score > 0 else -1
+                    ote_bonus_val = 1 if direction == "bullish" else -1
                     details["ote_hit"] = True
         scores["ote_bonus"] = ote_bonus_val
 
@@ -813,7 +813,7 @@ class SMCGenerator:
         rsi_div = detect_rsi_divergence(df, self.rsi_period)
         scores["rsi_div"] = rsi_div
 
-        # ── 8. Fibonacci Cluster bonus ──
+        # ── 8. Fibonacci Cluster bonus (independent) ──
         cluster_bonus = 0
         if self.cluster_enabled:
             clusters = self._fib_clusters.get(symbol, [])
@@ -821,7 +821,7 @@ class SMCGenerator:
                 if cl["count"] >= self.cluster_min_levels:
                     prox = close * self.cluster_proximity_pct / 100
                     if abs(close - cl["price"]) <= prox:
-                        cluster_bonus = 1 if fib_score > 0 else (-1 if fib_score < 0 else 0)
+                        cluster_bonus = 1 if direction == "bullish" else -1
                         details["cluster_price"] = round(cl["price"], 6)
                         details["cluster_count"] = cl["count"]
                         break
@@ -894,14 +894,35 @@ class SMCGenerator:
                 details["mm_price"] = mm["nearest_price"]
         scores["murray"] = mm_score
 
-        total = sum(scores.values())
+        # ── Split into STRUCTURE vs MOMENTUM ──
+        # Structure: WHERE to enter (determines signal direction)
+        structure_keys = ("fib_zone", "liq_sweep", "fvg", "order_block",
+                          "ote_bonus", "cluster_bonus", "pivot_bonus", "murray")
+        # Momentum: WHEN to enter (confirms or blocks entry)
+        momentum_keys = ("displacement", "volume", "rsi_div", "cum_delta", "vol_profile")
 
-        if total >= self.min_score:
-            signal = Signal.BUY
-        elif total <= -self.min_score:
-            signal = Signal.SELL
+        struct_score = sum(scores[k] for k in structure_keys if k in scores)
+        mom_score = sum(scores[k] for k in momentum_keys if k in scores)
+
+        # Signal from structure only
+        if struct_score >= self.min_score:
+            raw_signal = Signal.BUY
+        elif struct_score <= -self.min_score:
+            raw_signal = Signal.SELL
         else:
+            raw_signal = Signal.HOLD
+
+        # Momentum filter: block if momentum contradicts structure
+        signal = raw_signal
+        momentum_blocked = False
+        if raw_signal == Signal.BUY and mom_score < 0:
             signal = Signal.HOLD
+            momentum_blocked = True
+        elif raw_signal == Signal.SELL and mom_score > 0:
+            signal = Signal.HOLD
+            momentum_blocked = True
+
+        total = struct_score  # score = structure only (clean)
 
         # TP levels from Fibonacci extensions
         if extensions:
@@ -911,10 +932,13 @@ class SMCGenerator:
         # Store sweep level for SL calculation in engine
         details["sweep_level"] = sweep["swept_level"]
         details["fib_direction"] = direction
+        details["momentum_blocked"] = momentum_blocked
 
+        mom_str = f", mom={mom_score}" if mom_score != 0 else ""
+        block_str = " [MOMENTUM BLOCK]" if momentum_blocked else ""
         logger.info(
-            "FIBA %s: %s (score=%d, fib=%d[%s], ote=%d, sweep=%d[%s], fvg=%d, ob=%d, disp=%d, vol=%d, rsi_div=%d, cluster=%d, pivot=%d, vp=%d, cd=%d, mm=%d)",
-            symbol, signal.value, total,
+            "FIBA %s: %s (score=%d%s%s, fib=%d[%s], ote=%d, sweep=%d[%s], fvg=%d, ob=%d, disp=%d, vol=%d, rsi_div=%d, cluster=%d, pivot=%d, vp=%d, cd=%d, mm=%d)",
+            symbol, signal.value, total, mom_str, block_str,
             scores["fib_zone"], fib_zone_name,
             scores.get("ote_bonus", 0),
             scores["liq_sweep"], sweep["type"],

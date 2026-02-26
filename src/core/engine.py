@@ -62,6 +62,7 @@ class TradingEngine:
         # Correlation groups: symbol -> group name
         self._corr_groups: dict[str, str] = {}
         self._max_per_group: int = config["risk"].get("max_per_group", 1)
+        self._max_per_symbol: int = config["risk"].get("max_per_symbol", 1)
         for group_name, symbols in config["risk"].get("correlation_groups", {}).items():
             for s in symbols:
                 self._corr_groups[s] = group_name
@@ -555,20 +556,31 @@ class TradingEngine:
             else:
                 exchange_positions = self.client.get_positions(category="linear")
 
-            exch_open = set()
+            exch_sizes = {}  # (symbol, side) -> total exchange size
             for p in exchange_positions:
                 if p["size"] > 0:
-                    exch_open.add((p["symbol"], p["side"]))
+                    key = (p["symbol"], p["side"])
+                    exch_sizes[key] = p["size"]
+
+            # Sum DB qty per (symbol, side)
+            db_qty = {}
+            for trade in open_trades:
+                key = (trade["symbol"], trade["side"])
+                db_qty[key] = db_qty.get(key, 0) + trade["qty"]
 
             for trade in open_trades:
                 key = (trade["symbol"], trade["side"])
-                if key not in exch_open:
+                if key not in exch_sizes:
+                    # Fully closed on exchange
                     logger.info("Detected externally closed position: %s %s (trade #%d)",
                                 trade["side"], trade["symbol"], trade["id"])
                     try:
                         await self._check_trade_closed(trade)
                     except Exception:
                         logger.exception("Failed to process externally closed trade #%d", trade["id"])
+                elif db_qty.get(key, 0) > 0 and exch_sizes[key] < db_qty[key] * 0.5:
+                    logger.warning("Exchange size %.4f < DB total %.4f for %s %s — partial external close?",
+                                   exch_sizes[key], db_qty[key], trade["side"], trade["symbol"])
         except Exception:
             logger.exception("_detect_closed_positions error")
 
@@ -767,7 +779,11 @@ class TradingEngine:
             # 5. Check existing positions
             open_trades = await self.db.get_open_trades()
             symbol_open = [t for t in open_trades if t["symbol"] == symbol]
-            if symbol_open:
+            if len(symbol_open) >= self._max_per_symbol:
+                return
+
+            # One-way mode: only same direction allowed
+            if symbol_open and symbol_open[0]["side"] != side:
                 return
 
             if not self.risk.can_open_position(len(open_trades)):
@@ -776,17 +792,19 @@ class TradingEngine:
             if not self._check_margin_limit():
                 return
 
-            # Correlation group limit
+            # Correlation group limit (count unique symbols, not trades)
             group = self._corr_groups.get(symbol)
             if group:
-                group_open = sum(
-                    1 for t in open_trades
+                group_symbols = set(
+                    t["symbol"] for t in open_trades
                     if self._corr_groups.get(t["symbol"]) == group
                 )
-                if group_open >= self._max_per_group:
-                    logger.info("FIBA корреляция: отклонён %s — %d/%d в группе '%s'",
-                                symbol, group_open, self._max_per_group, group)
-                    return
+                if len(group_symbols) >= self._max_per_group:
+                    # Allow extra positions in own symbol (already in group)
+                    if symbol not in group_symbols:
+                        logger.info("FIBA корреляция: отклонён %s — %d/%d символов в группе '%s'",
+                                    symbol, len(group_symbols), self._max_per_group, group)
+                        return
 
             # 6. Open trade with SMC SL/TP
             atr = calculate_atr(df, self._atr_period)
@@ -1346,8 +1364,11 @@ class TradingEngine:
         )
 
         # Set trailing stop for futures / tbank (ATR-based or fixed)
+        # Skip exchange-level trailing if multiple positions per symbol
         trailing_msg = ""
-        if category in ("linear", "tbank"):
+        open_trades = await self.db.get_open_trades()
+        symbol_count = sum(1 for t in open_trades if t["symbol"] == symbol)
+        if category in ("linear", "tbank") and symbol_count <= 1:
             if atr and atr > 0:
                 trailing_distance = self.risk.calculate_trailing_distance_atr(
                     atr, price, self._atr_trail_mult
@@ -1379,6 +1400,8 @@ class TradingEngine:
                         active_price=active_price,
                     )
                     trailing_msg = f"\n📐 Trailing SL: {trail_pct}% (активация при {trail_activation_pct}% прибыли)"
+        elif symbol_count > 1:
+            trailing_msg = "\n📐 Trailing: пропущен (мульти-позиция)"
 
         direction = "ЛОНГ 📈" if side == "Buy" else "ШОРТ 📉"
         pos_value = qty * price
@@ -2284,18 +2307,23 @@ class TradingEngine:
             return
 
         # Move SL to entry (breakeven)
-        try:
-            if self.exchange_type == "bybit":
-                self.client.session.set_trading_stop(
-                    category="linear", symbol=symbol,
-                    stopLoss=str(round(entry, 6)), positionIdx=0,
-                )
-            else:
-                logger.info("Breakeven SL for %s: exchange does not support SL move, skipping", symbol)
+        # If multiple positions per symbol, update DB SL (polling will handle it)
+        open_for_symbol = [t for t in await self.db.get_open_trades() if t["symbol"] == symbol]
+        if len(open_for_symbol) > 1:
+            await self.db.update_stop_loss(trade_id, entry)
+        else:
+            try:
+                if self.exchange_type == "bybit":
+                    self.client.session.set_trading_stop(
+                        category="linear", symbol=symbol,
+                        stopLoss=str(round(entry, 6)), positionIdx=0,
+                    )
+                else:
+                    logger.info("Breakeven SL for %s: exchange does not support SL move, skipping", symbol)
+                    return
+            except Exception:
+                logger.warning("Failed to set breakeven SL for %s", symbol)
                 return
-        except Exception:
-            logger.warning("Failed to set breakeven SL for %s", symbol)
-            return
 
         self._breakeven_done.add(trade_id)
         msg = (
