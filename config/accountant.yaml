@@ -12,8 +12,8 @@ trading:
 
 accountant:
   check_interval: 10
-  min_profit_pct: 0.1        # AI review when net PnL >= 0.1%
-  auto_close_pct: 0.3        # hard close at 0.3%+ net profit (no AI needed)
+  min_profit_pct: 0.5        # AI review when net PnL >= 0.5% (~$400 gross на $80K позиции)
+  auto_close_pct: 1.0        # hard close at 1.0%+ net profit (no AI needed)
   loss_review_sl_pct: 50     # review when loss >= 50% of SL distance
   min_confidence: 6          # confidence for profit-side actions (lower = more aggressive)
   loss_min_confidence: 9     # confidence for loss-side CLOSE (harder to cut)

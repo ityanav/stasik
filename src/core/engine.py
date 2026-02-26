@@ -1630,10 +1630,7 @@ class TradingEngine:
         for trade in symbol_trades:
             qty = trade["qty"]
             entry = trade["entry_price"]
-            if side == "Buy":
-                pnl = (exit_price - entry) * qty
-            else:
-                pnl = (entry - exit_price) * qty
+            pnl = self._calc_net_pnl(side, entry, exit_price, qty)
             total_pnl += pnl
             try:
                 await self.db.close_trade(trade["id"], exit_price, pnl)
@@ -1793,9 +1790,10 @@ class TradingEngine:
             # Find matching record by entry price and side
             for rec in closed_records:
                 if rec["side"] == side and abs(rec["entry_price"] - entry_price) < entry_price * 0.001:
-                    pnl = rec["pnl"]
                     exit_price = rec["exit_price"]
-                    logger.info("Got real PnL from exchange for %s: %.2f (exit=%.4f)", symbol, pnl, exit_price)
+                    # Exchange closedPnl is GROSS (no commission) — always calculate net
+                    pnl = self._calc_net_pnl(side, entry_price, exit_price, qty)
+                    logger.info("Got exit from exchange for %s: net_pnl=%.2f (exit=%.4f)", symbol, pnl, exit_price)
                     break
         except Exception:
             logger.warning("Failed to get closed PnL from exchange for %s", symbol)
@@ -3036,10 +3034,7 @@ class TradingEngine:
                     rows = await cur.fetchall()
                     for t in rows:
                         exit_price = other_client.get_last_price(symbol) if other_client else 0
-                        if t["side"] == "Buy":
-                            pnl = (exit_price - t["entry_price"]) * t["qty"]
-                        else:
-                            pnl = (t["entry_price"] - exit_price) * t["qty"]
+                        pnl = self._calc_net_pnl(t["side"], t["entry_price"], exit_price, t["qty"])
                         await db.execute(
                             "UPDATE trades SET status='closed', exit_price=?, pnl=?, closed_at=datetime('now') WHERE id=?",
                             (exit_price, pnl, t["id"]),
@@ -3066,10 +3061,7 @@ class TradingEngine:
                         exit_price = self.client.get_last_price(symbol)
                     else:
                         exit_price = self.client.get_last_price(symbol, category=t["category"])
-                    if t["side"] == "Buy":
-                        pnl = (exit_price - t["entry_price"]) * t["qty"]
-                    else:
-                        pnl = (t["entry_price"] - exit_price) * t["qty"]
+                    pnl = self._calc_net_pnl(t["side"], t["entry_price"], exit_price, t["qty"])
                     await self.db.close_trade(t["id"], exit_price, pnl)
                     await self.db.update_daily_pnl(pnl)
                     balance = self.client.get_balance()
@@ -3082,7 +3074,7 @@ class TradingEngine:
         inst_tag = f"[{other_inst['name']}] " if is_other and other_inst else ""
         msg = f"❌ {inst_tag}Закрыл {direction} {symbol}"
         try:
-            msg += f"\nPnL: {pnl:+,.2f} {currency}"
+            msg += f"\nNet PnL: {pnl:+,.2f} {currency}"
         except Exception:
             pass
         logger.info(msg)
@@ -3128,10 +3120,7 @@ class TradingEngine:
                         exit_price = self.client.get_last_price(t["symbol"])
                     else:
                         exit_price = self.client.get_last_price(t["symbol"], category="linear")
-                    if t["side"] == "Buy":
-                        pnl = (exit_price - t["entry_price"]) * t["qty"]
-                    else:
-                        pnl = (t["entry_price"] - exit_price) * t["qty"]
+                    pnl = self._calc_net_pnl(t["side"], t["entry_price"], exit_price, t["qty"])
                     await self.db.close_trade(t["id"], exit_price, pnl)
                     await self.db.update_daily_pnl(pnl)
                 except Exception:
@@ -3187,10 +3176,7 @@ class TradingEngine:
                     exit_price = self.client.get_last_price(t["symbol"])
                 else:
                     exit_price = self.client.get_last_price(t["symbol"], category=t["category"])
-                if t["side"] == "Buy":
-                    pnl = (exit_price - t["entry_price"]) * t["qty"]
-                else:
-                    pnl = (t["entry_price"] - exit_price) * t["qty"]
+                pnl = self._calc_net_pnl(t["side"], t["entry_price"], exit_price, t["qty"])
                 await self.db.close_trade(t["id"], exit_price, pnl)
                 await self.db.update_daily_pnl(pnl)
                 balance = self.client.get_balance()
@@ -3266,10 +3252,8 @@ class TradingEngine:
                     for t in open_rows:
                         try:
                             exit_price = other_client.get_last_price(t["symbol"]) if is_tbank else other_client.get_last_price(t["symbol"], category="linear")
-                            if t["side"] == "Buy":
-                                pnl = (exit_price - t["entry_price"]) * t["qty"]
-                            else:
-                                pnl = (t["entry_price"] - exit_price) * t["qty"]
+                            # Net PnL: use engine's commission rate (same exchange)
+                            pnl = self._calc_net_pnl(t["side"], t["entry_price"], exit_price, t["qty"])
                             await db.execute(
                                 "UPDATE trades SET status='closed', exit_price=?, pnl=?, closed_at=datetime('now') WHERE id=?",
                                 (exit_price, pnl, t["id"]),
