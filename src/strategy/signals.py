@@ -641,8 +641,10 @@ class SMCGenerator:
 
         # Per-symbol caches (updated by engine via update_structure)
         self._htf_swings: dict[str, dict] = {}      # symbol -> swing_points
-        self._fib_levels: dict[str, dict] = {}       # symbol -> fib levels
-        self._fib_direction: dict[str, str] = {}     # symbol -> "bullish"/"bearish"
+        self._fib_levels: dict[str, dict] = {}       # symbol -> fib levels (primary)
+        self._fib_direction: dict[str, str] = {}     # symbol -> "bullish"/"bearish" (primary)
+        self._fib_levels_alt: dict[str, dict] = {}   # symbol -> fib levels (alternate)
+        self._fib_direction_alt: dict[str, str] = {} # symbol -> alternate direction
         self._fib_clusters: dict[str, list] = {}     # symbol -> cluster zones
         self._fib_pivots: dict[str, dict] = {}       # symbol -> pivot levels
 
@@ -650,6 +652,8 @@ class SMCGenerator:
         """Cache HTF swing structure and compute Fibonacci levels.
 
         Called by engine before generate() with HTF data.
+        Builds BOTH bullish and bearish Fib levels so generate() can
+        pick whichever zone the price is currently in.
         """
         self._htf_swings[symbol] = swings
 
@@ -658,21 +662,29 @@ class SMCGenerator:
         if not last_high or not last_low:
             self._fib_levels[symbol] = {}
             self._fib_direction[symbol] = ""
+            self._fib_levels_alt[symbol] = {}
+            self._fib_direction_alt[symbol] = ""
             return
 
         high_idx, high_price = last_high
         low_idx, low_price = last_low
 
-        # Direction: if most recent swing is a high → bearish retracement
-        #            if most recent swing is a low → bullish retracement
+        # Primary direction: most recent swing determines
         if high_idx > low_idx:
             direction = "bearish"
+            alt_direction = "bullish"
         else:
             direction = "bullish"
+            alt_direction = "bearish"
 
         self._fib_direction[symbol] = direction
         self._fib_levels[symbol] = calculate_fibonacci_levels(
             high_price, low_price, direction
+        )
+        # Alternate direction Fib (same high/low, opposite interpretation)
+        self._fib_direction_alt[symbol] = alt_direction
+        self._fib_levels_alt[symbol] = calculate_fibonacci_levels(
+            high_price, low_price, alt_direction
         )
 
         # Compute Fibonacci clusters from multiple swing pairs
@@ -687,6 +699,31 @@ class SMCGenerator:
         """Cache Fibonacci Pivot Points from daily data. Called by engine."""
         if self.fib_pivots_enabled and len(daily_df) >= 2:
             self._fib_pivots[symbol] = calculate_fib_pivots(daily_df)
+
+    def _check_fib_zone(self, close: float, retracement: dict, direction: str) -> tuple[int, str]:
+        """Check if price is in a Fib zone for the given direction. Returns (score, zone_name)."""
+        if not retracement:
+            return 0, ""
+        fib_0382 = retracement.get(0.382, 0)
+        fib_0618 = retracement.get(0.618, 0)
+        fib_0786 = retracement.get(0.786, 0)
+
+        premium_low = min(fib_0618, fib_0786)
+        premium_high = max(fib_0618, fib_0786)
+        standard_low = min(fib_0382, fib_0618)
+        standard_high = max(fib_0382, fib_0618)
+
+        if direction == "bullish":
+            if premium_low <= close <= premium_high:
+                return 2, "premium_buy"
+            if standard_low <= close <= standard_high:
+                return 1, "standard_buy"
+        else:
+            if premium_low <= close <= premium_high:
+                return -2, "premium_sell"
+            if standard_low <= close <= standard_high:
+                return -1, "standard_sell"
+        return 0, ""
 
     def generate(self, df: pd.DataFrame, symbol: str = "?", orderbook: dict | None = None) -> SignalResult:
         df.attrs["symbol"] = symbol
@@ -712,40 +749,22 @@ class SMCGenerator:
                 return SignalResult(signal=Signal.HOLD, score=0,
                                     details={"regime_filter": True, "adx": round(adx, 1)})
 
-        # ── 1. Fibonacci zone scoring ──
-        fib_score = 0
-        fib_zone_name = ""
-        if retracement:
-            fib_0382 = retracement.get(0.382, 0)
-            fib_0618 = retracement.get(0.618, 0)
-            fib_0786 = retracement.get(0.786, 0)
+        # ── 1. Fibonacci zone scoring (check BOTH directions) ──
+        fib_score, fib_zone_name = self._check_fib_zone(close, retracement, direction)
 
-            if direction == "bullish":
-                # Buy zone: price retraced DOWN
-                premium_low = min(fib_0618, fib_0786)
-                premium_high = max(fib_0618, fib_0786)
-                standard_low = min(fib_0382, fib_0618)
-                standard_high = max(fib_0382, fib_0618)
-
-                if premium_low <= close <= premium_high:
-                    fib_score = 2
-                    fib_zone_name = "premium_buy"
-                elif standard_low <= close <= standard_high:
-                    fib_score = 1
-                    fib_zone_name = "standard_buy"
-            else:
-                # Sell zone: price retraced UP
-                premium_low = min(fib_0618, fib_0786)
-                premium_high = max(fib_0618, fib_0786)
-                standard_low = min(fib_0382, fib_0618)
-                standard_high = max(fib_0382, fib_0618)
-
-                if premium_low <= close <= premium_high:
-                    fib_score = -2
-                    fib_zone_name = "premium_sell"
-                elif standard_low <= close <= standard_high:
-                    fib_score = -1
-                    fib_zone_name = "standard_sell"
+        # If primary direction has no zone hit, try alternate direction
+        if fib_score == 0:
+            alt_fib = self._fib_levels_alt.get(symbol, {})
+            alt_dir = self._fib_direction_alt.get(symbol, "")
+            if alt_fib and alt_dir:
+                alt_ret = alt_fib.get("retracement", {})
+                fib_score, fib_zone_name = self._check_fib_zone(close, alt_ret, alt_dir)
+                if fib_score != 0:
+                    # Switch to alternate direction for this signal
+                    direction = alt_dir
+                    extensions = alt_fib.get("extension", {})
+                    retracement = alt_ret
+                    details["alt_direction"] = True
 
         scores["fib_zone"] = fib_score
         details["fib_zone_name"] = fib_zone_name

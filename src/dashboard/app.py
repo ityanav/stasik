@@ -620,37 +620,79 @@ class Dashboard:
                     logger.warning("Failed to read positions from %s", inst_name)
 
         # Enrich positions with live unrealised PnL (calculated per-instance)
-        if not is_archive and self._get_client() and positions:
-            try:
-                exchange = self.config.get("exchange", "bybit")
-                if exchange == "tbank":
-                    raw = self._get_client().get_positions()
-                else:
-                    raw = self._get_client().get_positions(category="linear")
-                live_mark = {p["symbol"]: p.get("mark_price", 0) for p in raw}
-                live_leverage = {p["symbol"]: p.get("leverage", "?") for p in raw}
-                for pos in positions:
-                    sym = pos["symbol"]
-                    inst = (pos.get("instance") or "").upper()
-                    if "TBANK" in inst:
-                        pos["leverage"] = "1"
-                        continue
-                    pos["leverage"] = live_leverage.get(sym, "?")
-                    mark = 0
-                    if sym in live_mark and live_mark[sym]:
-                        mark = float(live_mark[sym])
+        if not is_archive and positions:
+            # Bybit positions
+            if self._get_client():
+                try:
+                    exchange = self.config.get("exchange", "bybit")
+                    if exchange == "tbank":
+                        raw = self._get_client().get_positions()
                     else:
-                        try:
-                            mark = self._get_client().get_last_price(sym, category="linear")
-                        except Exception:
-                            pass
-                    if mark > 0:
-                        entry = float(pos["entry_price"])
-                        qty = float(pos["size"])
-                        direction = 1 if pos["side"] == "Buy" else -1
-                        pos["unrealised_pnl"] = round((mark - entry) * qty * direction, 2)
-            except Exception:
-                pass
+                        raw = self._get_client().get_positions(category="linear")
+                    live_mark = {p["symbol"]: p.get("mark_price", 0) for p in raw}
+                    live_leverage = {p["symbol"]: p.get("leverage", "?") for p in raw}
+                    for pos in positions:
+                        inst = (pos.get("instance") or "").upper()
+                        if "TBANK" in inst or "MIDAS" in inst:
+                            continue
+                        sym = pos["symbol"]
+                        pos["leverage"] = live_leverage.get(sym, "?")
+                        mark = 0
+                        if sym in live_mark and live_mark[sym]:
+                            mark = float(live_mark[sym])
+                        else:
+                            try:
+                                mark = self._get_client().get_last_price(sym, category="linear")
+                            except Exception:
+                                pass
+                        if mark > 0:
+                            entry = float(pos["entry_price"])
+                            qty = float(pos["size"])
+                            direction = 1 if pos["side"] == "Buy" else -1
+                            pos["unrealised_pnl"] = round((mark - entry) * qty * direction, 2)
+                except Exception:
+                    pass
+
+            # TBank/Midas positions — get mark prices via TBankClient
+            tbank_positions = [p for p in positions
+                               if ("TBANK" in (p.get("instance") or "").upper()
+                                   or "MIDAS" in (p.get("instance") or "").upper())]
+            if tbank_positions:
+                try:
+                    from src.exchange.tbank_client import TBankClient
+                    import yaml as _yaml
+                    # Use first available tbank config for client
+                    for cfg_path in ("config/tbank_scalp.yaml", "config/midas.yaml"):
+                        if Path(cfg_path).exists():
+                            with open(cfg_path) as f:
+                                tcfg = _yaml.safe_load(f)
+                            tc = TBankClient(tcfg)
+                            break
+                    else:
+                        tc = None
+                    if tc:
+                        # Get live positions from TBank (has mark_price + unrealised_pnl)
+                        tbank_raw = tc.get_positions()
+                        tbank_mark = {p["symbol"]: p for p in tbank_raw}
+                        for pos in tbank_positions:
+                            pos["leverage"] = "1"
+                            sym = pos["symbol"]
+                            live = tbank_mark.get(sym)
+                            if live:
+                                pos["unrealised_pnl"] = round(float(live.get("unrealised_pnl", 0)), 2)
+                            else:
+                                # Position not on exchange — calc from last price
+                                try:
+                                    mark = tc.get_last_price(sym)
+                                    if mark > 0:
+                                        entry = float(pos["entry_price"])
+                                        qty = float(pos["size"])
+                                        direction = 1 if pos["side"] == "Buy" else -1
+                                        pos["unrealised_pnl"] = round((mark - entry) * qty * direction, 2)
+                                except Exception:
+                                    pass
+                except Exception as e:
+                    logger.debug("TBank position enrichment failed: %s", e)
 
         for pos in positions:
             entry = float(pos["entry_price"])
@@ -1825,6 +1867,7 @@ body.archive-mode .header{background:var(--bg2);border-bottom-color:rgba(255,152
       <span class="market-dot" id="bybit-dot"></span>
       <span class="hm-label">Bybit</span>
       <span class="market-status open">24/7</span>
+      <span class="market-hours" id="bybit-hours"></span>
       <span class="market-bal" id="bybit-bal">—</span>
       <span class="today-pnl" id="bybit-pnl"></span>
     </div>
@@ -2741,11 +2784,11 @@ async function loadPositions(){
       return`<tr class="fade-in">
         <td><span class="inst-tag ${isCls}">${iLabel}</span></td>
         <td style="color:var(--muted)">${p.symbol}${soBadge}</td>
-        <td style="color:var(--muted)">${p.side==='Buy'?'LONG':'SHORT'}</td>
+        <td style="color:var(--muted)">${p.side==='Buy'?'<span style="color:#00ff88">\u2191</span> LONG':'<span style="color:#ff2255">\u2193</span> SHORT'}</td>
         <td style="color:var(--muted)">${Math.round(entryAmt).toLocaleString()}</td>
         <td style="color:var(--muted)">${tpTxt}</td>
         <td style="color:var(--muted)">${slTxt}</td>
-        <td class="${cls(grossPnl)}"><strong>${fmt(grossPnl)}</strong></td>
+        <td class="${cls(grossPnl)}" style="opacity:0.45">${fmt(grossPnl)}</td>
         <td style="color:#ff9800">${fee.toLocaleString()}</td>
         <td class="${cls(pnl)}"><strong>${fmt(pnl)}</strong></td>
         <td>${closeBtn}</td></tr>`;
@@ -2768,7 +2811,8 @@ async function loadTrades(page){
       const isCls=inst.includes('TBANK')?'inst-tbank':inst.includes('DEGEN')?'inst-degen':inst.includes('SCALP')?'inst-scalp':inst.includes('MIDAS')?'inst-midas':inst.includes('TURTLE')?'inst-turtle':inst.includes('FIBA')?'inst-fiba':'inst-swing';
       const iLabel=inst.includes('TBANK-SCALP')?'TB-SCALP':inst.includes('TBANK-SWING')?'TB-SWING':inst.includes('DEGEN')?'DEGEN':inst.includes('SCALP')?'SCALP':inst.includes('MIDAS')?'MIDAS':inst.includes('TURTLE-TB')?'TURTLE-TB':inst.includes('TURTLE')?'TURTLE':inst.includes('FIBA')?'FIBA':'SWING';
       const tTime=t.closed_at||t.opened_at||'';
-      const tFmt=tTime?tTime.replace('T',' ').slice(5,16):'—';
+      let tFmt='—';
+      if(tTime){const utcD=new Date(tTime.replace(' ','T')+'Z');const mskD=new Date(utcD.getTime()+3*3600000);tFmt=String(mskD.getMonth()+1).padStart(2,'0')+'/'+String(mskD.getDate()).padStart(2,'0')+' '+String(mskD.getHours()).padStart(2,'0')+':'+String(mskD.getMinutes()).padStart(2,'0')}
       const tpc=t.partial_closed||0;
       const tSoBadge=tpc>0?` <span class="so-badge">${tpc}/3</span>`:'';
       const feeRate=inst.includes('TBANK')?0.0004:0.00055;
@@ -2781,11 +2825,11 @@ async function loadTrades(page){
       return`<tr class="fade-in">
         <td><span class="inst-tag ${isCls}">${iLabel}</span></td>
         <td style="color:var(--muted)">${t.symbol}${tSoBadge}</td>
-        <td style="color:var(--muted)">${t.side==='Buy'?'LONG':'SHORT'}</td>
+        <td style="color:var(--muted)">${t.side==='Buy'?'<span style="color:#00ff88">\u2191</span> LONG':'<span style="color:#ff2255">\u2193</span> SHORT'}</td>
         <td style="color:var(--muted);font-size:12px">${qty}</td>
         <td style="color:var(--muted)">${t.entry_price||'-'}</td><td style="color:var(--muted)">${t.exit_price||'-'}</td>
         <td style="font-size:12px;color:var(--muted)">$${psFmt}</td>
-        <td class="${cls(p)}"><strong>${p?p.toFixed(2):'-'}</strong></td>
+        <td class="${cls(p)}" style="opacity:0.45">${p?p.toFixed(2):'-'}</td>
         <td class="${cls(netPnl)}"><strong>${p?netPnl.toFixed(2):'-'}</strong></td>
         <td style="color:var(--muted);font-size:12px">${tFmt}</td>
         <td class="${t.status==='closed'?'status-closed':'status-open'}">${t.status==='closed'?'Closed':'Open'}</td></tr>`;
@@ -2807,8 +2851,10 @@ function updateMarketBar(){
   const h=msk.getHours(),m=msk.getMinutes(),day=msk.getDay();
   const pad=n=>String(n).padStart(2,'0');
   document.getElementById('msk-clock').textContent=pad(h)+':'+pad(m)+':'+pad(msk.getSeconds())+' МСК';
-  // Bybit always open
+  // Bybit always open — show UTC time
   document.getElementById('bybit-dot').className='market-dot open';
+  const utc=new Date(now.toLocaleString('en-US',{timeZone:'UTC'}));
+  document.getElementById('bybit-hours').textContent='UTC '+pad(utc.getHours())+':'+pad(utc.getMinutes());
   // MOEX: Mon-Fri 10:00-18:50 MSK
   const moexDot=document.getElementById('moex-dot');
   const moexSt=document.getElementById('moex-status');
