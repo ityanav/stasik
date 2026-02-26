@@ -96,6 +96,7 @@ def _enrich_pnl(positions: list[dict]):
     """Add live unrealised net PnL to positions from exchanges."""
     # Bybit
     bybit_marks = {}
+    bybit_session = None
     bybit_positions = [p for p in positions if p["exchange"] == "bybit"]
     if bybit_positions:
         try:
@@ -108,11 +109,13 @@ def _enrich_pnl(positions: list[dict]):
                 http_kwargs["demo"] = True
             else:
                 http_kwargs["testnet"] = bybit_cfg.get("testnet", False)
-            session = HTTP(**http_kwargs)
-            resp = session.get_positions(category="linear")
+            bybit_session = HTTP(**http_kwargs)
+            resp = bybit_session.get_positions(category="linear", limit=200)
             for p in resp["result"]["list"]:
                 if float(p["size"]) > 0:
-                    bybit_marks[p["symbol"]] = float(p.get("markPrice") or 0)
+                    mark = float(p.get("markPrice") or 0)
+                    if mark > 0:
+                        bybit_marks[p["symbol"]] = mark
         except Exception as e:
             logger.warning("Bybit positions fetch error: %s", e)
 
@@ -138,7 +141,14 @@ def _enrich_pnl(positions: list[dict]):
 
         if pos["exchange"] == "bybit":
             mark = bybit_marks.get(pos["symbol"], 0)
-            if mark > 0:
+            # Fallback: get last price via tickers if mark not found
+            if mark <= 0 and bybit_session:
+                try:
+                    resp = bybit_session.get_tickers(category="linear", symbol=pos["symbol"])
+                    mark = float(resp["result"]["list"][0]["lastPrice"])
+                except Exception:
+                    pass
+            if mark > 0 and entry > 0 and qty > 0:
                 direction = 1 if pos["side"] == "Buy" else -1
                 gross = (mark - entry) * qty * direction
                 fee = (entry * qty + mark * qty) * fee_rate

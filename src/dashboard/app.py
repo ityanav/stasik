@@ -51,6 +51,7 @@ class Dashboard:
         self._setup_routes()
         self._runner: web.AppRunner | None = None
         self._night_settings_path = Path("config/night_settings.json")
+        self._sale_settings_path = Path("config/sale_settings.json")
 
         # Standalone Bybit client (used when engine is None)
         self._client = None
@@ -206,6 +207,8 @@ class Dashboard:
         self.app.router.add_get("/api/events", self._api_events)
         self.app.router.add_get("/api/night-settings", self._api_night_settings_get)
         self.app.router.add_post("/api/night-settings", self._api_night_settings_post)
+        self.app.router.add_get("/api/sale-settings", self._api_sale_settings_get)
+        self.app.router.add_post("/api/sale-settings", self._api_sale_settings_post)
 
     async def start(self):
         self._runner = web.AppRunner(self.app)
@@ -214,10 +217,13 @@ class Dashboard:
         await site.start()
         logger.info("Dashboard started on 127.0.0.1:%d", self.port)
         self._night_task = asyncio.create_task(self._night_loop())
+        self._sale_task = asyncio.create_task(self._sale_loop())
 
     async def stop(self):
         if hasattr(self, "_night_task") and self._night_task:
             self._night_task.cancel()
+        if hasattr(self, "_sale_task") and self._sale_task:
+            self._sale_task.cancel()
         if self._runner:
             await self._runner.cleanup()
             logger.info("Dashboard stopped")
@@ -473,6 +479,135 @@ class Dashboard:
                 return
             except Exception:
                 logger.exception("[NIGHT] Loop error")
+
+    # --- SALE mode (Bybit only, GROSS PnL) ---
+
+    def _sale_read_settings(self) -> dict:
+        try:
+            if self._sale_settings_path.exists():
+                return json.loads(self._sale_settings_path.read_text())
+        except Exception:
+            pass
+        return {"enabled": False, "target": 0}
+
+    async def _sale_close_position(self, instance: str, symbol: str, side: str):
+        """Close a Bybit position (SALE mode — Bybit only)."""
+        exchange_closed = False
+        client = self._get_client()
+        if client:
+            try:
+                positions = client.get_positions(symbol=symbol, category="linear")
+                for p in positions:
+                    if p["symbol"] == symbol and p["size"] > 0:
+                        close_side = "Sell" if p["side"] == "Buy" else "Buy"
+                        client.place_order(
+                            symbol=symbol, side=close_side, qty=p["size"],
+                            category="linear", reduce_only=True,
+                        )
+                        exchange_closed = True
+            except Exception:
+                logger.warning("[SALE] Failed to close %s on Bybit", symbol)
+
+        db_path = self._resolve_instance_db(instance)
+        if db_path and Path(db_path).exists():
+            try:
+                mark = 0
+                if client:
+                    try:
+                        mark = client.get_last_price(symbol, category="linear")
+                    except Exception:
+                        pass
+                async with aiosqlite.connect(db_path) as db:
+                    db.row_factory = aiosqlite.Row
+                    cur = await db.execute(
+                        "SELECT id, side, entry_price, qty FROM trades WHERE symbol=? AND status='open'",
+                        (symbol,),
+                    )
+                    rows = await cur.fetchall()
+                    for r in rows:
+                        entry = float(r["entry_price"])
+                        qty = float(r["qty"])
+                        pnl = 0.0
+                        if mark > 0:
+                            direction = 1 if r["side"] == "Buy" else -1
+                            pnl = round((mark - entry) * qty * direction, 2)
+                        await db.execute(
+                            "UPDATE trades SET exit_price=?, pnl=?, status='closed', closed_at=? WHERE id=?",
+                            (mark if mark > 0 else entry, pnl, datetime.utcnow().isoformat(), r["id"]),
+                        )
+                    await db.commit()
+            except Exception:
+                logger.exception("[SALE] Failed to close %s in DB", symbol)
+
+        logger.info("[SALE] Closed %s/%s (exchange=%s)", instance, symbol, exchange_closed)
+
+    async def _sale_notify(self, instance: str, symbol: str, side: str, gross_pnl: float, target: int):
+        tg = self.config.get("telegram", {})
+        token = tg.get("token")
+        chat_id = tg.get("chat_id")
+        if not token or not chat_id:
+            return
+        sign = "+" if gross_pnl >= 0 else ""
+        text = (
+            f"\U0001F4B0 SALE CLOSE\n"
+            f"{instance} | {symbol} | {side}\n"
+            f"Gross PnL: {sign}{gross_pnl:.2f} USDT\n"
+            f"Target: {target} USDT"
+        )
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        try:
+            async with aiohttp.ClientSession() as session:
+                await session.post(url, json={"chat_id": chat_id, "text": text})
+        except Exception as e:
+            logger.warning("[SALE] Telegram notify failed: %s", e)
+
+    async def _sale_loop(self):
+        """Background loop: close Bybit positions when GROSS PnL >= target."""
+        logger.info("[SALE] Background loop started")
+        closing = set()
+        while True:
+            try:
+                await asyncio.sleep(10)
+                settings = self._sale_read_settings()
+                if not settings.get("enabled") or not settings.get("target"):
+                    continue
+
+                target = settings["target"]
+                positions = await self._night_get_positions_with_pnl()
+
+                for pos in positions:
+                    inst_upper = (pos.get("instance") or "").upper()
+                    # SALE only for Bybit
+                    if "TBANK" in inst_upper or "MIDAS" in inst_upper:
+                        continue
+
+                    gross_pnl = pos.get("unrealised_pnl", 0)
+                    if gross_pnl >= target:
+                        key = f"{pos['instance']}_{pos['symbol']}"
+                        if key in closing:
+                            continue
+                        closing.add(key)
+                        logger.info(
+                            "[SALE] Target hit: %s gross=%.2f target=%d — closing",
+                            key, gross_pnl, target,
+                        )
+                        try:
+                            await self._sale_close_position(
+                                pos["instance"], pos["symbol"], pos["side"],
+                            )
+                            await self._sale_notify(
+                                pos["instance"], pos["symbol"], pos["side"],
+                                gross_pnl, target,
+                            )
+                        except Exception:
+                            logger.exception("[SALE] Error closing %s", key)
+                        finally:
+                            closing.discard(key)
+            except asyncio.CancelledError:
+                logger.info("[SALE] Background loop stopped")
+                return
+            except Exception:
+                logger.exception("[SALE] Loop error")
 
     # --- Auth routes ---
 
@@ -1565,6 +1700,29 @@ class Dashboard:
         except Exception as e:
             return web.json_response({"error": str(e)}, status=400)
 
+    async def _api_sale_settings_get(self, request: web.Request) -> web.Response:
+        try:
+            if self._sale_settings_path.exists():
+                data = json.loads(self._sale_settings_path.read_text())
+            else:
+                data = {"enabled": False, "target": 0}
+        except Exception:
+            data = {"enabled": False, "target": 0}
+        return web.json_response(data)
+
+    async def _api_sale_settings_post(self, request: web.Request) -> web.Response:
+        try:
+            body = await request.json()
+            data = {
+                "enabled": bool(body.get("enabled", False)),
+                "target": int(body.get("target", 0)),
+            }
+            self._sale_settings_path.parent.mkdir(parents=True, exist_ok=True)
+            self._sale_settings_path.write_text(json.dumps(data))
+            return web.json_response({"ok": True})
+        except Exception as e:
+            return web.json_response({"error": str(e)}, status=400)
+
     async def _api_events(self, request: web.Request) -> web.StreamResponse:
         """SSE endpoint — pushes events when trades open or close."""
         resp = web.StreamResponse()
@@ -2287,6 +2445,17 @@ body.archive-mode .header{background:var(--bg2);border-bottom-color:rgba(255,152
 .night-slider:before{content:'';position:absolute;height:14px;width:14px;left:2px;bottom:2px;background:#555;border-radius:50%;transition:.3s}
 .night-switch input:checked+.night-slider{background:rgba(251,191,36,0.2);border-color:var(--neon-yellow);box-shadow:0 0 10px rgba(251,191,36,0.4)}
 .night-switch input:checked+.night-slider:before{transform:translateX(16px);background:var(--neon-yellow);box-shadow:0 0 6px var(--neon-yellow)}
+.sale-mode-wrap{display:flex;align-items:center;gap:8px}
+.sale-label{font-size:11px;color:var(--neon-cyan);font-weight:700;letter-spacing:1px;text-shadow:0 0 6px var(--neon-cyan)}
+.sale-input{width:52px;padding:4px 6px;background:rgba(0,255,255,0.08);border:1px solid rgba(0,255,255,0.3);border-radius:6px;color:var(--neon-cyan);font-family:'Share Tech Mono',monospace;font-size:13px;text-align:center;outline:none;transition:border-color .2s,box-shadow .2s}
+.sale-input:focus{border-color:var(--neon-cyan);box-shadow:0 0 8px rgba(0,255,255,0.3)}
+.sale-input::placeholder{color:rgba(0,255,255,0.3);font-size:11px}
+.sale-switch{position:relative;display:inline-block;width:36px;height:20px;flex-shrink:0}
+.sale-switch input{opacity:0;width:0;height:0}
+.sale-slider{position:absolute;cursor:pointer;top:0;left:0;right:0;bottom:0;background:rgba(255,255,255,0.08);border:1px solid rgba(255,255,255,0.15);border-radius:20px;transition:.3s}
+.sale-slider:before{content:'';position:absolute;height:14px;width:14px;left:2px;bottom:2px;background:#555;border-radius:50%;transition:.3s}
+.sale-switch input:checked+.sale-slider{background:rgba(0,255,255,0.2);border-color:var(--neon-cyan);box-shadow:0 0 10px rgba(0,255,255,0.4)}
+.sale-switch input:checked+.sale-slider:before{transform:translateX(16px);background:var(--neon-cyan);box-shadow:0 0 6px var(--neon-cyan)}
 </style>
 </head><body>
 
@@ -2330,6 +2499,11 @@ body.archive-mode .header{background:var(--bg2);border-bottom-color:rgba(255,152
       <span class="night-label">NIGHT</span>
       <input type="text" class="night-input" id="night-target" maxlength="4" inputmode="numeric" placeholder="PnL">
       <label class="night-switch"><input type="checkbox" id="night-toggle"><span class="night-slider"></span></label>
+    </div>
+    <div class="sale-mode-wrap" id="sale-mode-wrap">
+      <span class="sale-label">SALE</span>
+      <input type="text" class="sale-input" id="sale-target" maxlength="4" inputmode="numeric" placeholder="PnL">
+      <label class="sale-switch"><input type="checkbox" id="sale-toggle"><span class="sale-slider"></span></label>
     </div>
     <div class="source-toggle" id="source-toggle">
       <button class="active" onclick="setSource('live')" data-source="live">Live</button>
@@ -2504,6 +2678,35 @@ function _nightSave(){
   });
 })();
 
+let _saleEnabled=false,_saleTarget=0;
+let _saleSaveTimer=null;
+function _saleSave(){
+  clearTimeout(_saleSaveTimer);
+  _saleSaveTimer=setTimeout(()=>{
+    fetch('/api/sale-settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:_saleEnabled,target:_saleTarget})});
+  },300);
+}
+(function(){
+  document.addEventListener('DOMContentLoaded',()=>{
+    const inp=document.getElementById('sale-target');
+    const tog=document.getElementById('sale-toggle');
+    fetch('/api/sale-settings').then(r=>r.json()).then(d=>{
+      _saleEnabled=!!d.enabled;_saleTarget=d.target||0;
+      tog.checked=_saleEnabled;
+      if(_saleTarget)inp.value=_saleTarget;
+    }).catch(()=>{});
+    inp.addEventListener('input',()=>{
+      inp.value=inp.value.replace(/[^0-9]/g,'').slice(0,4);
+      _saleTarget=parseInt(inp.value)||0;
+      _saleSave();
+    });
+    tog.addEventListener('change',()=>{
+      _saleEnabled=tog.checked;
+      _saleSave();
+    });
+  });
+})();
+
 function fmt(v){return(v>=0?'+':'')+v.toFixed(2)}
 function cls(v){return v>=0?'g':'r'}
 
@@ -2605,6 +2808,7 @@ function setSource(src){
   const instances=document.getElementById('instances');
   const bulkActs=document.getElementById('bulk-actions');
   const nightWrap=document.getElementById('night-mode-wrap');
+  const saleWrap=document.getElementById('sale-mode-wrap');
   if(src==='archive'){
     banner.style.display='';
     badge.style.display='none';
@@ -2612,6 +2816,7 @@ function setSource(src){
     instances.style.display='none';
     bulkActs.style.display='none';
     nightWrap.style.display='none';
+    saleWrap.style.display='none';
     document.body.classList.add('archive-mode');
   }else{
     banner.style.display='none';
@@ -2620,6 +2825,7 @@ function setSource(src){
     instances.style.display='';
     bulkActs.style.display='';
     nightWrap.style.display='flex';
+    saleWrap.style.display='flex';
     document.body.classList.remove('archive-mode');
   }
   loadAll();
