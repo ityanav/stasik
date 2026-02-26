@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import subprocess
 import time
@@ -48,6 +49,7 @@ class Dashboard:
         self.app = web.Application(middlewares=[self.auth.middleware()])
         self._setup_routes()
         self._runner: web.AppRunner | None = None
+        self._night_settings_path = Path("config/night_settings.json")
 
         # Standalone Bybit client (used when engine is None)
         self._client = None
@@ -58,7 +60,15 @@ class Dashboard:
                 logger.info("Dashboard: standalone BybitClient initialized")
             except Exception:
                 logger.warning("Dashboard: failed to init standalone BybitClient")
-        self._last_trade_count: int = 0  # for SSE change detection
+
+        # Cached TBank client (avoid re-init on every request)
+        self._tbank_client = None
+        self._init_tbank_client()
+
+        # TTL caches for expensive operations
+        import time as _time
+        self._cache = {}  # key -> (value, expires_at)
+        self._cache_time = _time
 
     def _get_client(self):
         """Get Bybit client from engine or standalone."""
@@ -66,15 +76,112 @@ class Dashboard:
             return self.engine.client
         return self._client
 
-    @staticmethod
-    def _check_service_active(service: str) -> bool:
+    def _init_tbank_client(self):
+        """Init cached TBank client from first available config."""
+        try:
+            from src.exchange.tbank_client import TBankClient
+            import yaml as _yaml
+            for cfg_path in ("config/tbank_scalp.yaml", "config/midas.yaml"):
+                if Path(cfg_path).exists():
+                    with open(cfg_path) as f:
+                        tcfg = _yaml.safe_load(f)
+                    self._tbank_client = TBankClient(tcfg)
+                    logger.info("Dashboard: standalone TBankClient initialized")
+                    return
+        except Exception as e:
+            logger.warning("Dashboard: failed to init TBankClient: %s", e)
+
+    def _get_tbank_client(self):
+        """Get cached TBank client."""
+        return self._tbank_client
+
+    def _cache_get(self, key: str):
+        """Get value from TTL cache, returns None if expired/missing."""
+        entry = self._cache.get(key)
+        if entry and self._cache_time.time() < entry[1]:
+            return entry[0]
+        return None
+
+    def _cache_set(self, key: str, value, ttl: float = 5.0):
+        """Set value in TTL cache."""
+        self._cache[key] = (value, self._cache_time.time() + ttl)
+
+    def _get_bybit_positions_cached(self):
+        """Get Bybit positions with 5s cache."""
+        cached = self._cache_get("bybit_positions")
+        if cached is not None:
+            return cached
+        client = self._get_client()
+        if not client:
+            return []
+        try:
+            raw = client.get_positions(category="linear")
+            self._cache_set("bybit_positions", raw, 5.0)
+            return raw
+        except Exception:
+            return []
+
+    def _get_tbank_positions_cached(self):
+        """Get TBank positions with 5s cache."""
+        cached = self._cache_get("tbank_positions")
+        if cached is not None:
+            return cached
+        tc = self._get_tbank_client()
+        if not tc:
+            return []
+        try:
+            raw = tc.get_positions()
+            self._cache_set("tbank_positions", raw, 5.0)
+            return raw
+        except Exception:
+            return []
+
+    def _get_bybit_balance_cached(self):
+        """Get Bybit balance with 10s cache."""
+        cached = self._cache_get("bybit_balance")
+        if cached is not None:
+            return cached
+        client = self._get_client()
+        if not client:
+            return 0.0
+        try:
+            bal = client.get_balance()
+            self._cache_set("bybit_balance", bal, 10.0)
+            return bal
+        except Exception:
+            return 0.0
+
+    def _get_tbank_balance_cached(self):
+        """Get TBank balance with 10s cache."""
+        cached = self._cache_get("tbank_balance")
+        if cached is not None:
+            return cached
+        tc = self._get_tbank_client()
+        if not tc:
+            return 0.0
+        try:
+            bal = tc.get_balance()
+            self._cache_set("tbank_balance", bal, 10.0)
+            return bal
+        except Exception:
+            return 0.0
+
+    def _check_service_active(self, service: str) -> bool:
+        """Check systemctl is-active with 10s cache."""
+        cache_key = f"svc_{service}"
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            return cached
         try:
             result = subprocess.run(
                 ["systemctl", "is-active", service],
                 capture_output=True, text=True, timeout=3,
             )
-            return result.stdout.strip() == "active"
+            active = result.stdout.strip() == "active"
+            self._cache_set(cache_key, active, 10.0)
+            return active
         except Exception:
+            self._cache_set(cache_key, False, 10.0)
             return False
 
     def _setup_routes(self):
@@ -96,6 +203,8 @@ class Dashboard:
         self.app.router.add_get("/api/pair-pnl", self._api_pair_pnl)
         self.app.router.add_post("/api/set-leverage", self._api_set_leverage)
         self.app.router.add_get("/api/events", self._api_events)
+        self.app.router.add_get("/api/night-settings", self._api_night_settings_get)
+        self.app.router.add_post("/api/night-settings", self._api_night_settings_post)
 
     async def start(self):
         self._runner = web.AppRunner(self.app)
@@ -103,11 +212,240 @@ class Dashboard:
         site = web.TCPSite(self._runner, "127.0.0.1", self.port)
         await site.start()
         logger.info("Dashboard started on 127.0.0.1:%d", self.port)
+        self._night_task = asyncio.create_task(self._night_loop())
 
     async def stop(self):
+        if hasattr(self, "_night_task") and self._night_task:
+            self._night_task.cancel()
         if self._runner:
             await self._runner.cleanup()
             logger.info("Dashboard stopped")
+
+    # --- Night mode (server-side) ---
+
+    def _night_read_settings(self) -> dict:
+        """Read night mode settings from JSON file."""
+        try:
+            if self._night_settings_path.exists():
+                return json.loads(self._night_settings_path.read_text())
+        except Exception:
+            pass
+        return {"enabled": False, "target": 0}
+
+    async def _night_get_positions_with_pnl(self) -> list[dict]:
+        """Get all open positions with unrealised PnL (reuses existing logic)."""
+        positions = []
+        instance_name = self.config.get("instance_name", "SCALP")
+
+        # Main instance
+        main_open = await self.db.get_open_trades()
+        for t in main_open:
+            positions.append({
+                "symbol": t["symbol"],
+                "side": t["side"],
+                "size": float(t["qty"]),
+                "entry_price": float(t["entry_price"]),
+                "unrealised_pnl": 0.0,
+                "instance": instance_name,
+            })
+
+        # Other instances
+        for inst in _other_instances(self.config):
+            inst_name = inst.get("name", "???")
+            db_path = inst.get("db_path", "")
+            if db_path and Path(db_path).exists():
+                try:
+                    async with aiosqlite.connect(db_path) as db:
+                        db.row_factory = aiosqlite.Row
+                        cur = await db.execute(
+                            "SELECT symbol, side, entry_price, qty FROM trades WHERE status = 'open'"
+                        )
+                        rows = await cur.fetchall()
+                        for r in rows:
+                            positions.append({
+                                "symbol": r["symbol"],
+                                "side": r["side"],
+                                "size": float(r["qty"]),
+                                "entry_price": float(r["entry_price"]),
+                                "unrealised_pnl": 0.0,
+                                "instance": inst_name,
+                            })
+                except Exception:
+                    pass
+
+        # Enrich with live prices — Bybit
+        client = self._get_client()
+        if client:
+            try:
+                raw = self._get_bybit_positions_cached()
+                live_mark = {p["symbol"]: float(p.get("mark_price") or 0) for p in raw}
+                for pos in positions:
+                    inst_upper = (pos["instance"] or "").upper()
+                    if "TBANK" in inst_upper or "MIDAS" in inst_upper:
+                        continue
+                    mark = live_mark.get(pos["symbol"], 0)
+                    if not mark:
+                        try:
+                            mark = client.get_last_price(pos["symbol"], category="linear")
+                        except Exception:
+                            pass
+                    if mark > 0:
+                        direction = 1 if pos["side"] == "Buy" else -1
+                        pos["unrealised_pnl"] = round(
+                            (mark - float(pos["entry_price"])) * float(pos["size"]) * direction, 2
+                        )
+            except Exception:
+                pass
+
+        # Enrich — TBank/Midas
+        tc = self._get_tbank_client()
+        if tc:
+            try:
+                tbank_raw = self._get_tbank_positions_cached()
+                tbank_mark = {p["symbol"]: p for p in tbank_raw}
+                for pos in positions:
+                    inst_upper = (pos["instance"] or "").upper()
+                    if "TBANK" not in inst_upper and "MIDAS" not in inst_upper:
+                        continue
+                    live = tbank_mark.get(pos["symbol"])
+                    if live:
+                        pos["unrealised_pnl"] = round(float(live.get("unrealised_pnl", 0)), 2)
+                    else:
+                        try:
+                            mark = tc.get_last_price(pos["symbol"])
+                            if mark > 0:
+                                direction = 1 if pos["side"] == "Buy" else -1
+                                pos["unrealised_pnl"] = round(
+                                    (mark - float(pos["entry_price"])) * float(pos["size"]) * direction, 2
+                                )
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+        return positions
+
+    async def _night_close_position(self, instance: str, symbol: str, side: str):
+        """Close a position via exchange + DB (reuses close-position logic)."""
+        is_tbank = any(k in (instance or "").upper() for k in ("TBANK", "MIDAS"))
+        exchange_closed = False
+
+        if is_tbank:
+            try:
+                from src.exchange.tbank_client import TBankClient
+                for inst in _other_instances(self.config):
+                    if inst.get("name", "").upper() == (instance or "").upper():
+                        cfg_path = inst.get("config_path", "")
+                        if cfg_path and Path(cfg_path).exists():
+                            import yaml
+                            with open(cfg_path) as f:
+                                tcfg = yaml.safe_load(f)
+                            tc = TBankClient(tcfg)
+                            positions = tc.get_positions(symbol=symbol)
+                            for p in positions:
+                                if p["symbol"] == symbol and p["size"] > 0:
+                                    close_side = "Sell" if p["side"] == "Buy" else "Buy"
+                                    tc.place_order(symbol=symbol, side=close_side, qty=p["size"])
+                                    exchange_closed = True
+                            break
+            except Exception as e:
+                logger.warning("[NIGHT] Failed to close %s on TBank: %s", symbol, e)
+        else:
+            client = self._get_client()
+            if client:
+                try:
+                    positions = client.get_positions(symbol=symbol, category="linear")
+                    for p in positions:
+                        if p["symbol"] == symbol and p["size"] > 0:
+                            close_side = "Sell" if p["side"] == "Buy" else "Buy"
+                            client.place_order(
+                                symbol=symbol, side=close_side, qty=p["size"],
+                                category="linear", reduce_only=True,
+                            )
+                            exchange_closed = True
+                except Exception:
+                    logger.warning("[NIGHT] Failed to close %s on Bybit", symbol)
+
+        # Close in DB
+        db_path = self._resolve_instance_db(instance)
+        if db_path and Path(db_path).exists():
+            try:
+                mark = 0
+                if not is_tbank:
+                    client = self._get_client()
+                    if client:
+                        try:
+                            mark = client.get_last_price(symbol, category="linear")
+                        except Exception:
+                            pass
+                async with aiosqlite.connect(db_path) as db:
+                    db.row_factory = aiosqlite.Row
+                    cur = await db.execute(
+                        "SELECT id, side, entry_price, qty FROM trades WHERE symbol=? AND status='open'",
+                        (symbol,),
+                    )
+                    rows = await cur.fetchall()
+                    for r in rows:
+                        entry = float(r["entry_price"])
+                        qty = float(r["qty"])
+                        pnl = 0.0
+                        if mark > 0:
+                            direction = 1 if r["side"] == "Buy" else -1
+                            pnl = round((mark - entry) * qty * direction, 2)
+                        await db.execute(
+                            "UPDATE trades SET exit_price=?, pnl=?, status='closed', closed_at=? WHERE id=?",
+                            (mark if mark > 0 else entry, pnl, datetime.utcnow().isoformat(), r["id"]),
+                        )
+                    await db.commit()
+            except Exception:
+                logger.exception("[NIGHT] Failed to close %s in DB", symbol)
+
+        logger.info("[NIGHT] Closed %s/%s (exchange=%s)", instance, symbol, exchange_closed)
+
+    async def _night_loop(self):
+        """Background loop: check positions and auto-close when net PnL >= target."""
+        logger.info("[NIGHT] Background loop started")
+        closing = set()  # track in-flight closes
+        while True:
+            try:
+                await asyncio.sleep(10)
+                settings = self._night_read_settings()
+                if not settings.get("enabled") or not settings.get("target"):
+                    continue
+
+                target = settings["target"]
+                positions = await self._night_get_positions_with_pnl()
+
+                for pos in positions:
+                    gross_pnl = pos.get("unrealised_pnl", 0)
+                    inst_upper = (pos.get("instance") or "").upper()
+                    fee_rate = 0.0004 if ("TBANK" in inst_upper or "MIDAS" in inst_upper) else 0.00055
+                    entry_amount = float(pos["entry_price"]) * float(pos["size"])
+                    fee = entry_amount * fee_rate * 2
+                    net_pnl = gross_pnl - fee
+
+                    if net_pnl >= target:
+                        key = f"{pos['instance']}_{pos['symbol']}"
+                        if key in closing:
+                            continue
+                        closing.add(key)
+                        logger.info(
+                            "[NIGHT] Target hit: %s net=%.2f target=%d — closing",
+                            key, net_pnl, target,
+                        )
+                        try:
+                            await self._night_close_position(
+                                pos["instance"], pos["symbol"], pos["side"],
+                            )
+                        except Exception:
+                            logger.exception("[NIGHT] Error closing %s", key)
+                        finally:
+                            closing.discard(key)
+            except asyncio.CancelledError:
+                logger.info("[NIGHT] Background loop stopped")
+                return
+            except Exception:
+                logger.exception("[NIGHT] Loop error")
 
     # --- Auth routes ---
 
@@ -219,12 +557,8 @@ class Dashboard:
         balance = 0.0
         running = False
         tbank_balance = 0.0
-        if not is_archive and self._get_client():
-            try:
-                balance = self._get_client().get_balance()
-            except Exception:
-                pass
-            # Check if any trading service is running
+        if not is_archive:
+            balance = self._get_bybit_balance_cached()
             _all_services = [
                 "stasik-fiba", "stasik-tbank-scalp", "stasik-tbank-swing",
                 "stasik-midas", "stasik-fin",
@@ -242,6 +576,11 @@ class Dashboard:
             "SELECT COALESCE(SUM(pnl), 0) as total FROM trades "
             "WHERE status = 'closed' AND date(closed_at) = date('now')"
         )
+        _combined_sql = (
+            "SELECT COUNT(*) as cnt, "
+            "COALESCE(SUM(CASE WHEN date(closed_at) = date('now') THEN pnl ELSE 0 END), 0) as today "
+            "FROM trades WHERE status='closed'"
+        )
         for inst in _other_instances(self.config):
             db_path = _get_db_path(inst.get("db_path", ""), source)
             inst_name = inst.get("name", "")
@@ -250,36 +589,20 @@ class Dashboard:
                 try:
                     async with aiosqlite.connect(db_path) as db:
                         db.row_factory = aiosqlite.Row
-                        cur = await db.execute("SELECT COUNT(*) as cnt FROM trades WHERE status='closed'")
+                        cur = await db.execute(_combined_sql)
                         row = await cur.fetchone()
                         if row:
                             all_trades += int(row["cnt"])
-                        if not is_archive:
-                            cur = await db.execute(_today_sql)
-                            row = await cur.fetchone()
-                            if row:
-                                pnl_val = float(row["total"])
+                            if not is_archive:
+                                pnl_val = float(row["today"])
                                 if is_rub:
                                     today_pnl_rub += pnl_val
                                 else:
                                     today_pnl_usdt += pnl_val
                 except Exception:
                     pass
-            # Get TBank balance (only for live mode)
-            if not is_archive and "TBANK" in inst_name.upper():
-                try:
-                    from src.exchange.tbank_client import TBankClient
-                    import yaml
-                    svc = inst.get("service", "")
-                    cfg_map = {"stasik-tbank-scalp": "config/tbank_scalp.yaml", "stasik-tbank-swing": "config/tbank_swing.yaml"}
-                    cfg_path = cfg_map.get(svc)
-                    if cfg_path and Path(cfg_path).exists() and tbank_balance == 0:
-                        with open(cfg_path) as f:
-                            tcfg = yaml.safe_load(f)
-                        tc = TBankClient(tcfg)
-                        tbank_balance = tc.get_balance()
-                except Exception:
-                    pass
+            if not is_archive and "TBANK" in inst_name.upper() and tbank_balance == 0:
+                tbank_balance = self._get_tbank_balance_cached()
 
         data = {
             "balance": balance,
@@ -636,14 +959,10 @@ class Dashboard:
 
         # Enrich positions with live unrealised PnL (calculated per-instance)
         if not is_archive and positions:
-            # Bybit positions
+            # Bybit positions (cached 5s)
             if self._get_client():
                 try:
-                    exchange = self.config.get("exchange", "bybit")
-                    if exchange == "tbank":
-                        raw = self._get_client().get_positions()
-                    else:
-                        raw = self._get_client().get_positions(category="linear")
+                    raw = self._get_bybit_positions_cached()
                     live_mark = {p["symbol"]: p.get("mark_price", 0) for p in raw}
                     live_leverage = {p["symbol"]: p.get("leverage", "?") for p in raw}
                     for pos in positions:
@@ -674,20 +993,10 @@ class Dashboard:
                                    or "MIDAS" in (p.get("instance") or "").upper())]
             if tbank_positions:
                 try:
-                    from src.exchange.tbank_client import TBankClient
-                    import yaml as _yaml
-                    # Use first available tbank config for client
-                    for cfg_path in ("config/tbank_scalp.yaml", "config/midas.yaml"):
-                        if Path(cfg_path).exists():
-                            with open(cfg_path) as f:
-                                tcfg = _yaml.safe_load(f)
-                            tc = TBankClient(tcfg)
-                            break
-                    else:
-                        tc = None
+                    tc = self._get_tbank_client()
                     if tc:
-                        # Get live positions from TBank (has mark_price + unrealised_pnl)
-                        tbank_raw = tc.get_positions()
+                        # Get live positions from TBank (cached 5s)
+                        tbank_raw = self._get_tbank_positions_cached()
                         tbank_mark = {p["symbol"]: p for p in tbank_raw}
                         for pos in tbank_positions:
                             pos["leverage"] = "1"
@@ -1154,17 +1463,16 @@ class Dashboard:
             logger.exception("set-leverage error")
             return web.json_response({"ok": False, "error": str(e)}, status=500)
 
-    async def _get_total_trade_count(self) -> int:
-        """Count total closed trades across all instances for change detection."""
-        total = 0
+    async def _get_last_trade_id(self) -> int:
+        """Get max trade id across all instances for fast change detection."""
+        max_id = 0
+        _sql = "SELECT MAX(id) FROM trades"
         try:
             async with aiosqlite.connect(str(self.db.db_path)) as db:
-                cur = await db.execute(
-                    "SELECT COUNT(*) FROM trades WHERE status = 'closed'"
-                )
+                cur = await db.execute(_sql)
                 row = await cur.fetchone()
-                if row:
-                    total += row[0]
+                if row and row[0]:
+                    max_id = max(max_id, row[0])
         except Exception:
             pass
         for inst in _other_instances(self.config):
@@ -1172,61 +1480,119 @@ class Dashboard:
             if db_path and Path(db_path).exists():
                 try:
                     async with aiosqlite.connect(db_path) as db:
-                        cur = await db.execute(
-                            "SELECT COUNT(*) FROM trades WHERE status = 'closed'"
-                        )
+                        cur = await db.execute(_sql)
                         row = await cur.fetchone()
-                        if row:
-                            total += row[0]
+                        if row and row[0]:
+                            max_id = max(max_id, row[0])
                 except Exception:
                     pass
-        return total
+        return max_id
+
+    async def _get_open_count(self) -> int:
+        """Fast open trade count across all instances."""
+        cnt = 0
+        _sql = "SELECT COUNT(*) FROM trades WHERE status='open'"
+        try:
+            async with aiosqlite.connect(str(self.db.db_path)) as db:
+                cur = await db.execute(_sql)
+                row = await cur.fetchone()
+                if row:
+                    cnt += row[0]
+        except Exception:
+            pass
+        for inst in _other_instances(self.config):
+            db_path = inst.get("db_path", "")
+            if db_path and Path(db_path).exists():
+                try:
+                    async with aiosqlite.connect(db_path) as db:
+                        cur = await db.execute(_sql)
+                        row = await cur.fetchone()
+                        if row:
+                            cnt += row[0]
+                except Exception:
+                    pass
+        return cnt
+
+    async def _api_night_settings_get(self, request: web.Request) -> web.Response:
+        """Return night mode settings from server file."""
+        try:
+            if self._night_settings_path.exists():
+                data = json.loads(self._night_settings_path.read_text())
+            else:
+                data = {"enabled": False, "target": 0}
+        except Exception:
+            data = {"enabled": False, "target": 0}
+        return web.json_response(data)
+
+    async def _api_night_settings_post(self, request: web.Request) -> web.Response:
+        """Save night mode settings to server file."""
+        try:
+            body = await request.json()
+            data = {
+                "enabled": bool(body.get("enabled", False)),
+                "target": int(body.get("target", 0)),
+            }
+            self._night_settings_path.parent.mkdir(parents=True, exist_ok=True)
+            self._night_settings_path.write_text(json.dumps(data))
+            return web.json_response({"ok": True})
+        except Exception as e:
+            return web.json_response({"error": str(e)}, status=400)
 
     async def _api_events(self, request: web.Request) -> web.StreamResponse:
-        """SSE endpoint — pushes 'trade_closed' when new trades appear."""
+        """SSE endpoint — pushes events when trades open or close."""
         resp = web.StreamResponse()
         resp.content_type = "text/event-stream"
         resp.headers["Cache-Control"] = "no-cache"
         resp.headers["X-Accel-Buffering"] = "no"
         await resp.prepare(request)
 
-        # Init baseline
-        last_count = await self._get_total_trade_count()
-        self._last_trade_count = last_count
+        last_id = await self._get_last_trade_id()
+        last_open = await self._get_open_count()
 
         try:
             while True:
                 await asyncio.sleep(3)
-                current = await self._get_total_trade_count()
-                if current != last_count:
-                    last_count = current
-                    self._last_trade_count = current
-                    await resp.write(b"event: trade_closed\ndata: {}\n\n")
+                cur_id = await self._get_last_trade_id()
+                cur_open = await self._get_open_count()
+                if cur_id != last_id:
+                    # New trade appeared or status changed
+                    if cur_open < last_open:
+                        await resp.write(b"event: trade_closed\ndata: {}\n\n")
+                    else:
+                        await resp.write(b"event: trade_opened\ndata: {}\n\n")
+                    last_id = cur_id
+                    last_open = cur_open
+                elif cur_open != last_open:
+                    if cur_open < last_open:
+                        await resp.write(b"event: trade_closed\ndata: {}\n\n")
+                    else:
+                        await resp.write(b"event: trade_opened\ndata: {}\n\n")
+                    last_open = cur_open
         except (asyncio.CancelledError, ConnectionResetError):
             pass
         return resp
 
     async def _api_pair_pnl(self, request: web.Request) -> web.Response:
         """Per-pair PnL across all instances."""
-        import sqlite3 as _sql
         pairs: dict[str, dict] = {}
-        main_db = self.cfg.get("database", "data/trades.db")
-        other = self.cfg.get("other_instances", [])
-        all_dbs = [{"db": main_db, "name": self.cfg.get("instance_name", "MAIN")}] + other
+        db_cfg = self.config.get("database", {})
+        main_db = db_cfg.get("path", "data/trades.db") if isinstance(db_cfg, dict) else str(db_cfg)
+        other = _other_instances(self.config)
+        all_dbs = [{"db_path": main_db, "name": self.config.get("instance_name", "MAIN")}] + other
         for inst in all_dbs:
-            db_path = inst.get("db", "")
+            db_path = inst.get("db_path", "")
             inst_name = inst.get("name", "")
             if not db_path or not Path(db_path).exists():
                 continue
             is_tbank = "TBANK" in inst_name.upper() or "MIDAS" in inst_name.upper()
             cur = "RUB" if is_tbank else "USDT"
             try:
-                conn = _sql.connect(db_path)
-                rows = conn.execute(
-                    "SELECT symbol, COUNT(*) as cnt, COALESCE(SUM(pnl),0) as total "
-                    "FROM trades WHERE status='closed' GROUP BY symbol"
-                ).fetchall()
-                conn.close()
+                async with aiosqlite.connect(db_path) as db:
+                    async_cur = await db.execute(
+                        "SELECT symbol, COUNT(*) as cnt, COALESCE(SUM(pnl),0) as total "
+                        "FROM trades WHERE status='closed' GROUP BY symbol"
+                    )
+                    rows = await async_cur.fetchall()
                 for symbol, cnt, total in rows:
                     key = f"{symbol}_{cur}"
                     if key not in pairs:
@@ -1883,6 +2249,17 @@ body.archive-mode .header{background:var(--bg2);border-bottom-color:rgba(255,152
   .chart-grid{grid-template-columns:1fr}
   .chart-fullscreen-content{width:100vw;padding:16px;border-radius:12px}
 }
+.night-mode-wrap{display:flex;align-items:center;gap:8px}
+.night-label{font-size:11px;color:var(--neon-yellow);font-weight:700;letter-spacing:1px;text-shadow:0 0 6px var(--neon-yellow)}
+.night-input{width:52px;padding:4px 6px;background:rgba(251,191,36,0.08);border:1px solid rgba(251,191,36,0.3);border-radius:6px;color:var(--neon-yellow);font-family:'Share Tech Mono',monospace;font-size:13px;text-align:center;outline:none;transition:border-color .2s,box-shadow .2s}
+.night-input:focus{border-color:var(--neon-yellow);box-shadow:0 0 8px rgba(251,191,36,0.3)}
+.night-input::placeholder{color:rgba(251,191,36,0.3);font-size:11px}
+.night-switch{position:relative;display:inline-block;width:36px;height:20px;flex-shrink:0}
+.night-switch input{opacity:0;width:0;height:0}
+.night-slider{position:absolute;cursor:pointer;top:0;left:0;right:0;bottom:0;background:rgba(255,255,255,0.08);border:1px solid rgba(255,255,255,0.15);border-radius:20px;transition:.3s}
+.night-slider:before{content:'';position:absolute;height:14px;width:14px;left:2px;bottom:2px;background:#555;border-radius:50%;transition:.3s}
+.night-switch input:checked+.night-slider{background:rgba(251,191,36,0.2);border-color:var(--neon-yellow);box-shadow:0 0 10px rgba(251,191,36,0.4)}
+.night-switch input:checked+.night-slider:before{transform:translateX(16px);background:var(--neon-yellow);box-shadow:0 0 6px var(--neon-yellow)}
 </style>
 </head><body>
 
@@ -1922,6 +2299,11 @@ body.archive-mode .header{background:var(--bg2);border-bottom-color:rgba(255,152
     </div>
   </div>
   <div class="header-right">
+    <div class="night-mode-wrap" id="night-mode-wrap">
+      <span class="night-label">NIGHT</span>
+      <input type="text" class="night-input" id="night-target" maxlength="4" inputmode="numeric" placeholder="PnL">
+      <label class="night-switch"><input type="checkbox" id="night-toggle"><span class="night-slider"></span></label>
+    </div>
     <div class="source-toggle" id="source-toggle">
       <button class="active" onclick="setSource('live')" data-source="live">Live</button>
       <button onclick="setSource('archive')" data-source="archive">Архив</button>
@@ -1989,7 +2371,7 @@ body.archive-mode .header{background:var(--bg2);border-bottom-color:rgba(255,152
     <div class="tbl-wrap">
       <table>
         <thead><tr>
-          <th>Bot</th><th>Pair</th><th>Side</th><th>Size</th><th>Entry</th><th>Exit</th><th>PS</th><th>Gross PnL</th><th>Net PnL</th><th>Time</th><th>Status</th>
+          <th>Bot</th><th>Pair</th><th>Side</th><th>Size</th><th>Entry</th><th>Exit</th><th>PS</th><th>Gross PnL</th><th>Net PnL</th><th>Time</th><th>Dur</th><th>Status</th>
         </tr></thead>
         <tbody id="tbody"></tbody>
       </table>
@@ -2066,6 +2448,34 @@ body.archive-mode .header{background:var(--bg2);border-bottom-color:rgba(255,152
 let currentPage=1,hasNext=false,currentTF='1m',currentSource='live';
 let archiveDate=null; // null = today (live)
 let archiveRange='day'; // 'day' | 'week'
+let _nightEnabled=false,_nightTarget=0;
+let _nightSaveTimer=null;
+function _nightSave(){
+  clearTimeout(_nightSaveTimer);
+  _nightSaveTimer=setTimeout(()=>{
+    fetch('/api/night-settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:_nightEnabled,target:_nightTarget})});
+  },300);
+}
+(function(){
+  document.addEventListener('DOMContentLoaded',()=>{
+    const inp=document.getElementById('night-target');
+    const tog=document.getElementById('night-toggle');
+    fetch('/api/night-settings').then(r=>r.json()).then(d=>{
+      _nightEnabled=!!d.enabled;_nightTarget=d.target||0;
+      tog.checked=_nightEnabled;
+      if(_nightTarget)inp.value=_nightTarget;
+    }).catch(()=>{});
+    inp.addEventListener('input',()=>{
+      inp.value=inp.value.replace(/[^0-9]/g,'').slice(0,4);
+      _nightTarget=parseInt(inp.value)||0;
+      _nightSave();
+    });
+    tog.addEventListener('change',()=>{
+      _nightEnabled=tog.checked;
+      _nightSave();
+    });
+  });
+})();
 
 function fmt(v){return(v>=0?'+':'')+v.toFixed(2)}
 function cls(v){return v>=0?'g':'r'}
@@ -2167,12 +2577,14 @@ function setSource(src){
   const dateNav=document.getElementById('date-nav');
   const instances=document.getElementById('instances');
   const bulkActs=document.getElementById('bulk-actions');
+  const nightWrap=document.getElementById('night-mode-wrap');
   if(src==='archive'){
     banner.style.display='';
     badge.style.display='none';
     dateNav.style.display='';
     instances.style.display='none';
     bulkActs.style.display='none';
+    nightWrap.style.display='none';
     document.body.classList.add('archive-mode');
   }else{
     banner.style.display='none';
@@ -2180,6 +2592,7 @@ function setSource(src){
     dateNav.style.display='';
     instances.style.display='';
     bulkActs.style.display='';
+    nightWrap.style.display='flex';
     document.body.classList.remove('archive-mode');
   }
   loadAll();
@@ -2793,6 +3206,7 @@ async function setTP(symbol,side,entryPrice,qty,instance,btn){
 }
 
 let _posCache=[];
+// _nightCheck removed — night mode runs server-side
 function _renderPosRow(p){
       const grossPnl=parseFloat(p.unrealised_pnl)||0;
       const inst=(p.instance||'').toUpperCase();
@@ -2835,6 +3249,7 @@ async function loadPositions(){
     wrap.style.display=currentSource==='live'?'':'none';
     _posCache=pos;
     body.innerHTML=pos.map(p=>_renderPosRow(p)).join('');
+    // night mode runs server-side
   }catch(e){console.error('positions',e)}
 }
 async function updatePnlOnly(){
@@ -2864,6 +3279,7 @@ async function updatePnlOnly(){
       if(netTd){netTd.className=cls(pnl);netTd.innerHTML='<strong>'+fmt(pnl)+'</strong>'}
     }
     _posCache=pos;
+    // night mode runs server-side
   }catch(e){console.error('pnl-update',e)}
 }
 
@@ -2883,7 +3299,7 @@ async function loadTrades(page){
       const iLabel=inst.includes('TBANK-SCALP')?'TB-SCALP':inst.includes('TBANK-SWING')?'TB-SWING':inst.includes('DEGEN')?'DEGEN':inst.includes('SCALP')?'SCALP':inst.includes('MIDAS')?'MIDAS':inst.includes('TURTLE-TB')?'TURTLE-TB':inst.includes('TURTLE')?'TURTLE':inst.includes('FIBA')?'FIBA':inst.includes('BUBA')?'BUBA':inst;
       const tTime=t.closed_at||t.opened_at||'';
       let tFmt='—';
-      if(tTime){const utcD=new Date(tTime.replace(' ','T')+'Z');const mskD=new Date(utcD.getTime()+3*3600000);tFmt=String(mskD.getMonth()+1).padStart(2,'0')+'/'+String(mskD.getDate()).padStart(2,'0')+' '+String(mskD.getHours()).padStart(2,'0')+':'+String(mskD.getMinutes()).padStart(2,'0')}
+      if(tTime){const utcD=new Date(tTime.replace(' ','T')+'Z');const mskD=new Date(utcD.getTime()+3*3600000);tFmt=String(mskD.getDate()).padStart(2,'0')+'.'+String(mskD.getMonth()+1).padStart(2,'0')+' '+String(mskD.getHours()).padStart(2,'0')+':'+String(mskD.getMinutes()).padStart(2,'0')}
       const tpc=t.partial_closed||0;
       const tSoBadge=tpc>0?` <span class="so-badge">${tpc}/3</span>`:'';
       const feeRate=inst.includes('TBANK')?0.0004:0.00055;
@@ -2893,6 +3309,14 @@ async function loadTrades(page){
       const qty=t.qty||0;
       const ps=entryAmt;
       const psFmt=ps>=1000?(ps/1000).toFixed(1)+'k':ps.toFixed(0);
+      let dur='—';
+      if(t.opened_at&&t.closed_at){
+        const ms=new Date(t.closed_at.replace(' ','T')+'Z')-new Date(t.opened_at.replace(' ','T')+'Z');
+        if(ms>0){const s=Math.floor(ms/1000),m=Math.floor(s/60),h=Math.floor(m/60),d=Math.floor(h/24);dur=d>0?d+'d '+h%24+'h':h>0?h+'h '+m%60+'m':m>0?m+'m':s+'s'}
+      }else if(t.opened_at&&t.status==='open'){
+        const ms=Date.now()-new Date(t.opened_at.replace(' ','T')+'Z');
+        if(ms>0){const s=Math.floor(ms/1000),m=Math.floor(s/60),h=Math.floor(m/60),d=Math.floor(h/24);dur=d>0?d+'d '+h%24+'h':h>0?h+'h '+m%60+'m':m>0?m+'m':s+'s'}
+      }
       return`<tr class="fade-in">
         <td><span class="inst-tag ${isCls}">${iLabel}</span></td>
         <td style="color:var(--muted)">${t.symbol}${tSoBadge}</td>
@@ -2903,6 +3327,7 @@ async function loadTrades(page){
         <td class="${cls(p)}" style="opacity:0.45">${p?p.toFixed(2):'-'}</td>
         <td class="${cls(netPnl)}"><strong>${p?netPnl.toFixed(2):'-'}</strong></td>
         <td style="color:var(--muted);font-size:12px">${tFmt}</td>
+        <td style="color:var(--muted);font-size:11px;white-space:nowrap">${dur}</td>
         <td class="${t.status==='closed'?'status-closed':'status-open'}">${t.status==='closed'?'Closed':'Open'}</td></tr>`;
     }).join('');
   }catch(e){console.error('trades',e)}
@@ -2911,10 +3336,9 @@ async function loadTrades(page){
 function changePage(d){loadTrades(currentPage+d)}
 
 async function loadAll(){
-  await loadInstances();
-  await Promise.all([loadStats(),loadChart(),loadPositions(),loadTrades(currentPage),loadPairPnl()]);
+  await Promise.all([loadInstances(),loadStats(),loadChart(),loadPositions(),loadTrades(currentPage),loadPairPnl()]);
   document.getElementById('last-update').textContent=
-    'Обновлено: '+new Date().toLocaleTimeString('ru-RU')+' (автообновление каждые 10 сек)';
+    'Обновлено: '+new Date().toLocaleTimeString('ru-RU');
 }
 function updateMarketBar(){
   const now=new Date();
@@ -2949,19 +3373,24 @@ function updateMarketBar(){
     else{moexSt.textContent='Закрыта';moexHr.textContent='откроется в 10:00'}
   }
 }
-updateMarketBar();setInterval(updateMarketBar,1000);
+updateMarketBar();setInterval(updateMarketBar,10000);
 
 loadAll();
-setInterval(updatePnlOnly,2000);
-setInterval(async()=>{if(slEditing)return;await loadInstances();loadStats();loadChart();loadPositions();loadTrades(currentPage);loadPairPnl()},10000);
+setInterval(updatePnlOnly,5000);
+setInterval(()=>{if(slEditing)return;loadAll()},15000);
 
 // SSE: instant trade updates
+let _sseThrottle=0;
+function _sseRefresh(full){
+  const now=Date.now();
+  if(now-_sseThrottle<2000)return;
+  _sseThrottle=now;
+  if(full){loadAll()}else{loadPositions();loadStats()}
+}
 function connectSSE(){
   const es=new EventSource('/api/events');
-  es.addEventListener('trade_closed',()=>{
-    console.log('SSE: trade closed, refreshing');
-    loadTrades(1);loadPositions();loadInstances();loadStats();loadChart();
-  });
+  es.addEventListener('trade_closed',()=>{console.log('SSE: trade closed');_sseRefresh(true)});
+  es.addEventListener('trade_opened',()=>{console.log('SSE: trade opened');_sseRefresh(false)});
   es.onerror=()=>{es.close();setTimeout(connectSSE,5000)};
 }
 connectSSE();
