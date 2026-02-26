@@ -7,6 +7,7 @@ import sqlite3
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional
 
 import yaml
 from telegram import (
@@ -29,20 +30,20 @@ logger = logging.getLogger(__name__)
 
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     [
-        [KeyboardButton("📊 Статус"), KeyboardButton("💰 PnL")],
-        [KeyboardButton("📈 Позиции"), KeyboardButton("❓ Помощь")],
+        [KeyboardButton("📊 Статус"), KeyboardButton("📈 Позиции")],
         [KeyboardButton("▶️ Старт"), KeyboardButton("🛑 Стоп")],
     ],
     resize_keyboard=True,
 )
 
-# Instance definitions: name, db_path, service, currency
+# Instance definitions: name, db_path, service, currency, config_path, exchange_type
 INSTANCES = [
-    {"name": "FIBA", "db": "/root/stasik/data/fiba.db", "service": "stasik-fiba", "currency": "USDT"},
-    {"name": "TBANK-SCALP", "db": "/root/stasik/data/tbank_scalp.db", "service": "stasik-tbank-scalp", "currency": "RUB"},
-    {"name": "TBANK-SWING", "db": "/root/stasik/data/tbank_swing.db", "service": "stasik-tbank-swing", "currency": "RUB"},
-    {"name": "MIDAS", "db": "/root/stasik/data/midas.db", "service": "stasik-midas", "currency": "RUB"},
-    {"name": "FIN", "db": None, "service": "stasik-fin", "currency": None},
+    {"name": "FIBA", "db": "/root/stasik/data/fiba.db", "service": "stasik-fiba", "currency": "USDT", "config": "/root/stasik/config/fiba.yaml", "exchange": "bybit"},
+    {"name": "BUBA", "db": "/root/stasik/data/buba.db", "service": "stasik-buba", "currency": "USDT", "config": "/root/stasik/config/buba.yaml", "exchange": "bybit"},
+    {"name": "TBANK-SCALP", "db": "/root/stasik/data/tbank_scalp.db", "service": "stasik-tbank-scalp", "currency": "RUB", "config": "/root/stasik/config/tbank_scalp.yaml", "exchange": "tbank"},
+    {"name": "TBANK-SWING", "db": "/root/stasik/data/tbank_swing.db", "service": "stasik-tbank-swing", "currency": "RUB", "config": "/root/stasik/config/tbank_swing.yaml", "exchange": "tbank"},
+    {"name": "MIDAS", "db": "/root/stasik/data/midas.db", "service": "stasik-midas", "currency": "RUB", "config": "/root/stasik/config/midas.yaml", "exchange": "tbank"},
+    {"name": "FIN", "db": None, "service": "stasik-fin", "currency": None, "config": None, "exchange": None},
 ]
 
 
@@ -91,53 +92,6 @@ def _get_status() -> str:
     return "\n".join(lines)
 
 
-def _get_pnl() -> str:
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    lines = ["💰 PnL\n"]
-
-    total_usdt = 0.0
-    total_rub = 0.0
-    today_usdt = 0.0
-    today_rub = 0.0
-
-    for inst in INSTANCES:
-        if not inst["db"] or not Path(inst["db"]).exists():
-            continue
-
-        # All-time
-        rows = _query_db(inst["db"], "SELECT COUNT(*) as cnt, COALESCE(SUM(pnl),0) as total FROM trades WHERE status='closed'")
-        cnt = rows[0]["cnt"] if rows else 0
-        total_pnl = rows[0]["total"] if rows else 0
-
-        # Today
-        rows_today = _query_db(inst["db"], "SELECT COUNT(*) as cnt, COALESCE(SUM(pnl),0) as total FROM trades WHERE status='closed' AND closed_at LIKE ?", (today + "%",))
-        today_cnt = rows_today[0]["cnt"] if rows_today else 0
-        today_pnl = rows_today[0]["total"] if rows_today else 0
-
-        cur = inst["currency"]
-        sign = "+" if total_pnl >= 0 else ""
-        today_sign = "+" if today_pnl >= 0 else ""
-
-        lines.append(f"📌 {inst['name']}: {sign}{total_pnl:,.2f} {cur} ({cnt} trades)")
-        if today_cnt > 0:
-            lines.append(f"   Today: {today_sign}{today_pnl:,.2f} {cur} ({today_cnt})")
-
-        if cur == "USDT":
-            total_usdt += total_pnl
-            today_usdt += today_pnl
-        else:
-            total_rub += total_pnl
-            today_rub += today_pnl
-
-    lines.append("")
-    if total_usdt != 0 or today_usdt != 0:
-        lines.append(f"Σ USDT: {'+' if total_usdt >= 0 else ''}{total_usdt:,.2f} (today: {'+' if today_usdt >= 0 else ''}{today_usdt:,.2f})")
-    if total_rub != 0 or today_rub != 0:
-        lines.append(f"Σ RUB: {'+' if total_rub >= 0 else ''}{total_rub:,.2f} (today: {'+' if today_rub >= 0 else ''}{today_rub:,.2f})")
-
-    return "\n".join(lines)
-
-
 def _get_positions() -> tuple[str, list[dict]]:
     all_positions = []
     for inst in INSTANCES:
@@ -145,11 +99,12 @@ def _get_positions() -> tuple[str, list[dict]]:
             continue
         rows = _query_db(
             inst["db"],
-            "SELECT symbol, side, entry_price, qty, pnl, opened_at FROM trades WHERE status='open'",
+            "SELECT id, symbol, side, entry_price, qty, pnl, opened_at FROM trades WHERE status='open'",
         )
         for r in rows:
             r["instance"] = inst["name"]
             r["currency"] = inst["currency"]
+            r["exchange"] = inst["exchange"]
             all_positions.append(r)
 
     if not all_positions:
@@ -163,6 +118,86 @@ def _get_positions() -> tuple[str, list[dict]]:
         lines.append(f"[{p['instance']}] {p['symbol']} {d} @ {p['entry_price']} | {sign}{pnl:,.2f} {p['currency']}")
 
     return "\n".join(lines), all_positions
+
+
+def _close_bybit_position(config_path: str, symbol: str) -> str:
+    """Close a Bybit position via API."""
+    try:
+        from pybit.unified_trading import HTTP
+
+        with open(config_path) as f:
+            cfg = yaml.safe_load(f)
+
+        bybit_cfg = cfg["bybit"]
+        http_kwargs = {
+            "api_key": bybit_cfg["api_key"],
+            "api_secret": bybit_cfg["api_secret"],
+        }
+        if bybit_cfg.get("demo"):
+            http_kwargs["demo"] = True
+        else:
+            http_kwargs["testnet"] = bybit_cfg.get("testnet", False)
+
+        session = HTTP(**http_kwargs)
+        resp = session.get_positions(category="linear", symbol=symbol)
+        for p in resp["result"]["list"]:
+            size = float(p["size"])
+            if size > 0:
+                close_side = "Sell" if p["side"] == "Buy" else "Buy"
+                session.place_order(
+                    category="linear",
+                    symbol=symbol,
+                    side=close_side,
+                    orderType="Market",
+                    qty=str(size),
+                    reduceOnly=True,
+                )
+                return f"✅ {symbol} закрыт (market {close_side} {size})"
+        return f"⚠️ {symbol} — позиция не найдена на бирже"
+    except Exception as e:
+        return f"❌ Ошибка закрытия {symbol}: {e}"
+
+
+def _close_tbank_position(config_path: str, symbol: str) -> str:
+    """Close a TBank position via API."""
+    try:
+        from src.exchange.tbank_client import TBankClient
+
+        with open(config_path) as f:
+            cfg = yaml.safe_load(f)
+
+        client = TBankClient(cfg)
+        positions = client.get_positions(symbol=symbol)
+        for p in positions:
+            if p["symbol"] == symbol and p["size"] > 0:
+                close_side = "Sell" if p["side"] == "Buy" else "Buy"
+                client.place_order(symbol=symbol, side=close_side, qty=p["size"])
+                return f"✅ {symbol} закрыт (market {close_side} {p['size']})"
+        return f"⚠️ {symbol} — позиция не найдена на бирже"
+    except Exception as e:
+        err_str = str(e)
+        if "30079" in err_str or "not available for trading" in err_str.lower():
+            return f"⏸ Биржа MOEX закрыта — {symbol} нельзя закрыть сейчас"
+        return f"❌ Ошибка закрытия {symbol}: {e}"
+
+
+def _update_db_closed(db_path: str, trade_id: int):
+    """Mark trade as closed in DB."""
+    try:
+        conn = sqlite3.connect(db_path)
+        now = datetime.now(timezone.utc).isoformat()
+        conn.execute("UPDATE trades SET status='closed', closed_at=? WHERE id=?", (now, trade_id))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.warning("DB update failed for trade %s: %s", trade_id, e)
+
+
+def _find_instance(name: str) -> Optional[dict]:
+    for inst in INSTANCES:
+        if inst["name"] == name:
+            return inst
+    return None
 
 
 class StandaloneTelegramBot:
@@ -195,10 +230,7 @@ class StandaloneTelegramBot:
     def _register_handlers(self):
         self.app.add_handler(CommandHandler("start", self._cmd_start))
         self.app.add_handler(CommandHandler("status", self._cmd_status))
-        self.app.add_handler(CommandHandler("pnl", self._cmd_pnl))
         self.app.add_handler(CommandHandler("positions", self._cmd_positions))
-        self.app.add_handler(CommandHandler("stop", self._cmd_stop))
-        self.app.add_handler(CommandHandler("help", self._cmd_help))
         self.app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self._handle_button))
         self.app.add_handler(CallbackQueryHandler(self._callback_handler))
         self.app.add_error_handler(self._error_handler)
@@ -218,11 +250,9 @@ class StandaloneTelegramBot:
         text = update.message.text.strip()
         handlers = {
             "📊 Статус": self._cmd_status,
-            "💰 PnL": self._cmd_pnl,
             "📈 Позиции": self._cmd_positions,
             "▶️ Старт": self._cmd_run,
             "🛑 Стоп": self._cmd_stop,
-            "❓ Помощь": self._cmd_help,
         }
         handler = handlers.get(text)
         if handler:
@@ -235,11 +265,10 @@ class StandaloneTelegramBot:
             return
         await update.message.reply_text(
             "🤖 Stasik Trading Bot\n\n"
-            "/status — Статус сервисов\n"
-            "/pnl — Прибыль и убытки\n"
-            "/positions — Открытые позиции\n"
-            "/stop — Остановить сервис\n"
-            "/help — Помощь",
+            "📊 Статус — состояние ботов\n"
+            "📈 Позиции — открытые сделки + закрытие\n"
+            "▶️ Старт — запустить бота\n"
+            "🛑 Стоп — остановить бота",
             reply_markup=MAIN_KEYBOARD,
         )
 
@@ -248,23 +277,34 @@ class StandaloneTelegramBot:
             return
         await update.message.reply_text(_get_status(), reply_markup=MAIN_KEYBOARD)
 
-    async def _cmd_pnl(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-        if not self._check_auth(update):
-            return
-        await update.message.reply_text(_get_pnl(), reply_markup=MAIN_KEYBOARD)
-
     async def _cmd_positions(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not self._check_auth(update):
             return
         text, positions = _get_positions()
-        await update.message.reply_text(text, reply_markup=MAIN_KEYBOARD)
+
+        if positions:
+            buttons = []
+            for p in positions:
+                d = "L" if p["side"] == "Buy" else "S"
+                pnl = p.get("pnl") or 0
+                sign = "+" if pnl >= 0 else ""
+                label = f"❌ {p['instance']} {p['symbol']} {d} ({sign}{pnl:.2f})"
+                cb_data = f"close_{p['instance']}_{p['id']}_{p['symbol']}"
+                buttons.append([InlineKeyboardButton(label, callback_data=cb_data)])
+            buttons.append([InlineKeyboardButton("❌ Закрыть ВСЕ", callback_data="close_all")])
+            buttons.append([InlineKeyboardButton("Отмена", callback_data="cancel")])
+            await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+        else:
+            await update.message.reply_text(text, reply_markup=MAIN_KEYBOARD)
 
     async def _cmd_stop(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not self._check_auth(update):
             return
         buttons = []
         for inst in INSTANCES:
-            buttons.append([InlineKeyboardButton(f"🛑 {inst['name']}", callback_data=f"stop_{inst['service']}")])
+            active = _is_service_active(inst["service"])
+            icon = "🟢" if active else "🔴"
+            buttons.append([InlineKeyboardButton(f"🛑 {icon} {inst['name']}", callback_data=f"stop_{inst['service']}")])
         buttons.append([InlineKeyboardButton("🛑 Всё", callback_data="stop_all")])
         buttons.append([InlineKeyboardButton("Отмена", callback_data="cancel")])
         await update.message.reply_text("Что остановить?", reply_markup=InlineKeyboardMarkup(buttons))
@@ -274,24 +314,12 @@ class StandaloneTelegramBot:
             return
         buttons = []
         for inst in INSTANCES:
-            buttons.append([InlineKeyboardButton(f"▶️ {inst['name']}", callback_data=f"start_{inst['service']}")])
+            active = _is_service_active(inst["service"])
+            icon = "🟢" if active else "🔴"
+            buttons.append([InlineKeyboardButton(f"▶️ {icon} {inst['name']}", callback_data=f"start_{inst['service']}")])
         buttons.append([InlineKeyboardButton("▶️ Всё", callback_data="start_all")])
         buttons.append([InlineKeyboardButton("Отмена", callback_data="cancel")])
         await update.message.reply_text("Что запустить?", reply_markup=InlineKeyboardMarkup(buttons))
-
-    async def _cmd_help(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-        if not self._check_auth(update):
-            return
-        await update.message.reply_text(
-            "🤖 Stasik Trading Bot\n\n"
-            "📊 Статус — состояние сервисов\n"
-            "💰 PnL — прибыль/убытки\n"
-            "📈 Позиции — открытые сделки\n"
-            "▶️ Старт — запустить сервис\n"
-            "🛑 Стоп — остановить сервис\n"
-            "❓ Помощь — эта справка",
-            reply_markup=MAIN_KEYBOARD,
-        )
 
     # ── Inline callbacks ──
 
@@ -303,6 +331,7 @@ class StandaloneTelegramBot:
         await query.answer()
         data = query.data
 
+        # ── Stop service ──
         if data.startswith("stop_stasik-"):
             service = data[len("stop_"):]
             name = service.replace("stasik-", "").upper()
@@ -316,11 +345,12 @@ class StandaloneTelegramBot:
                 results.append(f"{'🛑' if ok else '❌'} {inst['name']} {'остановлен' if ok else 'ошибка'}")
             await query.edit_message_text("\n".join(results))
 
+        # ── Start service ──
         elif data.startswith("start_stasik-"):
             service = data[len("start_"):]
             name = service.replace("stasik-", "").upper()
             if _is_service_active(service):
-                await query.edit_message_text(f"{name} уже работает")
+                await query.edit_message_text(f"🟢 {name} уже работает")
             else:
                 ok = _systemctl("start", service)
                 await query.edit_message_text(f"{'▶️' if ok else '❌'} {name} {'запущен' if ok else 'ошибка'}")
@@ -329,10 +359,65 @@ class StandaloneTelegramBot:
             results = []
             for inst in INSTANCES:
                 if _is_service_active(inst["service"]):
-                    results.append(f"{inst['name']} уже работает")
+                    results.append(f"🟢 {inst['name']} уже работает")
                 else:
                     ok = _systemctl("start", inst["service"])
                     results.append(f"{'▶️' if ok else '❌'} {inst['name']} {'запущен' if ok else 'ошибка'}")
+            await query.edit_message_text("\n".join(results))
+
+        # ── Close single position ──
+        elif data.startswith("close_") and data != "close_all":
+            # Format: close_{INSTANCE}_{TRADE_ID}_{SYMBOL}
+            parts = data.split("_", 3)
+            if len(parts) >= 4:
+                inst_name = parts[1]
+                trade_id = int(parts[2])
+                symbol = parts[3]
+
+                await query.edit_message_text(f"⏳ Закрываю {symbol}...")
+
+                inst = _find_instance(inst_name)
+                if not inst or not inst["config"]:
+                    await query.edit_message_text(f"❌ Инстанс {inst_name} не найден")
+                    return
+
+                loop = asyncio.get_event_loop()
+                if inst["exchange"] == "bybit":
+                    result = await loop.run_in_executor(None, _close_bybit_position, inst["config"], symbol)
+                else:
+                    result = await loop.run_in_executor(None, _close_tbank_position, inst["config"], symbol)
+
+                if result.startswith("✅"):
+                    _update_db_closed(inst["db"], trade_id)
+
+                await query.edit_message_text(result)
+
+        # ── Close all positions ──
+        elif data == "close_all":
+            _, positions = _get_positions()
+            if not positions:
+                await query.edit_message_text("Нет открытых позиций.")
+                return
+
+            await query.edit_message_text(f"⏳ Закрываю {len(positions)} позиций...")
+
+            results = []
+            loop = asyncio.get_event_loop()
+            for p in positions:
+                inst = _find_instance(p["instance"])
+                if not inst or not inst["config"]:
+                    results.append(f"❌ {p['symbol']} — инстанс не найден")
+                    continue
+
+                if inst["exchange"] == "bybit":
+                    result = await loop.run_in_executor(None, _close_bybit_position, inst["config"], p["symbol"])
+                else:
+                    result = await loop.run_in_executor(None, _close_tbank_position, inst["config"], p["symbol"])
+
+                if result.startswith("✅"):
+                    _update_db_closed(inst["db"], p["id"])
+                results.append(result)
+
             await query.edit_message_text("\n".join(results))
 
         elif data == "cancel":
@@ -360,7 +445,6 @@ async def main():
         token = cfg["telegram"]["token"]
         chat_id = cfg["telegram"]["chat_id"]
     else:
-        # Fallback: read from smc.yaml
         fallback = Path(__file__).resolve().parent.parent / "config" / "smc.yaml"
         with open(fallback) as f:
             cfg = yaml.safe_load(f)

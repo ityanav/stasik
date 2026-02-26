@@ -236,10 +236,14 @@ class Accountant:
         self.loss_review_sl_pct: float = acct.get("loss_review_sl_pct", 0)
         self.min_confidence: int = acct.get("min_confidence", 6)
         self.loss_min_confidence: int = acct.get("loss_min_confidence", 9)
+        self.breakeven_pct: float = acct.get("breakeven_pct", 0)
+        self.ai_cooldown: int = acct.get("ai_cooldown", 0)
+        self.ai_enabled: bool = acct.get("ai_enabled", True)
+        self.ai_loss_review: bool = acct.get("ai_loss_review", False)
         self.timeframe: str = str(acct.get("timeframe", "15"))
 
-        ai = config["ai"]
-        self.ai_key: str = ai["api_key"]
+        ai = config.get("ai", {})
+        self.ai_key: str = ai.get("api_key", "")
         self.ai_model: str = ai.get("model", "deepseek-chat")
         self.ai_timeout: int = ai.get("timeout", 15)
 
@@ -254,6 +258,8 @@ class Accountant:
         self._own_db: aiosqlite.Connection | None = None
         self._last_hold_log: dict[tuple, float] = {}  # (trade_id, instance) -> timestamp
         self._evaluated_trades: set[tuple] = set()  # (trade_id, instance)
+        self._breakeven_done: set[int] = set()  # trade IDs already moved to breakeven
+        self._ai_last_call: dict[int, float] = {}  # trade_id -> timestamp of last AI call
 
     # ── lifecycle ──────────────────────────────────────────────
 
@@ -300,9 +306,34 @@ class Accountant:
 
         logger.info("Accountant: checking %d positions", len(positions))
 
+        # Clean up breakeven/cooldown tracking for closed trades
+        open_ids = {pos["id"] for pos in positions}
+        self._breakeven_done = self._breakeven_done & open_ids
+        self._ai_last_call = {k: v for k, v in self._ai_last_call.items() if k in open_ids}
+
         for pos in positions:
             net_pnl = pos["net_pnl"]
             net_pnl_pct = pos["net_pnl_pct"]
+            trade_id = pos["id"]
+
+            # Stage 0: SHIELD — move SL to breakeven (protect profit, don't close)
+            if (self.breakeven_pct > 0
+                    and net_pnl_pct >= self.breakeven_pct
+                    and trade_id not in self._breakeven_done):
+                entry = pos["entry_price"]
+                side = pos["side"]
+                old_sl = pos.get("stop_loss") or 0.0
+                # Check if SL is already at or better than entry
+                already_be = (side == "Buy" and old_sl >= entry) or \
+                             (side == "Sell" and old_sl <= entry)
+                if not already_be:
+                    logger.info(
+                        "FIN shield %s: +%.2f%% → SL to breakeven (entry %.4f)",
+                        pos["symbol"], net_pnl_pct, entry,
+                    )
+                    await self._move_sl(pos, entry, f"shield: +{net_pnl_pct:.2f}% → SL to breakeven")
+                self._breakeven_done.add(trade_id)
+                continue
 
             # Hard auto-close: USD threshold (net PnL in dollars)
             if self.auto_close_usd > 0 and net_pnl >= self.auto_close_usd:
@@ -322,11 +353,11 @@ class Accountant:
                 await self._close_position(pos, f"auto-close: +{net_pnl_pct:.2f}% >= {self.auto_close_pct}% threshold")
                 continue
 
-            # Determine if this position needs AI review
+            # AI review — profit and loss reviewed independently
             review_reason = ""
-            if net_pnl_pct > self.min_profit_pct:
+            if net_pnl_pct > self.min_profit_pct and self.ai_enabled:
                 review_reason = "profit"
-            elif self.loss_review_sl_pct > 0 and net_pnl_pct < 0:
+            elif self.loss_review_sl_pct > 0 and net_pnl_pct < 0 and self.ai_loss_review:
                 sl = pos.get("stop_loss") or 0.0
                 entry = pos["entry_price"]
                 side = pos["side"]
@@ -342,6 +373,13 @@ class Accountant:
 
             if not review_reason:
                 continue
+
+            # AI cooldown: don't spam DeepSeek for the same trade
+            if self.ai_cooldown > 0:
+                last_call = self._ai_last_call.get(trade_id, 0)
+                if time.time() - last_call < self.ai_cooldown:
+                    continue
+                self._ai_last_call[trade_id] = time.time()
 
             pos["review_reason"] = review_reason
             verdict = await self._ask_ai(pos)

@@ -12,12 +12,16 @@ trading:
 
 accountant:
   check_interval: 10
-  min_profit_pct: 0.5        # AI review when net PnL >= 0.5%
-  auto_close_pct: 1.0        # hard close at 1.0%+ net profit (no AI needed)
-  auto_close_usd: 20         # hard close at $20+ net profit (catches small but real gains)
+  breakeven_pct: 0.06        # Shield: move SL to entry at 0.06% net profit
+  min_profit_pct: 0.10       # AI review when net PnL >= 0.10% (if AI enabled)
+  auto_close_pct: 0.15       # hard close at 0.15%+ net profit (~$120 on $80K)
+  auto_close_usd: 0          # disabled — was grabbing $20 crumbs on $80K positions
   loss_review_sl_pct: 50     # review when loss >= 50% of SL distance
-  min_confidence: 6          # confidence for profit-side actions (lower = more aggressive)
-  loss_min_confidence: 9     # confidence for loss-side CLOSE (harder to cut)
+  ai_enabled: false           # AI for profits disabled — pure logic (shield + auto-close)
+  ai_loss_review: true        # AI for losses enabled — reviews when loss >= 50% SL distance
+  min_confidence: 6          # confidence for profit-side actions (if AI enabled)
+  loss_min_confidence: 9     # confidence for loss-side CLOSE (if AI enabled)
+  ai_cooldown: 120           # seconds between AI calls for same trade (if AI enabled)
   timeframe: "15"
 
 databases:

@@ -480,13 +480,7 @@ class TradingEngine:
                     cur_price = self._ws_prices.get(sym)
                     if not cur_price:
                         continue
-                    sl = trade.get("stop_loss") or 0
                     tp = trade.get("take_profit") or 0
-                    if sl > 0:
-                        try:
-                            await self._check_db_stop_loss_with_price(trade, cur_price)
-                        except Exception:
-                            logger.exception("SL monitor error %s", sym)
                     if tp > 0:
                         try:
                             await self._check_db_take_profit_with_price(trade, cur_price)
@@ -522,14 +516,7 @@ class TradingEngine:
                 for trade in open_trades:
                     if not self._running:
                         break
-                    sl = trade.get("stop_loss") or 0
                     tp = trade.get("take_profit") or 0
-                    # Dynamic SL: отключён — предсказуемый SL (Котегава/ATR)
-                    if sl > 0:
-                        try:
-                            await self._check_db_stop_loss(trade)
-                        except Exception:
-                            logger.exception("SL poll error %s", trade.get("symbol"))
                     if tp > 0:
                         try:
                             await self._check_db_take_profit(trade)
@@ -1748,7 +1735,6 @@ class TradingEngine:
             if trade["category"] not in ("linear", "tbank"):
                 continue
             try:
-                await self._check_db_stop_loss(trade)
                 await self._check_db_take_profit(trade)
                 await self._check_breakeven(trade)
                 await self._check_smart_exit(trade)
@@ -2025,110 +2011,6 @@ class TradingEngine:
             f"Net PnL: {net_pnl:,.0f} USDT (лимит: -{target}$)"
         )
 
-    async def _check_db_stop_loss(self, trade: dict):
-        """Close position when price hits stop_loss stored in DB (fetches price via REST)."""
-        sl = trade.get("stop_loss")
-        if not sl or sl <= 0:
-            return
-        try:
-            if self.exchange_type == "tbank":
-                cur_price = self.client.get_last_price(trade["symbol"])
-            else:
-                cur_price = self.client.get_last_price(trade["symbol"], category="linear")
-        except Exception:
-            return
-        await self._check_db_stop_loss_with_price(trade, cur_price)
-
-    async def _dynamic_sl_tighten(self, trade: dict):
-        """Tighten SL to max 60% of TP (in $). Triggers at 80% of limit."""
-        sl = trade.get("stop_loss") or 0
-        tp = trade.get("take_profit") or 0
-        entry = trade.get("entry_price") or 0
-        qty = trade.get("qty") or 0
-        side = trade.get("side", "")
-        symbol = trade.get("symbol", "")
-        if not all([sl, tp, entry, qty, side]):
-            return
-
-        tp_usd = abs(tp - entry) * qty
-        max_sl_usd = tp_usd * 0.6
-        sl_usd = abs(sl - entry) * qty
-        if tp_usd <= 0 or sl_usd <= max_sl_usd:
-            return  # SL already ≤ 60% of TP
-
-        # Get current price
-        try:
-            if self.exchange_type == "tbank":
-                cur_price = self.client.get_last_price(symbol)
-            else:
-                cur_price = self.client.get_last_price(symbol, category="linear")
-        except Exception:
-            return
-        if not cur_price:
-            return
-
-        # Calculate unrealized net loss (after commission)
-        unrealized_pnl = self._calc_net_pnl(side, entry, cur_price, qty)
-
-        # When net loss reaches 80% of limit → tighten SL to 60% of TP
-        if unrealized_pnl < 0 and abs(unrealized_pnl) >= max_sl_usd * 0.8:
-            new_sl_dist = abs(tp - entry) * 0.6
-            if side == "Buy":
-                new_sl = round(entry - new_sl_dist, 6)
-            else:
-                new_sl = round(entry + new_sl_dist, 6)
-            logger.info("Dynamic SL tighten: %s loss $%.0f → SL $%.0f→$%.0f (60%% of TP $%.0f)",
-                        symbol, abs(unrealized_pnl), sl_usd, max_sl_usd, tp_usd)
-            await self.db.update_trade(trade["id"], stop_loss=new_sl)
-
-    async def _check_db_stop_loss_with_price(self, trade: dict, cur_price: float):
-        """Close position when price hits stop_loss stored in DB."""
-        sl = trade.get("stop_loss")
-        if not sl or sl <= 0 or not cur_price:
-            return
-
-        symbol = trade["symbol"]
-        side = trade["side"]
-        entry = trade["entry_price"]
-        qty = trade["qty"]
-
-        # Buy: close when price <= SL (price fell)
-        if side == "Buy" and cur_price > sl:
-            return
-        # Sell: close when price >= SL (price rose)
-        if side == "Sell" and cur_price < sl:
-            return
-
-        # SL hit — close position (net PnL after commission)
-        net_pnl = self._calc_net_pnl(side, entry, cur_price, qty)
-
-        # Try to close on exchange (may fail if position is phantom)
-        close_side = "Sell" if side == "Buy" else "Buy"
-        try:
-            if self.exchange_type == "tbank":
-                self.client.place_order(symbol=symbol, side=close_side, qty=qty)
-            else:
-                self.client.place_order(symbol=symbol, side=close_side, qty=qty, category="linear", reduce_only=True)
-        except Exception:
-            logger.warning("DB stop-loss: no position on exchange for %s, closing in DB only", symbol)
-
-        # Always close in DB
-        try:
-            balance = self.client.get_balance()
-            await self.db.close_trade(trade["id"], cur_price, net_pnl)
-            await self.db.update_daily_pnl(net_pnl)
-            await self._record_pnl(net_pnl, balance)
-        except Exception:
-            logger.exception("DB stop-loss: DB update failed for %s", symbol)
-
-        direction = "ЛОНГ" if side == "Buy" else "ШОРТ"
-        fee = self._calc_fee(entry, cur_price, qty)
-        logger.info("🛑 SL сработал: %s %s @ %.6f (SL=%.6f, net PnL=%.2f, fee=%.2f)", direction, symbol, cur_price, sl, net_pnl, fee)
-        await self._notify(
-            f"🛑 Стоп-лосс: {direction} {symbol}\n"
-            f"Цена: {cur_price:,.6f} (SL: {sl:,.6f})\n"
-            f"Net PnL: {net_pnl:+,.2f} (fee: {fee:.2f})"
-        )
 
     async def _check_db_take_profit(self, trade: dict):
         """Close position when price hits take_profit stored in DB (fetches price via REST)."""
