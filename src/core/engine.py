@@ -1390,21 +1390,15 @@ class TradingEngine:
         elif symbol_count > 1:
             trailing_msg = "\n📐 Trailing: пропущен (мульти-позиция)"
 
-        direction = "ЛОНГ 📈" if side == "Buy" else "ШОРТ 📉"
+        direction = "LONG" if side == "Buy" else "SHORT"
         pos_value = qty * price
-        size_note = f" (AI: x{ai_size_mult})" if ai_size_mult else ""
-        atr_note = f"\n📊 ATR: {atr:.4f}" if atr and atr > 0 else ""
-        daily_total = await self._get_daily_total_pnl()
-        day_arrow = "▲" if daily_total >= 0 else "▼"
-        msg = (
-            f"{'🟢' if side == 'Buy' else '🔴'} Открыл {direction} {symbol}\n"
-            f"Цена: {price:.2f}\n"
-            f"SL: {sl:.2f} ({sl_source}) | TP: {tp:.2f} ({tp_source}){trailing_msg}{atr_note}\n"
-            f"Баланс: {balance:,.0f} USDT ({day_arrow} сегодня: {daily_total:+,.0f})\n"
-            f"Объём: {qty}{size_note} (~{pos_value:,.0f} USDT)"
-        )
-        if ai_reasoning:
-            msg += f"\n{ai_reasoning}"
+        from datetime import datetime, timezone, timedelta
+        msk = datetime.now(timezone(timedelta(hours=3)))
+        msk_time = msk.strftime("%H:%M")
+        exchange = self.config.get("exchange", "bybit")
+        cur = "RUB" if exchange == "tbank" else "USDT"
+        ps_fmt = f"{pos_value:,.0f}" if pos_value < 100_000 else f"{pos_value/1000:,.1f}k"
+        msg = f"OPEN [{direction}] [{symbol}] [{ps_fmt} {cur}] [{msk_time} MSK]"
         logger.info(msg)
         await self._notify(msg)
 
@@ -1810,33 +1804,28 @@ class TradingEngine:
         self._breakeven_done.discard(trade["id"])
 
         # Send notification
-        if pnl >= 0:
-            emoji = "💰"
-            result_text = f"заработал: +{pnl:,.2f} USDT"
-        else:
-            emoji = "💸"
-            result_text = f"просрал: {pnl:,.2f} USDT"
-
-        direction = "ЛОНГ" if side == "Buy" else "ШОРТ"
-        daily_pnl = await self.db.get_daily_pnl()
-        total_pnl = await self.db.get_total_pnl()
-
-        cooldown_note = ""
-        if pnl < 0 and self._cooldown_seconds > 0:
-            cooldown_note = f"\n⏳ Кулдаун {symbol}: {self._cooldown_seconds // 60} мин"
-
-        daily_total = await self._get_daily_total_pnl()
-        day_arrow = "▲" if daily_total >= 0 else "▼"
-
-        msg = (
-            f"{emoji} Закрыл {direction} {symbol}\n"
-            f"Вход: {entry_price} → Выход: {exit_price}\n"
-            f"Результат: {result_text}{cooldown_note}\n"
-            f"─────────────\n"
-            f"За день: {daily_pnl:+,.2f} USDT\n"
-            f"Всего: {total_pnl:+,.2f} USDT\n"
-            f"Баланс: {balance:,.0f} USDT ({day_arrow} сегодня: {daily_total:+,.0f})"
-        )
+        icon = "🟢" if pnl >= 0 else "🔴"
+        currency = "RUB" if self.exchange_type == "tbank" else "USDT"
+        from datetime import datetime, timezone, timedelta
+        msk = datetime.now(timezone(timedelta(hours=3)))
+        msk_time = msk.strftime("%H:%M")
+        dur_str = ""
+        opened_at = trade.get("opened_at")
+        if opened_at:
+            try:
+                opened_dt = datetime.fromisoformat(opened_at)
+                dur_sec = int((datetime.now(timezone.utc) - opened_dt.replace(tzinfo=timezone.utc)).total_seconds())
+                if dur_sec >= 86400:
+                    dur_str = f"{dur_sec // 86400}d {(dur_sec % 86400) // 3600}h"
+                elif dur_sec >= 3600:
+                    dur_str = f"{dur_sec // 3600}h {(dur_sec % 3600) // 60}m"
+                elif dur_sec >= 60:
+                    dur_str = f"{dur_sec // 60}m"
+                else:
+                    dur_str = f"{dur_sec}s"
+            except Exception:
+                pass
+        msg = f"{icon} {pnl:+,.2f} {currency} [CLOSED] [{dur_str}] [{msk_time} MSK]"
         logger.info(msg)
         await self._notify(msg)
 
@@ -1876,12 +1865,28 @@ class TradingEngine:
 
         self._close_at_profit.discard(symbol)
         currency = "RUB" if self.exchange_type == "tbank" else "USDT"
-        direction = "ЛОНГ" if side == "Buy" else "ШОРТ"
-        logger.info("✅ Close-at-profit: закрыл %s %s при net PnL +%.0f %s", direction, symbol, net_pnl, currency)
-        await self._notify(
-            f"✅ Закрыл {direction} {symbol} в плюсе\n"
-            f"Net PnL: +{net_pnl:,.0f} {currency}"
-        )
+        from datetime import datetime, timezone, timedelta
+        msk = datetime.now(timezone(timedelta(hours=3)))
+        msk_time = msk.strftime("%H:%M")
+        dur_str = ""
+        opened_at = trade.get("opened_at")
+        if opened_at:
+            try:
+                opened_dt = datetime.fromisoformat(opened_at)
+                dur_sec = int((datetime.now(timezone.utc) - opened_dt.replace(tzinfo=timezone.utc)).total_seconds())
+                if dur_sec >= 86400:
+                    dur_str = f"{dur_sec // 86400}d {(dur_sec % 86400) // 3600}h"
+                elif dur_sec >= 3600:
+                    dur_str = f"{dur_sec // 3600}h {(dur_sec % 3600) // 60}m"
+                elif dur_sec >= 60:
+                    dur_str = f"{dur_sec // 60}m"
+                else:
+                    dur_str = f"{dur_sec}s"
+            except Exception:
+                pass
+        msg = f"🟢 +{net_pnl:,.2f} {currency} [CLOSED] [{dur_str}] [{msk_time} MSK]"
+        logger.info(msg)
+        await self._notify(msg)
 
     def add_close_at_profit(self, symbol: str) -> str:
         """Add symbol to close-at-profit watchlist. Returns status message."""
@@ -2951,14 +2956,31 @@ class TradingEngine:
                 except Exception:
                     logger.exception("Failed to update DB for %s", symbol)
 
-        direction = "ЛОНГ" if close_side == "Sell" else "ШОРТ"
         currency = "RUB" if is_tbank else "USDT"
-        inst_tag = f"[{other_inst['name']}] " if is_other and other_inst else ""
-        msg = f"❌ {inst_tag}Закрыл {direction} {symbol}"
+        from datetime import datetime, timezone, timedelta
+        msk = datetime.now(timezone(timedelta(hours=3)))
+        msk_time = msk.strftime("%H:%M")
         try:
-            msg += f"\nNet PnL: {pnl:+,.2f} {currency}"
+            icon = "🟢" if pnl >= 0 else "🔴"
+            dur_str = ""
+            try:
+                opened_at = t.get("opened_at") if t else None
+                if opened_at:
+                    opened_dt = datetime.fromisoformat(opened_at)
+                    dur_sec = int((datetime.now(timezone.utc) - opened_dt.replace(tzinfo=timezone.utc)).total_seconds())
+                    if dur_sec >= 86400:
+                        dur_str = f"{dur_sec // 86400}d {(dur_sec % 86400) // 3600}h"
+                    elif dur_sec >= 3600:
+                        dur_str = f"{dur_sec // 3600}h {(dur_sec % 3600) // 60}m"
+                    elif dur_sec >= 60:
+                        dur_str = f"{dur_sec // 60}m"
+                    else:
+                        dur_str = f"{dur_sec}s"
+            except Exception:
+                pass
+            msg = f"{icon} {pnl:+,.2f} {currency} [CLOSED] [{dur_str}] [{msk_time} MSK]"
         except Exception:
-            pass
+            msg = f"🔴 {symbol} [CLOSED] [{msk_time} MSK]"
         logger.info(msg)
         await self._notify(msg)
         return msg

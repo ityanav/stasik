@@ -1991,7 +1991,7 @@ body{font-family:'Share Tech Mono','JetBrains Mono',monospace;background:linear-
 .card .card-icon{font-size:24px;margin-bottom:8px;display:block}
 .card h3{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:1.2px}
 .card .val{font-size:26px;font-weight:700;margin-top:6px;transition:all 0.3s}
-.g{color:var(--green);text-shadow:0 0 8px rgba(0,255,136,0.6),0 0 20px rgba(0,255,136,0.25)}.r{color:var(--red);text-shadow:0 0 8px rgba(255,34,85,0.6),0 0 20px rgba(255,34,85,0.25)}
+.g{color:rgba(0,255,136,0.55);text-shadow:0 0 6px rgba(0,255,136,0.3)}.r{color:rgba(255,34,85,0.55);text-shadow:0 0 6px rgba(255,34,85,0.3)}
 
 .chart-section{
   background:var(--bg2);border:1px solid var(--border);border-radius:12px;
