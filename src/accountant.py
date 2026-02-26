@@ -86,6 +86,18 @@ ACCOUNTANT_PROMPT = """\
 - Время > 3 часов и рынок стоит (DOJI, низкий объём) → CLOSE. Капитал заморожен.
 - Учитывай уроки из прошлых ошибок.
 
+УПРАВЛЕНИЕ УБЫТКАМИ (ревью при убытке ≥50% от SL):
+- Тебя вызвали потому что позиция в значительном убытке. НО SL уже стоит — он защищает.
+- ГЛАВНОЕ ПРАВИЛО: SL существует не просто так. Если SL поставлен правильно, позиция может развернуться.
+- ПО УМОЛЧАНИЮ — HOLD. Закрывай убыток ТОЛЬКО при ОЧЕВИДНЫХ И СИЛЬНЫХ сигналах против.
+- Криптовалюты волатильны — откат на 50% SL это НОРМАЛЬНО, часто цена возвращается.
+- CLOSE только если ВСЁ СРАЗУ: объём ПРОТИВ растёт + rejection ПРОТИВ нас + EMA подтверждают + RSI экстремум.
+- Один-два фактора против — НЕ ДОСТАТОЧНО для CLOSE. Нужно минимум 3-4 подтверждения.
+- DOJI, низкий объём, нерешительность → HOLD. Это пауза, а не разворот.
+- Rejection В НАШУ сторону → HOLD. Рынок защищает наше направление.
+- MOVE_SL ближе к цене — предпочтительнее CLOSE. Ужми SL, дай шанс на разворот.
+- confidence 9-10 для CLOSE в убытке. Если не уверен на 9+ — ставь HOLD или MOVE_SL.
+
 JSON (без markdown):
 CLOSE/HOLD: {"decision":"CLOSE","confidence":1-10,"reasoning":"кратко"}
 MOVE_SL: {"decision":"MOVE_SL","confidence":1-10,"reasoning":"кратко","new_sl":12345.0}
@@ -215,8 +227,10 @@ class Accountant:
 
         acct = config["accountant"]
         self.check_interval: int = acct.get("check_interval", 30)
-        self.min_profit_pct: float = acct.get("min_profit_pct", 0.15)
+        self.min_profit_pct: float = acct.get("min_profit_pct", 0.0)
+        self.loss_review_sl_pct: float = acct.get("loss_review_sl_pct", 0)
         self.min_confidence: int = acct.get("min_confidence", 6)
+        self.loss_min_confidence: int = acct.get("loss_min_confidence", 9)
         self.timeframe: str = str(acct.get("timeframe", "15"))
 
         ai = config["ai"]
@@ -283,9 +297,29 @@ class Accountant:
 
         for pos in positions:
             net_pnl_pct = pos["net_pnl_pct"]
-            if net_pnl_pct < self.min_profit_pct:
+
+            # Determine if this position needs AI review
+            review_reason = ""
+            if net_pnl_pct > self.min_profit_pct:
+                review_reason = "profit"
+            elif self.loss_review_sl_pct > 0 and net_pnl_pct < 0:
+                sl = pos.get("stop_loss") or 0.0
+                entry = pos["entry_price"]
+                side = pos["side"]
+                if sl and entry:
+                    if side == "Buy":
+                        sl_dist_pct = (entry - sl) / entry * 100
+                    else:
+                        sl_dist_pct = (sl - entry) / entry * 100
+                    if sl_dist_pct > 0:
+                        loss_threshold = sl_dist_pct * self.loss_review_sl_pct / 100
+                        if abs(net_pnl_pct) >= loss_threshold:
+                            review_reason = "loss_review"
+
+            if not review_reason:
                 continue
 
+            pos["review_reason"] = review_reason
             verdict = await self._ask_ai(pos)
             if verdict is None:
                 continue
@@ -301,7 +335,10 @@ class Accountant:
 
             await self._log_decision(pos, decision, confidence, reasoning)
 
-            if decision == "CLOSE" and confidence >= self.min_confidence:
+            # Higher confidence bar for closing at a loss
+            close_threshold = self.loss_min_confidence if review_reason == "loss_review" else self.min_confidence
+
+            if decision == "CLOSE" and confidence >= close_threshold:
                 await self._close_position(pos, reasoning)
             elif decision == "MOVE_SL" and confidence >= self.min_confidence:
                 new_sl = verdict.get("new_sl")
@@ -403,7 +440,14 @@ class Accountant:
         else:
             breakeven = entry * (1 - 2 * comm)
 
+        review_reason = pos.get("review_reason", "profit")
+        if review_reason == "loss_review":
+            reason_line = "ПРИЧИНА РЕВЬЮ: УБЫТОК достиг 50% от SL — оцени, стоит ли резать убыток или рынок развернётся\n"
+        else:
+            reason_line = "ПРИЧИНА РЕВЬЮ: позиция в плюсе — оцени, фиксировать или держать\n"
+
         user_msg = (
+            f"{reason_line}"
             f"Символ: {symbol}\n"
             f"Направление: {direction}\n"
             f"Вход: {entry:.4f}, Текущая: {cur:.4f}\n"

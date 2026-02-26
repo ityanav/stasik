@@ -12,8 +12,10 @@ trading:
 
 accountant:
   check_interval: 10
-  min_profit_pct: 0.1
-  min_confidence: 8
+  min_profit_pct: 0          # any positive net PnL triggers review
+  loss_review_sl_pct: 50     # review when loss >= 50% of SL distance
+  min_confidence: 8          # confidence for profit-side actions
+  loss_min_confidence: 9     # confidence for loss-side CLOSE (harder to cut)
   timeframe: "15"
 
 databases:
