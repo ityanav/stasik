@@ -205,21 +205,15 @@ async def main():
                     await _send_telegram(msg)
                     open_trades.setdefault(name, set()).add(tid)
                 elif trade["status"] == "closed":
-                    # Opened and already closed (e.g. instant close)
-                    msg = _format_close(name, trade)
-                    logger.info("New closed: %s/%s id=%d", name, trade["symbol"], tid)
-                    await _send_telegram(msg)
+                    # Close notifications handled by engine/FIN — just track
                     open_trades.get(name, set()).discard(tid)
                 watermarks[name] = max(watermarks.get(name, 0), tid)
 
-            # 2. Check if previously open trades got closed
+            # 2. Track closed trades (remove from open set)
             tracked = open_trades.get(name, set())
             if tracked:
                 closed = _get_newly_closed(db_path, tracked)
                 for trade in closed:
-                    msg = _format_close(name, trade)
-                    logger.info("Closed: %s/%s id=%d", name, trade["symbol"], trade["id"])
-                    await _send_telegram(msg)
                     tracked.discard(trade["id"])
 
 

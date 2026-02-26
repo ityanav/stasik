@@ -31,6 +31,7 @@ logger = logging.getLogger(__name__)
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     [
         [KeyboardButton("📊 Статус"), KeyboardButton("📈 Позиции")],
+        [KeyboardButton("💰 Баланс")],
         [KeyboardButton("▶️ Старт"), KeyboardButton("🛑 Стоп")],
     ],
     resize_keyboard=True,
@@ -43,7 +44,6 @@ INSTANCES = [
     {"name": "TBANK-SCALP", "db": "/root/stasik/data/tbank_scalp.db", "service": "stasik-tbank-scalp", "currency": "RUB", "config": "/root/stasik/config/tbank_scalp.yaml", "exchange": "tbank"},
     {"name": "TBANK-SWING", "db": "/root/stasik/data/tbank_swing.db", "service": "stasik-tbank-swing", "currency": "RUB", "config": "/root/stasik/config/tbank_swing.yaml", "exchange": "tbank"},
     {"name": "MIDAS", "db": "/root/stasik/data/midas.db", "service": "stasik-midas", "currency": "RUB", "config": "/root/stasik/config/midas.yaml", "exchange": "tbank"},
-    {"name": "FIN", "db": None, "service": "stasik-fin", "currency": None, "config": None, "exchange": None},
 ]
 
 
@@ -92,6 +92,67 @@ def _get_status() -> str:
     return "\n".join(lines)
 
 
+def _enrich_pnl(positions: list[dict]):
+    """Add live unrealised net PnL to positions from exchanges."""
+    # Bybit
+    bybit_marks = {}
+    bybit_positions = [p for p in positions if p["exchange"] == "bybit"]
+    if bybit_positions:
+        try:
+            from pybit.unified_trading import HTTP
+            with open("/root/stasik/config/fiba.yaml") as f:
+                cfg = yaml.safe_load(f)
+            bybit_cfg = cfg["bybit"]
+            http_kwargs = {"api_key": bybit_cfg["api_key"], "api_secret": bybit_cfg["api_secret"]}
+            if bybit_cfg.get("demo"):
+                http_kwargs["demo"] = True
+            else:
+                http_kwargs["testnet"] = bybit_cfg.get("testnet", False)
+            session = HTTP(**http_kwargs)
+            resp = session.get_positions(category="linear")
+            for p in resp["result"]["list"]:
+                if float(p["size"]) > 0:
+                    bybit_marks[p["symbol"]] = float(p.get("markPrice") or 0)
+        except Exception as e:
+            logger.warning("Bybit positions fetch error: %s", e)
+
+    # TBank
+    tbank_pnl = {}
+    tbank_positions = [p for p in positions if p["exchange"] == "tbank"]
+    if tbank_positions:
+        try:
+            from src.exchange.tbank_client import TBankClient
+            with open("/root/stasik/config/tbank_scalp.yaml") as f:
+                cfg = yaml.safe_load(f)
+            tc = TBankClient(cfg)
+            raw = tc.get_positions()
+            for p in raw:
+                tbank_pnl[p["symbol"]] = float(p.get("unrealised_pnl", 0))
+        except Exception as e:
+            logger.warning("TBank positions fetch error: %s", e)
+
+    for pos in positions:
+        entry = float(pos["entry_price"] or 0)
+        qty = float(pos["qty"] or 0)
+        fee_rate = 0.0004 if pos["currency"] == "RUB" else 0.00055
+
+        if pos["exchange"] == "bybit":
+            mark = bybit_marks.get(pos["symbol"], 0)
+            if mark > 0:
+                direction = 1 if pos["side"] == "Buy" else -1
+                gross = (mark - entry) * qty * direction
+                fee = (entry * qty + mark * qty) * fee_rate
+                pos["net_pnl"] = round(gross - fee, 2)
+            else:
+                pos["net_pnl"] = 0.0
+        elif pos["exchange"] == "tbank":
+            gross = tbank_pnl.get(pos["symbol"], 0)
+            fee = entry * qty * fee_rate * 2  # approx round-trip
+            pos["net_pnl"] = round(gross - fee, 2)
+        else:
+            pos["net_pnl"] = 0.0
+
+
 def _get_positions() -> tuple[str, list[dict]]:
     all_positions = []
     for inst in INSTANCES:
@@ -110,10 +171,12 @@ def _get_positions() -> tuple[str, list[dict]]:
     if not all_positions:
         return "📈 Нет открытых позиций.", []
 
+    _enrich_pnl(all_positions)
+
     lines = [f"📈 Позиции ({len(all_positions)})\n"]
     for p in all_positions:
         d = "L" if p["side"] == "Buy" else "S"
-        pnl = p.get("pnl") or 0
+        pnl = p.get("net_pnl", 0)
         sign = "+" if pnl >= 0 else ""
         lines.append(f"[{p['instance']}] {p['symbol']} {d} @ {p['entry_price']} | {sign}{pnl:,.2f} {p['currency']}")
 
@@ -200,6 +263,109 @@ def _find_instance(name: str) -> Optional[dict]:
     return None
 
 
+def _get_balance_info() -> str:
+    """Get Bybit + TBank balances and daily net PnL from all DBs."""
+    lines = ["💰 Баланс\n"]
+
+    # Bybit balance
+    bybit_balance = 0.0
+    try:
+        from pybit.unified_trading import HTTP
+        cfg_path = "/root/stasik/config/fiba.yaml"
+        with open(cfg_path) as f:
+            cfg = yaml.safe_load(f)
+        bybit_cfg = cfg["bybit"]
+        http_kwargs = {
+            "api_key": bybit_cfg["api_key"],
+            "api_secret": bybit_cfg["api_secret"],
+        }
+        if bybit_cfg.get("demo"):
+            http_kwargs["demo"] = True
+        else:
+            http_kwargs["testnet"] = bybit_cfg.get("testnet", False)
+        session = HTTP(**http_kwargs)
+        resp = session.get_wallet_balance(accountType="UNIFIED", coin="USDT")
+        for acct in resp["result"]["list"]:
+            for c in acct["coin"]:
+                if c["coin"] == "USDT":
+                    bybit_balance = float(c["walletBalance"])
+    except Exception as e:
+        logger.warning("Bybit balance error: %s", e)
+
+    # TBank balance
+    tbank_balance = 0.0
+    try:
+        from src.exchange.tbank_client import TBankClient
+        cfg_path = "/root/stasik/config/tbank_scalp.yaml"
+        with open(cfg_path) as f:
+            cfg = yaml.safe_load(f)
+        tc = TBankClient(cfg)
+        tbank_balance = tc.get_balance("RUB")
+    except Exception as e:
+        logger.warning("TBank balance error: %s", e)
+
+    lines.append(f"Bybit: {bybit_balance:,.2f} USDT")
+    lines.append(f"TBank: {tbank_balance:,.0f} RUB")
+
+    # Daily net PnL per instance
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    total_usdt = 0.0
+    total_rub = 0.0
+    lines.append("\n📅 Сегодня (net PnL)\n")
+
+    for inst in INSTANCES:
+        if not inst["db"] or not Path(inst["db"]).exists():
+            continue
+        rows = _query_db(
+            inst["db"],
+            "SELECT SUM(pnl) as total, COUNT(*) as cnt FROM trades "
+            "WHERE status='closed' AND date(closed_at)=?",
+            (today,),
+        )
+        if not rows or rows[0]["total"] is None:
+            continue
+        gross = float(rows[0]["total"])
+        cnt = rows[0]["cnt"]
+
+        # Calc fees for net PnL
+        fee_rows = _query_db(
+            inst["db"],
+            "SELECT entry_price, exit_price, qty FROM trades "
+            "WHERE status='closed' AND date(closed_at)=?",
+            (today,),
+        )
+        fee_rate = 0.0004 if inst["currency"] == "RUB" else 0.00055
+        total_fee = sum(
+            (float(r["entry_price"] or 0) * float(r["qty"] or 0) +
+             float(r["exit_price"] or 0) * float(r["qty"] or 0)) * fee_rate
+            for r in fee_rows
+        )
+        net = gross - total_fee
+        cur = inst["currency"]
+        sign = "+" if net >= 0 else ""
+        emoji = "🟢" if net >= 0 else "🔴"
+
+        if cur == "USDT":
+            total_usdt += net
+        else:
+            total_rub += net
+
+        lines.append(f"{emoji} {inst['name']}: {sign}{net:.2f} {cur} ({cnt} сделок)")
+
+    # Totals
+    lines.append("")
+    if total_usdt != 0:
+        sign = "+" if total_usdt >= 0 else ""
+        lines.append(f"Итого USDT: {sign}{total_usdt:.2f}")
+    if total_rub != 0:
+        sign = "+" if total_rub >= 0 else ""
+        lines.append(f"Итого RUB: {sign}{total_rub:.0f}")
+    if total_usdt == 0 and total_rub == 0:
+        lines.append("Сегодня сделок нет")
+
+    return "\n".join(lines)
+
+
 class StandaloneTelegramBot:
     def __init__(self, token: str, chat_id: str):
         self.token = token
@@ -251,6 +417,7 @@ class StandaloneTelegramBot:
         handlers = {
             "📊 Статус": self._cmd_status,
             "📈 Позиции": self._cmd_positions,
+            "💰 Баланс": self._cmd_balance,
             "▶️ Старт": self._cmd_run,
             "🛑 Стоп": self._cmd_stop,
         }
@@ -267,6 +434,7 @@ class StandaloneTelegramBot:
             "🤖 Stasik Trading Bot\n\n"
             "📊 Статус — состояние ботов\n"
             "📈 Позиции — открытые сделки + закрытие\n"
+            "💰 Баланс — Bybit/TBank + дневной PnL\n"
             "▶️ Старт — запустить бота\n"
             "🛑 Стоп — остановить бота",
             reply_markup=MAIN_KEYBOARD,
@@ -277,25 +445,32 @@ class StandaloneTelegramBot:
             return
         await update.message.reply_text(_get_status(), reply_markup=MAIN_KEYBOARD)
 
+    async def _cmd_balance(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        if not self._check_auth(update):
+            return
+        loop = asyncio.get_event_loop()
+        text = await loop.run_in_executor(None, _get_balance_info)
+        await update.message.reply_text(text, reply_markup=MAIN_KEYBOARD)
+
     async def _cmd_positions(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not self._check_auth(update):
             return
-        text, positions = _get_positions()
+        _, positions = _get_positions()
 
         if positions:
             buttons = []
             for p in positions:
                 d = "L" if p["side"] == "Buy" else "S"
-                pnl = p.get("pnl") or 0
+                pnl = p.get("net_pnl", 0)
                 sign = "+" if pnl >= 0 else ""
                 label = f"❌ {p['instance']} {p['symbol']} {d} ({sign}{pnl:.2f})"
                 cb_data = f"close_{p['instance']}_{p['id']}_{p['symbol']}"
                 buttons.append([InlineKeyboardButton(label, callback_data=cb_data)])
             buttons.append([InlineKeyboardButton("❌ Закрыть ВСЕ", callback_data="close_all")])
             buttons.append([InlineKeyboardButton("Отмена", callback_data="cancel")])
-            await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+            await update.message.reply_text(f"📈 Позиции ({len(positions)})", reply_markup=InlineKeyboardMarkup(buttons))
         else:
-            await update.message.reply_text(text, reply_markup=MAIN_KEYBOARD)
+            await update.message.reply_text("📈 Нет открытых позиций.", reply_markup=MAIN_KEYBOARD)
 
     async def _cmd_stop(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not self._check_auth(update):

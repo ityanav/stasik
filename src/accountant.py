@@ -884,17 +884,8 @@ class Accountant:
     # ── telegram ───────────────────────────────────────────────
 
     async def _notify(self, text: str):
-        if not self.tg_token or not self.tg_chat:
-            return
-        url = f"https://api.telegram.org/bot{self.tg_token}/sendMessage"
-        try:
-            await self._http.post(
-                url,
-                json={"chat_id": self.tg_chat, "text": text},
-                timeout=10,
-            )
-        except Exception:
-            logger.warning("Telegram notification failed")
+        # Telegram notifications disabled — notifier handles alerts
+        return
 
 
 # ── Entry point ────────────────────────────────────────────────────
