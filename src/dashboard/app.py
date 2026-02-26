@@ -417,13 +417,11 @@ class Dashboard:
         if not token or not chat_id:
             return
         currency = "RUB" if any(k in (instance or "").upper() for k in ("TBANK", "MIDAS")) else "USDT"
-        sign = "+" if net_pnl >= 0 else ""
-        text = (
-            f"\U0001F319 NIGHT CLOSE\n"
-            f"{instance} | {symbol} | {side}\n"
-            f"Net PnL: {sign}{net_pnl:.2f} {currency}\n"
-            f"Target: {target} {currency}"
-        )
+        icon = "🟢" if net_pnl >= 0 else "🔴"
+        from datetime import timezone, timedelta
+        msk = datetime.now(timezone(timedelta(hours=3)))
+        msk_time = msk.strftime("%H:%M")
+        text = f"{icon} {net_pnl:+,.2f} {currency} [NIGHT] [{msk_time} MSK]"
         url = f"https://api.telegram.org/bot{token}/sendMessage"
         try:
             async with aiohttp.ClientSession() as session:
@@ -547,13 +545,11 @@ class Dashboard:
         chat_id = tg.get("chat_id")
         if not token or not chat_id:
             return
-        sign = "+" if gross_pnl >= 0 else ""
-        text = (
-            f"\U0001F4B0 SALE CLOSE\n"
-            f"{instance} | {symbol} | {side}\n"
-            f"Gross PnL: {sign}{gross_pnl:.2f} USDT\n"
-            f"Target: {target} USDT"
-        )
+        icon = "🟢" if gross_pnl >= 0 else "🔴"
+        from datetime import timezone, timedelta
+        msk = datetime.now(timezone(timedelta(hours=3)))
+        msk_time = msk.strftime("%H:%M")
+        text = f"{icon} {gross_pnl:+,.2f} USDT [SALE] [{msk_time} MSK]"
         url = f"https://api.telegram.org/bot{token}/sendMessage"
         try:
             async with aiohttp.ClientSession() as session:
