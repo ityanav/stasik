@@ -6,6 +6,7 @@ import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
+import aiohttp
 import aiosqlite
 from aiohttp import web
 
@@ -402,6 +403,28 @@ class Dashboard:
 
         logger.info("[NIGHT] Closed %s/%s (exchange=%s)", instance, symbol, exchange_closed)
 
+    async def _night_notify(self, instance: str, symbol: str, side: str, net_pnl: float, target: int):
+        """Send Telegram notification about night-mode close."""
+        tg = self.config.get("telegram", {})
+        token = tg.get("token")
+        chat_id = tg.get("chat_id")
+        if not token or not chat_id:
+            return
+        currency = "RUB" if any(k in (instance or "").upper() for k in ("TBANK", "MIDAS")) else "USDT"
+        sign = "+" if net_pnl >= 0 else ""
+        text = (
+            f"\U0001F319 NIGHT CLOSE\n"
+            f"{instance} | {symbol} | {side}\n"
+            f"Net PnL: {sign}{net_pnl:.2f} {currency}\n"
+            f"Target: {target} {currency}"
+        )
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        try:
+            async with aiohttp.ClientSession() as session:
+                await session.post(url, json={"chat_id": chat_id, "text": text})
+        except Exception as e:
+            logger.warning("[NIGHT] Telegram notify failed: %s", e)
+
     async def _night_loop(self):
         """Background loop: check positions and auto-close when net PnL >= target."""
         logger.info("[NIGHT] Background loop started")
@@ -436,6 +459,10 @@ class Dashboard:
                         try:
                             await self._night_close_position(
                                 pos["instance"], pos["symbol"], pos["side"],
+                            )
+                            await self._night_notify(
+                                pos["instance"], pos["symbol"], pos["side"],
+                                net_pnl, target,
                             )
                         except Exception:
                             logger.exception("[NIGHT] Error closing %s", key)
