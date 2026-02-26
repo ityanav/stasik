@@ -1,9 +1,9 @@
-"""Standalone trade close notifier — polls DBs and sends Telegram messages."""
+"""Standalone trade notifier — polls DBs for new opens/closes, sends Telegram."""
 
 import asyncio
 import logging
 import sqlite3
-import time
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 import aiohttp
@@ -14,6 +14,8 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger("trade_notifier")
+
+MSK = timezone(timedelta(hours=3))
 
 # All trade databases to monitor
 DATABASES = {
@@ -47,13 +49,15 @@ def _currency(instance: str) -> str:
     return "RUB" if _is_tbank(instance) else "USDT"
 
 
-def _get_last_closed_id(db_path: str) -> int:
-    """Get the max ID of closed trades in a DB."""
+def _now_msk() -> str:
+    return datetime.now(MSK).strftime("%d.%m %H:%M")
+
+
+def _get_max_id(db_path: str) -> int:
+    """Get the max trade ID in a DB."""
     try:
         conn = sqlite3.connect(db_path)
-        cur = conn.execute(
-            "SELECT MAX(id) FROM trades WHERE status = 'closed'"
-        )
+        cur = conn.execute("SELECT MAX(id) FROM trades")
         row = cur.fetchone()
         conn.close()
         return row[0] or 0
@@ -61,15 +65,15 @@ def _get_last_closed_id(db_path: str) -> int:
         return 0
 
 
-def _get_new_closed_trades(db_path: str, after_id: int) -> list[dict]:
-    """Get closed trades with id > after_id."""
+def _get_new_trades(db_path: str, after_id: int) -> list[dict]:
+    """Get all trades with id > after_id."""
     try:
         conn = sqlite3.connect(db_path)
         conn.row_factory = sqlite3.Row
         cur = conn.execute(
             "SELECT id, symbol, side, qty, entry_price, exit_price, pnl, "
-            "opened_at, closed_at, instance FROM trades "
-            "WHERE status = 'closed' AND id > ? ORDER BY id",
+            "status, opened_at, closed_at, instance FROM trades "
+            "WHERE id > ? ORDER BY id",
             (after_id,),
         )
         rows = [dict(r) for r in cur.fetchall()]
@@ -80,7 +84,56 @@ def _get_new_closed_trades(db_path: str, after_id: int) -> list[dict]:
         return []
 
 
-def _format_message(instance: str, trade: dict) -> str:
+def _get_newly_closed(db_path: str, open_ids: set[int]) -> list[dict]:
+    """Check if any previously open trades are now closed."""
+    if not open_ids:
+        return []
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        placeholders = ",".join("?" for _ in open_ids)
+        cur = conn.execute(
+            f"SELECT id, symbol, side, qty, entry_price, exit_price, pnl, "
+            f"status, opened_at, closed_at, instance FROM trades "
+            f"WHERE id IN ({placeholders}) AND status = 'closed'",
+            list(open_ids),
+        )
+        rows = [dict(r) for r in cur.fetchall()]
+        conn.close()
+        return rows
+    except Exception as e:
+        logger.warning("Failed to check closed in %s: %s", db_path, e)
+        return []
+
+
+def _get_open_ids(db_path: str) -> set[int]:
+    """Get IDs of all currently open trades."""
+    try:
+        conn = sqlite3.connect(db_path)
+        cur = conn.execute("SELECT id FROM trades WHERE status = 'open'")
+        ids = {row[0] for row in cur.fetchall()}
+        conn.close()
+        return ids
+    except Exception:
+        return set()
+
+
+def _format_open(instance: str, trade: dict) -> str:
+    symbol = trade["symbol"]
+    side = "LONG" if trade["side"] == "Buy" else "SHORT"
+    entry = float(trade["entry_price"] or 0)
+    qty = float(trade["qty"] or 0)
+    amount = round(entry * qty, 2)
+    cur = _currency(instance)
+    inst_label = trade.get("instance") or instance
+
+    return (
+        f"\U0001f535 {inst_label} | {side} {symbol}\n"
+        f"{amount:.0f} {cur} | {_now_msk()}"
+    )
+
+
+def _format_close(instance: str, trade: dict) -> str:
     symbol = trade["symbol"]
     side = trade["side"]
     pnl = float(trade["pnl"] or 0)
@@ -89,20 +142,18 @@ def _format_message(instance: str, trade: dict) -> str:
     qty = float(trade["qty"] or 0)
     cur = _currency(instance)
 
-    # Net PnL (after commission)
     fee_rate = 0.0004 if _is_tbank(instance) else 0.00055
     fee = (entry * qty + exit_p * qty) * fee_rate
     net_pnl = pnl - fee
 
     sign = "+" if net_pnl >= 0 else ""
     emoji = "\u2705" if net_pnl >= 0 else "\u274c"
-
     inst_label = trade.get("instance") or instance
 
     return (
         f"{emoji} {inst_label} | {symbol} | {side}\n"
         f"Entry: {entry:.4g} \u2192 Exit: {exit_p:.4g}\n"
-        f"Net PnL: {sign}{net_pnl:.2f} {cur}"
+        f"Net PnL: {sign}{net_pnl:.2f} {cur} | {_now_msk()}"
     )
 
 
@@ -121,14 +172,18 @@ async def _send_telegram(text: str):
 async def main():
     logger.info("Trade notifier started, monitoring %d databases", len(DATABASES))
 
-    # Initialize watermarks — start from current max IDs (don't notify old trades)
+    # Initialize watermarks and open trade sets
     watermarks: dict[str, int] = {}
+    open_trades: dict[str, set[int]] = {}
+
     for name, db_path in DATABASES.items():
         if Path(db_path).exists():
-            watermarks[name] = _get_last_closed_id(db_path)
-            logger.info("  %s: watermark=%d", name, watermarks[name])
+            watermarks[name] = _get_max_id(db_path)
+            open_trades[name] = _get_open_ids(db_path)
+            logger.info("  %s: watermark=%d, open=%d", name, watermarks[name], len(open_trades[name]))
         else:
             watermarks[name] = 0
+            open_trades[name] = set()
             logger.info("  %s: DB not found, will check later", name)
 
     while True:
@@ -138,14 +193,34 @@ async def main():
             if not Path(db_path).exists():
                 continue
 
+            # 1. Check for new trades (opens)
             last_id = watermarks.get(name, 0)
-            new_trades = _get_new_closed_trades(db_path, last_id)
+            new_trades = _get_new_trades(db_path, last_id)
 
             for trade in new_trades:
-                msg = _format_message(name, trade)
-                logger.info("New closed trade: %s/%s id=%d", name, trade["symbol"], trade["id"])
-                await _send_telegram(msg)
-                watermarks[name] = max(watermarks[name], trade["id"])
+                tid = trade["id"]
+                if trade["status"] == "open":
+                    msg = _format_open(name, trade)
+                    logger.info("New open: %s/%s id=%d", name, trade["symbol"], tid)
+                    await _send_telegram(msg)
+                    open_trades.setdefault(name, set()).add(tid)
+                elif trade["status"] == "closed":
+                    # Opened and already closed (e.g. instant close)
+                    msg = _format_close(name, trade)
+                    logger.info("New closed: %s/%s id=%d", name, trade["symbol"], tid)
+                    await _send_telegram(msg)
+                    open_trades.get(name, set()).discard(tid)
+                watermarks[name] = max(watermarks.get(name, 0), tid)
+
+            # 2. Check if previously open trades got closed
+            tracked = open_trades.get(name, set())
+            if tracked:
+                closed = _get_newly_closed(db_path, tracked)
+                for trade in closed:
+                    msg = _format_close(name, trade)
+                    logger.info("Closed: %s/%s id=%d", name, trade["symbol"], trade["id"])
+                    await _send_telegram(msg)
+                    tracked.discard(trade["id"])
 
 
 if __name__ == "__main__":
