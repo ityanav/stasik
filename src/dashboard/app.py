@@ -227,7 +227,7 @@ class Dashboard:
             # Check if any trading service is running
             _all_services = [
                 "stasik-fiba", "stasik-tbank-scalp", "stasik-tbank-swing",
-                "stasik-midas", "stasik-accountant",
+                "stasik-midas", "stasik-fin",
             ]
             running = any(self._check_service_active(s) for s in _all_services)
 
@@ -728,7 +728,7 @@ class Dashboard:
             if not service or action not in ("start", "stop", "restart"):
                 return web.json_response({"ok": False, "error": "Bad request"}, status=400)
             # Whitelist: only known stasik services
-            allowed = {"stasik", "stasik-degen", "stasik-tbank-scalp", "stasik-tbank-swing", "stasik-dashboard", "stasik-midas", "stasik-turtle", "stasik-turtle-tbank", "stasik-smc", "stasik-fiba", "stasik-buba", "stasik-accountant"}
+            allowed = {"stasik", "stasik-degen", "stasik-tbank-scalp", "stasik-tbank-swing", "stasik-dashboard", "stasik-midas", "stasik-turtle", "stasik-turtle-tbank", "stasik-smc", "stasik-fiba", "stasik-buba", "stasik-fin"}
             if service not in allowed:
                 return web.json_response({"ok": False, "error": "Unknown service"}, status=400)
 

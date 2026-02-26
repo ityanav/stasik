@@ -228,6 +228,7 @@ class Accountant:
         acct = config["accountant"]
         self.check_interval: int = acct.get("check_interval", 30)
         self.min_profit_pct: float = acct.get("min_profit_pct", 0.0)
+        self.auto_close_pct: float = acct.get("auto_close_pct", 0)  # hard close at N% net profit
         self.loss_review_sl_pct: float = acct.get("loss_review_sl_pct", 0)
         self.min_confidence: int = acct.get("min_confidence", 6)
         self.loss_min_confidence: int = acct.get("loss_min_confidence", 9)
@@ -296,7 +297,17 @@ class Accountant:
         logger.info("Accountant: checking %d positions", len(positions))
 
         for pos in positions:
+            net_pnl = pos["net_pnl"]
             net_pnl_pct = pos["net_pnl_pct"]
+
+            # Hard auto-close: if net PnL % exceeds threshold, close immediately
+            if self.auto_close_pct > 0 and net_pnl_pct >= self.auto_close_pct:
+                logger.info(
+                    "FIN auto-close %s: +%.2f%% (>= %.1f%% threshold), +%.2f$",
+                    pos["symbol"], net_pnl_pct, self.auto_close_pct, net_pnl,
+                )
+                await self._close_position(pos, f"auto-close: +{net_pnl_pct:.2f}% >= {self.auto_close_pct}% threshold")
+                continue
 
             # Determine if this position needs AI review
             review_reason = ""

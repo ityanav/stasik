@@ -42,7 +42,7 @@ INSTANCES = [
     {"name": "TBANK-SCALP", "db": "/root/stasik/data/tbank_scalp.db", "service": "stasik-tbank-scalp", "currency": "RUB"},
     {"name": "TBANK-SWING", "db": "/root/stasik/data/tbank_swing.db", "service": "stasik-tbank-swing", "currency": "RUB"},
     {"name": "MIDAS", "db": "/root/stasik/data/midas.db", "service": "stasik-midas", "currency": "RUB"},
-    {"name": "ACCOUNTANT", "db": None, "service": "stasik-accountant", "currency": None},
+    {"name": "FIN", "db": None, "service": "stasik-fin", "currency": None},
 ]
 
 
