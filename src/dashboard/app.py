@@ -876,6 +876,11 @@ class Dashboard:
         closed_trades.sort(key=lambda t: t.get("closed_at") or "", reverse=True)
         all_trades = open_trades + closed_trades
 
+        # Enrich with leverage from config
+        for t in all_trades:
+            if "leverage" not in t or not t.get("leverage"):
+                t["leverage"] = self._get_instance_config_leverage(t.get("instance", ""))
+
         # Paginate
         offset = (page - 1) * per_page
         page_trades = all_trades[offset:offset + per_page + 1]
@@ -2558,7 +2563,7 @@ body.archive-mode .header{background:var(--bg2);border-bottom-color:rgba(255,152
     <h2>📊 Открытые позиции</h2>
     <div class="tbl-wrap">
       <table>
-        <thead><tr><th>Bot</th><th>Pair</th><th>Side</th><th>PS</th><th>TP</th><th>SL</th><th>Gross PnL</th><th>Fee</th><th>Net PnL</th><th></th></tr></thead>
+        <thead><tr><th>Bot</th><th>Pair</th><th>Side</th><th>Lev</th><th>PS</th><th>TP</th><th>SL</th><th>Gross PnL</th><th>Fee</th><th>Net PnL</th><th></th></tr></thead>
         <tbody id="pos-body"></tbody>
       </table>
     </div>
@@ -2572,7 +2577,7 @@ body.archive-mode .header{background:var(--bg2);border-bottom-color:rgba(255,152
     <div class="tbl-wrap">
       <table>
         <thead><tr>
-          <th>Bot</th><th>Pair</th><th>Side</th><th>Size</th><th>Entry</th><th>Exit</th><th>PS</th><th>Gross PnL</th><th>Net PnL</th><th>Time</th><th>Dur</th><th>Status</th>
+          <th>Bot</th><th>Pair</th><th>Side</th><th>Lev</th><th>Size</th><th>Entry</th><th>Exit</th><th>PS</th><th>Gross PnL</th><th>Net PnL</th><th>Time</th><th>Dur</th><th>Status</th>
         </tr></thead>
         <tbody id="tbody"></tbody>
       </table>
@@ -3457,10 +3462,12 @@ function _renderPosRow(p){
       const pc=p.partial_closed||0;
       const soBadge=pc>0?` <span class="so-badge">${pc}/3</span>`:'';
       const key=`${p.instance||''}_${p.symbol}_${p.side}`;
+      const lev=p.leverage||'?';
       return`<tr data-pos-key="${key}" class="fade-in">
         <td><span class="inst-tag ${isCls}">${iLabel}</span></td>
         <td style="color:var(--muted)">${p.symbol}${soBadge}</td>
         <td style="color:var(--muted)">${p.side==='Buy'?'<span style="color:#00ff88">\u2191</span> LONG':'<span style="color:#ff2255">\u2193</span> SHORT'}</td>
+        <td style="color:var(--neon-cyan);font-size:11px">x${lev}</td>
         <td style="color:var(--muted)">${Math.round(entryAmt).toLocaleString()}</td>
         <td style="color:var(--muted)">${tpTxt}</td>
         <td style="color:var(--muted)">${slTxt}</td>
@@ -3476,7 +3483,7 @@ async function loadPositions(){
     const body=document.getElementById('pos-body');
     const wrap=document.getElementById('close-all-wrap');
     if(!pos.length){
-      body.innerHTML='<tr><td colspan="10" style="text-align:center;color:#445;padding:20px">Нет открытых позиций</td></tr>';
+      body.innerHTML='<tr><td colspan="11" style="text-align:center;color:#445;padding:20px">Нет открытых позиций</td></tr>';
       wrap.style.display='none';_posCache=[];return;
     }
     wrap.style.display=currentSource==='live'?'':'none';
@@ -3550,10 +3557,12 @@ async function loadTrades(page){
         const ms=Date.now()-new Date(t.opened_at.replace(' ','T')+'Z');
         if(ms>0){const s=Math.floor(ms/1000),m=Math.floor(s/60),h=Math.floor(m/60),d=Math.floor(h/24);dur=d>0?d+'d '+h%24+'h':h>0?h+'h '+m%60+'m':m>0?m+'m':s+'s'}
       }
+      const tLev=t.leverage||'?';
       return`<tr class="fade-in">
         <td><span class="inst-tag ${isCls}">${iLabel}</span></td>
         <td style="color:var(--muted)">${t.symbol}${tSoBadge}</td>
         <td style="color:var(--muted)">${t.side==='Buy'?'<span style="color:#00ff88">\u2191</span> LONG':'<span style="color:#ff2255">\u2193</span> SHORT'}</td>
+        <td style="color:var(--neon-cyan);font-size:11px">x${tLev}</td>
         <td style="color:var(--muted);font-size:12px">${qty}</td>
         <td style="color:var(--muted)">${t.entry_price||'-'}</td><td style="color:var(--muted)">${t.exit_price||'-'}</td>
         <td style="font-size:12px;color:var(--muted)">$${psFmt}</td>
