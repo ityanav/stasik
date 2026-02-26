@@ -771,27 +771,52 @@ class Dashboard:
             except Exception as e:
                 logger.exception("close-position error")
                 return web.json_response({"ok": False, "error": str(e)}, status=500)
-        # Standalone mode — close via BybitClient directly
-        client = self._get_client()
-        if not client:
-            return web.json_response({"ok": False, "error": "No client"}, status=503)
+        # Standalone mode — close via exchange client directly
         try:
             data = await request.json()
             symbol = data.get("symbol", "")
             instance = data.get("instance", "")
             if not symbol:
                 return web.json_response({"ok": False, "error": "No symbol"}, status=400)
-            # Try to close on exchange
+            # Determine exchange type from instance name
+            is_tbank = any(k in (instance or "").upper() for k in ("TBANK", "MIDAS"))
             exchange_closed = False
-            try:
-                positions = client.get_positions(symbol=symbol, category="linear")
-                for p in positions:
-                    if p["symbol"] == symbol and p["size"] > 0:
-                        close_side = "Sell" if p["side"] == "Buy" else "Buy"
-                        client.place_order(symbol=symbol, side=close_side, qty=p["size"], category="linear", reduce_only=True)
-                        exchange_closed = True
-            except Exception:
-                logger.warning("Failed to close %s on exchange", symbol)
+            if is_tbank:
+                try:
+                    from src.exchange.tbank_client import TBankClient
+                    # Find matching tbank config
+                    for inst in _other_instances(self.config):
+                        if inst.get("name", "").upper() == (instance or "").upper():
+                            cfg_path = inst.get("config_path", "")
+                            if cfg_path and Path(cfg_path).exists():
+                                import yaml
+                                with open(cfg_path) as f:
+                                    tcfg = yaml.safe_load(f)
+                                tc = TBankClient(tcfg)
+                                positions = tc.get_positions(symbol=symbol)
+                                for p in positions:
+                                    if p["symbol"] == symbol and p["size"] > 0:
+                                        close_side = "Sell" if p["side"] == "Buy" else "Buy"
+                                        tc.place_order(symbol=symbol, side=close_side, qty=p["size"])
+                                        exchange_closed = True
+                                break
+                except Exception as e:
+                    err_str = str(e)
+                    if "30079" in err_str or "not available" in err_str.lower():
+                        return web.json_response({"ok": False, "error": "MOEX закрыта"}, status=400)
+                    logger.warning("Failed to close %s on TBank: %s", symbol, e)
+            else:
+                client = self._get_client()
+                if client:
+                    try:
+                        positions = client.get_positions(symbol=symbol, category="linear")
+                        for p in positions:
+                            if p["symbol"] == symbol and p["size"] > 0:
+                                close_side = "Sell" if p["side"] == "Buy" else "Buy"
+                                client.place_order(symbol=symbol, side=close_side, qty=p["size"], category="linear", reduce_only=True)
+                                exchange_closed = True
+                    except Exception:
+                        logger.warning("Failed to close %s on Bybit", symbol)
             # Close in DB (get current price for PnL)
             db_path = self._resolve_instance_db(instance)
             if not db_path:
@@ -2710,12 +2735,12 @@ async function setPairLeverage(symbol,leverage,sel){
 }
 
 async function closePosition(symbol,instance,btn){
-  if(!confirm('Закрыть позицию '+symbol+'?'))return;
+  if(!confirm('Закрыть '+symbol+'?'))return;
   btn.disabled=true;btn.textContent='...';
   try{
     const r=await fetch('/api/close-position',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({symbol,instance})});
     const d=await r.json();
-    if(d.ok){btn.innerHTML='&#10003;';loadAll()}
+    if(d.ok){btn.innerHTML='&#10003;';loadPositions()}
     else{alert(d.error||'Ошибка');btn.disabled=false;btn.innerHTML='&times;'}
   }catch(e){alert('Ошибка: '+e);btn.disabled=false;btn.innerHTML='&times;'}
 }
@@ -2767,23 +2792,12 @@ async function setTP(symbol,side,entryPrice,qty,instance,btn){
   }catch(e){alert('Ошибка: '+e);btn.disabled=false;btn.textContent='OK'}
 }
 
-async function loadPositions(){
-  try{
-    if(slEditing)return;
-    const pos=await(await fetch('/api/positions?source='+currentSource)).json();
-    const body=document.getElementById('pos-body');
-    const wrap=document.getElementById('close-all-wrap');
-    if(!pos.length){
-      body.innerHTML='<tr><td colspan="10" style="text-align:center;color:#445;padding:20px">Нет открытых позиций</td></tr>';
-      wrap.style.display='none';return;
-    }
-    wrap.style.display=currentSource==='live'?'':'none';
-    body.innerHTML=pos.map(p=>{
+let _posCache=[];
+function _renderPosRow(p){
       const grossPnl=parseFloat(p.unrealised_pnl)||0;
       const inst=(p.instance||'').toUpperCase();
       const isCls=inst.includes('TBANK')?'inst-tbank':inst.includes('DEGEN')?'inst-degen':inst.includes('SCALP')?'inst-scalp':inst.includes('MIDAS')?'inst-midas':inst.includes('TURTLE')?'inst-turtle':inst.includes('FIBA')?'inst-fiba':inst.includes('BUBA')?'inst-buba':'inst-other';
       const iLabel=inst.includes('TBANK-SCALP')?'TB-SCALP':inst.includes('TBANK-SWING')?'TB-SWING':inst.includes('DEGEN')?'DEGEN':inst.includes('SCALP')?'SCALP':inst.includes('MIDAS')?'MIDAS':inst.includes('TURTLE-TB')?'TURTLE-TB':inst.includes('TURTLE')?'TURTLE':inst.includes('FIBA')?'FIBA':inst.includes('BUBA')?'BUBA':inst;
-      const cur=inst.includes('TBANK')?'RUB':'USDT';
       const closeBtn=currentSource==='live'?`<button class="btn-close-x" onclick="closePosition('${p.symbol}','${p.instance||''}',this)" title="Закрыть позицию">&times;</button>`:'';
       const entryAmt=parseFloat(p.entry_amount)||0;
       const feeRate=inst.includes('TBANK')?0.0004:0.00055;
@@ -2795,20 +2809,62 @@ async function loadPositions(){
       const slTxt=slPnl!=null?fmt(slPnl):'—';
       const pc=p.partial_closed||0;
       const soBadge=pc>0?` <span class="so-badge">${pc}/3</span>`:'';
-      const isTbankPos=inst.includes('TBANK');
-      return`<tr class="fade-in">
+      const key=`${p.instance||''}_${p.symbol}_${p.side}`;
+      return`<tr data-pos-key="${key}" class="fade-in">
         <td><span class="inst-tag ${isCls}">${iLabel}</span></td>
         <td style="color:var(--muted)">${p.symbol}${soBadge}</td>
         <td style="color:var(--muted)">${p.side==='Buy'?'<span style="color:#00ff88">\u2191</span> LONG':'<span style="color:#ff2255">\u2193</span> SHORT'}</td>
         <td style="color:var(--muted)">${Math.round(entryAmt).toLocaleString()}</td>
         <td style="color:var(--muted)">${tpTxt}</td>
         <td style="color:var(--muted)">${slTxt}</td>
-        <td class="${cls(grossPnl)}" style="opacity:0.45">${fmt(grossPnl)}</td>
+        <td class="${cls(grossPnl)}" data-col="gross" style="opacity:0.45">${fmt(grossPnl)}</td>
         <td style="color:#ff9800">${fee.toLocaleString()}</td>
-        <td class="${cls(pnl)}"><strong>${fmt(pnl)}</strong></td>
+        <td class="${cls(pnl)}" data-col="net"><strong>${fmt(pnl)}</strong></td>
         <td>${closeBtn}</td></tr>`;
-    }).join('');
+}
+async function loadPositions(){
+  try{
+    if(slEditing)return;
+    const pos=await(await fetch('/api/positions?source='+currentSource)).json();
+    const body=document.getElementById('pos-body');
+    const wrap=document.getElementById('close-all-wrap');
+    if(!pos.length){
+      body.innerHTML='<tr><td colspan="10" style="text-align:center;color:#445;padding:20px">Нет открытых позиций</td></tr>';
+      wrap.style.display='none';_posCache=[];return;
+    }
+    wrap.style.display=currentSource==='live'?'':'none';
+    _posCache=pos;
+    body.innerHTML=pos.map(p=>_renderPosRow(p)).join('');
   }catch(e){console.error('positions',e)}
+}
+async function updatePnlOnly(){
+  try{
+    if(slEditing)return;
+    const pos=await(await fetch('/api/positions?source='+currentSource)).json();
+    const body=document.getElementById('pos-body');
+    if(!pos.length){
+      if(_posCache.length>0)loadPositions();
+      return;
+    }
+    if(pos.length!==_posCache.length){loadPositions();return}
+    const rows=body.querySelectorAll('tr[data-pos-key]');
+    for(const p of pos){
+      const key=`${p.instance||''}_${p.symbol}_${p.side}`;
+      const row=[...rows].find(r=>r.dataset.posKey===key);
+      if(!row){loadPositions();return}
+      const grossPnl=parseFloat(p.unrealised_pnl)||0;
+      const inst=(p.instance||'').toUpperCase();
+      const entryAmt=parseFloat(p.entry_amount)||0;
+      const feeRate=inst.includes('TBANK')?0.0004:0.00055;
+      const fee=Math.round(entryAmt*feeRate*2);
+      const pnl=grossPnl-fee;
+      const grossTd=row.querySelector('[data-col="gross"]');
+      const netTd=row.querySelector('[data-col="net"]');
+      if(grossTd){grossTd.className=cls(grossPnl);grossTd.style.opacity='0.45';grossTd.textContent=fmt(grossPnl)}
+      if(netTd){netTd.className=cls(pnl);netTd.innerHTML='<strong>'+fmt(pnl)+'</strong>'}
+    }
+    _posCache=pos;
+  }catch(e){console.error('pnl-update',e)}
 }
 
 async function loadTrades(page){
@@ -2896,6 +2952,7 @@ function updateMarketBar(){
 updateMarketBar();setInterval(updateMarketBar,1000);
 
 loadAll();
+setInterval(updatePnlOnly,2000);
 setInterval(async()=>{if(slEditing)return;await loadInstances();loadStats();loadChart();loadPositions();loadTrades(currentPage);loadPairPnl()},10000);
 
 // SSE: instant trade updates
