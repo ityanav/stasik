@@ -1991,7 +1991,7 @@ body{font-family:'Share Tech Mono','JetBrains Mono',monospace;background:linear-
 .card .card-icon{font-size:24px;margin-bottom:8px;display:block}
 .card h3{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:1.2px}
 .card .val{font-size:26px;font-weight:700;margin-top:6px;transition:all 0.3s}
-.g{color:var(--green)}.r{color:var(--red)}
+.g{color:var(--green);text-shadow:0 0 8px rgba(0,255,136,0.6),0 0 20px rgba(0,255,136,0.25)}.r{color:var(--red);text-shadow:0 0 8px rgba(255,34,85,0.6),0 0 20px rgba(255,34,85,0.25)}
 
 .chart-section{
   background:var(--bg2);border:1px solid var(--border);border-radius:12px;
@@ -3258,7 +3258,7 @@ function _renderPosRow(p){
         <td style="color:var(--muted)">${Math.round(entryAmt).toLocaleString()}</td>
         <td style="color:var(--muted)">${tpTxt}</td>
         <td style="color:var(--muted)">${slTxt}</td>
-        <td class="${cls(grossPnl)}" data-col="gross" style="opacity:0.45">${fmt(grossPnl)}</td>
+        <td class="${cls(grossPnl)}" data-col="gross">${fmt(grossPnl)}</td>
         <td style="color:#ff9800">${fee.toLocaleString()}</td>
         <td class="${cls(pnl)}" data-col="net"><strong>${fmt(pnl)}</strong></td>
         <td>${closeBtn}</td></tr>`;
@@ -3302,7 +3302,7 @@ async function updatePnlOnly(){
       const pnl=grossPnl-fee;
       const grossTd=row.querySelector('[data-col="gross"]');
       const netTd=row.querySelector('[data-col="net"]');
-      if(grossTd){grossTd.className=cls(grossPnl);grossTd.style.opacity='0.45';grossTd.textContent=fmt(grossPnl)}
+      if(grossTd){grossTd.className=cls(grossPnl);grossTd.textContent=fmt(grossPnl)}
       if(netTd){netTd.className=cls(pnl);netTd.innerHTML='<strong>'+fmt(pnl)+'</strong>'}
     }
     _posCache=pos;
@@ -3351,7 +3351,7 @@ async function loadTrades(page){
         <td style="color:var(--muted);font-size:12px">${qty}</td>
         <td style="color:var(--muted)">${t.entry_price||'-'}</td><td style="color:var(--muted)">${t.exit_price||'-'}</td>
         <td style="font-size:12px;color:var(--muted)">$${psFmt}</td>
-        <td class="${cls(p)}" style="opacity:0.45">${p?p.toFixed(2):'-'}</td>
+        <td class="${cls(p)}">${p?p.toFixed(2):'-'}</td>
         <td class="${cls(netPnl)}"><strong>${p?netPnl.toFixed(2):'-'}</strong></td>
         <td style="color:var(--muted);font-size:12px">${tFmt}</td>
         <td style="color:var(--muted);font-size:11px;white-space:nowrap">${dur}</td>
