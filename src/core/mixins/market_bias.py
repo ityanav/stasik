@@ -1,5 +1,8 @@
 import logging
 import time
+from pathlib import Path
+
+import yaml
 
 from src.strategy.ai_analyst import extract_indicator_values, format_risk_text, summarize_candles
 from src.strategy.indicators import calculate_atr, detect_swing_points, detect_swing_points_zigzag
@@ -20,6 +23,24 @@ class MarketBiasMixin:
         "vol": "volume", "rsi_div": "rsi_div",
         "pivot": "pivot_bonus", "vp": "vol_profile",
     }
+
+    @staticmethod
+    def _load_combo_set(name: str) -> list | None:
+        """Load combo list from config/combos.yaml by set name."""
+        path = Path("config/combos.yaml")
+        if not path.exists():
+            return None
+        with open(path) as f:
+            data = yaml.safe_load(f) or {}
+        return data.get(name)
+
+    def _get_combo_filter(self) -> list | None:
+        """Get combo filter: from combo_set (shared file) or inline combo_filter."""
+        strat = self.config.get("strategy", {})
+        combo_set = strat.get("combo_set")
+        if combo_set:
+            return self._load_combo_set(combo_set)
+        return strat.get("combo_filter")
 
     def _check_combo(self, combo_filter: list, details: dict, signal: str, symbol: str) -> bool:
         """Check if active indicators match an allowed combo. Returns True if passed."""
@@ -173,7 +194,7 @@ class MarketBiasMixin:
                 return
 
             # Combo filter + reverse
-            combo_filter = self.config.get("strategy", {}).get("combo_filter")
+            combo_filter = self._get_combo_filter()
             combo_reverse = self.config.get("strategy", {}).get("combo_reverse", False)
             if combo_filter and not self._check_combo(combo_filter, result.details, result.signal.value, symbol):
                 return

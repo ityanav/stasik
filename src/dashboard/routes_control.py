@@ -161,21 +161,71 @@ class RouteControlMixin:
                 logger.exception("close-all error")
                 return web.json_response({"ok": False, "error": str(e)}, status=500)
         # Standalone mode
+        count = 0
+        errors = []
+
+        # 1. Close Bybit positions
         client = self._get_client()
-        if not client:
-            return web.json_response({"ok": False, "error": "No client"}, status=503)
-        try:
-            positions = client.get_positions(category="linear")
-            count = 0
-            for p in positions:
-                if p["size"] > 0:
-                    close_side = "Sell" if p["side"] == "Buy" else "Buy"
-                    client.place_order(symbol=p["symbol"], side=close_side, qty=p["size"], category="linear", reduce_only=True)
-                    count += 1
-            return web.json_response({"ok": True, "message": f"Закрыто {count} позиций"})
-        except Exception as e:
-            logger.exception("close-all error")
-            return web.json_response({"ok": False, "error": str(e)}, status=500)
+        if client:
+            try:
+                positions = client.get_positions(category="linear")
+                for p in positions:
+                    if p["size"] > 0:
+                        close_side = "Sell" if p["side"] == "Buy" else "Buy"
+                        client.place_order(symbol=p["symbol"], side=close_side, qty=p["size"], category="linear", reduce_only=True)
+                        count += 1
+            except Exception as e:
+                logger.exception("close-all Bybit error")
+                errors.append(f"Bybit: {e}")
+
+        # 2. Close TBank/Midas positions
+        for inst in _other_instances(self.config):
+            inst_name = (inst.get("name") or "").upper()
+            if not any(k in inst_name for k in ("TBANK", "MIDAS")):
+                continue
+            cfg_path = inst.get("config_path", "")
+            if not cfg_path or not Path(cfg_path).exists():
+                continue
+            try:
+                import yaml
+                from src.exchange.tbank_client import TBankClient
+                with open(cfg_path) as f:
+                    tcfg = yaml.safe_load(f)
+                tc = TBankClient(tcfg)
+                positions = tc.get_positions()
+                for p in positions:
+                    if p["size"] > 0:
+                        close_side = "Sell" if p["side"] == "Buy" else "Buy"
+                        tc.place_order(symbol=p["symbol"], side=close_side, qty=p["size"])
+                        count += 1
+            except Exception as e:
+                err_str = str(e)
+                if "30079" in err_str or "not available" in err_str.lower():
+                    errors.append(f"{inst_name}: MOEX закрыта")
+                else:
+                    logger.exception("close-all %s error", inst_name)
+                    errors.append(f"{inst_name}: {e}")
+
+        # 3. Close all open trades in all DBs
+        all_dbs = [(str(self.db.db_path), self.config.get("instance_name", "SCALP"))]
+        for inst in _other_instances(self.config):
+            all_dbs.append((inst.get("db_path", ""), inst.get("name", "")))
+        for db_path, db_inst in all_dbs:
+            if not db_path or not Path(db_path).exists():
+                continue
+            try:
+                async with aiosqlite.connect(db_path) as db:
+                    await db.execute(
+                        "UPDATE trades SET status='closed', closed_at=? WHERE status='open'",
+                        (datetime.now(timezone(timedelta(hours=3))).strftime("%Y-%m-%dT%H:%M:%S.%f"),))
+                    await db.commit()
+            except Exception:
+                logger.warning("close-all: failed to close trades in DB %s", db_path)
+
+        msg = f"Закрыто {count} позиций"
+        if errors:
+            msg += " (ошибки: " + "; ".join(errors) + ")"
+        return web.json_response({"ok": True, "message": msg})
 
     async def _api_double_position(self, request: web.Request) -> web.Response:
         """Open a new position with 2x size in the same direction."""

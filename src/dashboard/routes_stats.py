@@ -4,9 +4,54 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import aiosqlite
+import yaml
 from aiohttp import web
 
 logger = logging.getLogger(__name__)
+
+# Combo type detection — load combo sets from config/combos.yaml
+_COMBO_KEY_MAP = {
+    "fib_zone": "fib", "liq_sweep": "sweep", "fvg": "fvg",
+    "order_block": "ob", "cluster_bonus": "cluster",
+    "cum_delta": "cd", "ote_bonus": "ote", "murray": "mm",
+    "displacement": "mom", "volume": "vol", "rsi_div": "rsi_div",
+    "pivot_bonus": "pivot", "vol_profile": "vp",
+}
+_ALL_DETAIL_KEYS = list(_COMBO_KEY_MAP.keys())
+
+
+def _load_combo_sets() -> dict[str, list]:
+    """Load combo sets from config/combos.yaml."""
+    path = Path("config/combos.yaml")
+    if not path.exists():
+        return {}
+    try:
+        with open(path) as f:
+            return yaml.safe_load(f) or {}
+    except Exception:
+        return {}
+
+
+def _get_combo_type(details_json: str | None) -> str:
+    """Determine combo type ('lev' or 'shakal') from signal_scores details JSON."""
+    if not details_json:
+        return "lev"
+    try:
+        import json
+        d = json.loads(details_json)
+        active = frozenset(
+            _COMBO_KEY_MAP[k] for k in _ALL_DETAIL_KEYS if d.get(k, 0) != 0
+        )
+        sets = _load_combo_sets()
+        # Reverse map: short name → internal key (for combo definitions)
+        fwd = {v: k for k, v in _COMBO_KEY_MAP.items()}
+        for set_name, combos in sets.items():
+            allowed = [frozenset(x for x in combo) for combo in combos]
+            if active in allowed:
+                return set_name
+        return "lev"
+    except Exception:
+        return "lev"
 
 
 def _get_db_path(live_path: str, source: str) -> str:
@@ -244,7 +289,56 @@ class RouteStatsMixin:
         if has_next:
             page_trades = page_trades[:per_page]
 
+        # Enrich with combo_type from signal_scores
+        await self._enrich_combo_type(page_trades, source)
+
         return web.json_response({"trades": page_trades, "page": page, "has_next": has_next})
+
+    async def _enrich_combo_type(self, trades: list[dict], source: str = "live"):
+        """Add combo_type ('lev'/'shakal') to trades by looking up signal_scores."""
+        # Group trade IDs by DB path
+        db_trades: dict[str, list[dict]] = {}
+        instance_name = self.config.get("instance_name", "SCALP")
+        for t in trades:
+            inst = (t.get("instance") or "").upper()
+            if inst == instance_name.upper() or not inst:
+                db_path = _get_db_path(str(self.db.db_path), source)
+            else:
+                found = False
+                for oi in _other_instances(self.config):
+                    if oi.get("name", "").upper() == inst:
+                        db_path = _get_db_path(oi.get("db_path", ""), source)
+                        found = True
+                        break
+                if not found:
+                    t["combo_type"] = "lev"
+                    continue
+            db_trades.setdefault(db_path, []).append(t)
+
+        for db_path, group in db_trades.items():
+            if not Path(db_path).exists():
+                for t in group:
+                    t["combo_type"] = "lev"
+                continue
+            ids = [t["id"] for t in group if t.get("id")]
+            if not ids:
+                for t in group:
+                    t["combo_type"] = "lev"
+                continue
+            try:
+                async with aiosqlite.connect(db_path) as db:
+                    placeholders = ",".join("?" * len(ids))
+                    cur = await db.execute(
+                        f"SELECT trade_id, details FROM signal_scores WHERE trade_id IN ({placeholders})",
+                        ids,
+                    )
+                    rows = await cur.fetchall()
+                    score_map = {r[0]: r[1] for r in rows}
+                for t in group:
+                    t["combo_type"] = _get_combo_type(score_map.get(t.get("id")))
+            except Exception:
+                for t in group:
+                    t["combo_type"] = "lev"
 
     async def _api_pnl(self, request: web.Request) -> web.Response:
         days = int(request.query.get("days", "30"))
@@ -414,11 +508,12 @@ class RouteStatsMixin:
                     async with aiosqlite.connect(main_archive) as db:
                         db.row_factory = aiosqlite.Row
                         cur = await db.execute(
-                            "SELECT symbol, side, entry_price, qty, stop_loss, take_profit, partial_closed, opened_at FROM trades WHERE status = 'open' ORDER BY opened_at DESC"
+                            "SELECT id, symbol, side, entry_price, qty, stop_loss, take_profit, partial_closed, opened_at FROM trades WHERE status = 'open' ORDER BY opened_at DESC"
                         )
                         rows = await cur.fetchall()
                         for r in rows:
                             positions.append({
+                                "id": r["id"],
                                 "symbol": r["symbol"],
                                 "side": r["side"],
                                 "size": float(r["qty"]),
@@ -437,6 +532,7 @@ class RouteStatsMixin:
             main_open = await self.db.get_open_trades()
             for t in main_open:
                 positions.append({
+                    "id": t["id"],
                     "symbol": t["symbol"],
                     "side": t["side"],
                     "size": float(t["qty"]),
@@ -458,11 +554,12 @@ class RouteStatsMixin:
                     async with aiosqlite.connect(db_path) as db:
                         db.row_factory = aiosqlite.Row
                         cur = await db.execute(
-                            "SELECT symbol, side, entry_price, qty, stop_loss, take_profit, partial_closed, opened_at FROM trades WHERE status = 'open' ORDER BY opened_at DESC"
+                            "SELECT id, symbol, side, entry_price, qty, stop_loss, take_profit, partial_closed, opened_at FROM trades WHERE status = 'open' ORDER BY opened_at DESC"
                         )
                         rows = await cur.fetchall()
                         for r in rows:
                             positions.append({
+                                "id": r["id"],
                                 "symbol": r["symbol"],
                                 "side": r["side"],
                                 "size": float(r["qty"]),
@@ -564,7 +661,15 @@ class RouteStatsMixin:
             else:
                 pos["tp_pnl"] = None
 
+        # Enrich with combo_type
+        await self._enrich_combo_type_positions(positions, source)
+
         return web.json_response(positions)
+
+    async def _enrich_combo_type_positions(self, positions: list[dict], source: str = "live"):
+        """Add combo_type to open positions from signal_scores."""
+        # Reuse _enrich_combo_type — positions have same structure (id, instance)
+        await self._enrich_combo_type(positions, source)
 
     async def _api_pair_pnl(self, request: web.Request) -> web.Response:
         """Per-pair PnL across all instances."""

@@ -1,0 +1,14 @@
+# Combo sets — shared between instances
+# Лев 🦁 — прибыльные комбинации (прямой вход)
+lev:
+  - [fib, fvg, sweep]
+  - [cluster, fib, fvg]
+  - [cluster, fib, ob, sweep]
+
+# Шакал 🐺 — убыточные комбинации (вход в обратную сторону)
+shakal:
+  - [cd, cluster, fib, mom, ote]
+  - [cluster, fib, fvg, mm, sweep]
+  - [cluster, fib, ote, sweep]
+  - [cluster, fib, ob]
+  - [cluster, fib, sweep]

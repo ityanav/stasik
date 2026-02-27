@@ -43,12 +43,7 @@ strategy:
   orderbook_enabled: false
   patterns_enabled: false
   reversal_confirmation: false
-  combo_filter:
-    - [fib, fvg, sweep]
-    - [cluster, fib, fvg]
-    - [cluster, fib, ob, sweep]
-    - [cluster, fib, ob]
-    - [cluster, fib, sweep]
+  combo_set: lev              # config/combos.yaml → lev
   macd_fast: 12
   macd_slow: 26
   macd_signal: 9

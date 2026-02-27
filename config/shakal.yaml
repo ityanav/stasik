@@ -43,12 +43,7 @@ strategy:
   orderbook_enabled: false
   patterns_enabled: false
   reversal_confirmation: false
-  # Contrarian combos — these are losing combos, so we flip direction
-  combo_filter:
-    - [cd, cluster, fib, mom, ote]
-    - [cluster, fib, fvg, mm, sweep]
-    - [cluster, fib, ote, sweep]
-    - [cluster, fib, sweep]
+  combo_set: shakal           # config/combos.yaml → shakal
   combo_reverse: true        # ГИЕНА: open in opposite direction
   combo_reverse_size: 0.3    # 30% of normal position size
   macd_fast: 12
