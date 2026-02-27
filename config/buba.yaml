@@ -98,7 +98,6 @@ risk:
   commission_rate: 0.055
   max_margin_usdt: 20000
   min_tp_net: 0
-  stale_timeout_min: 60             # close if not in profit after 60 min (1H TF)
   cooldown_after_loss: 30   # 30 min cooldown (half a candle on 1H)
   stop_loss: 3.0
   take_profit: 6.0

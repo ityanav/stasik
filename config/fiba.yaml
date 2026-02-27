@@ -105,7 +105,6 @@ risk:
   commission_rate: 0.055
   max_margin_usdt: 120000            # Max initial margin for this instance ($)
   min_tp_net: 0
-  stale_timeout_min: 15             # close if not in profit after 15 min
   cooldown_after_loss: 5
   stop_loss: 1.5
   take_profit: 4.0
