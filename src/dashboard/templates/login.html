@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="ru"><head>
+<meta charset="utf-8">
+<title>Stasik — Вход</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&display=swap" rel="stylesheet">
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{
+  font-family:'Share Tech Mono','JetBrains Mono',monospace;
+  background:#0a0a1a;
+  background-image:
+    linear-gradient(rgba(0,229,255,0.03) 1px,transparent 1px),
+    linear-gradient(90deg,rgba(0,229,255,0.03) 1px,transparent 1px);
+  background-size:40px 40px;
+  min-height:100vh;display:flex;align-items:center;justify-content:center;
+  color:#e0e0f0;
+}
+.login-box{
+  background:#111128;
+  border:1px solid #1a1a3a;
+  border-radius:20px;padding:40px 36px;width:100%;max-width:400px;
+  box-shadow:0 4px 24px rgba(0,0,0,0.4),0 0 40px rgba(0,229,255,0.05);
+  transition:box-shadow 0.3s;
+}
+.login-box:hover{box-shadow:0 4px 24px rgba(0,0,0,0.4),0 0 60px rgba(0,229,255,0.12)}
+.logo{text-align:center;margin-bottom:28px}
+.logo .cyber-logo{width:72px;height:72px;margin:0 auto 12px;filter:drop-shadow(0 0 12px rgba(0,229,255,0.6)) drop-shadow(0 0 24px rgba(191,0,255,0.3));animation:logoPulse 3s ease-in-out infinite}
+@keyframes logoPulse{0%,100%{filter:drop-shadow(0 0 12px rgba(0,229,255,0.6)) drop-shadow(0 0 24px rgba(191,0,255,0.3))}50%{filter:drop-shadow(0 0 20px rgba(0,229,255,0.9)) drop-shadow(0 0 40px rgba(191,0,255,0.5))}}
+.logo h1{font-size:22px;font-weight:700;color:#e0e0f0;letter-spacing:2px;text-shadow:0 0 10px rgba(0,229,255,0.5)}
+.logo p{font-size:13px;color:#667;margin-top:4px}
+.error{
+  background:rgba(255,34,85,0.12);color:#ff2255;
+  padding:10px 14px;border-radius:10px;font-size:13px;
+  margin-bottom:16px;text-align:center;border:1px solid rgba(255,34,85,0.25);
+}
+label{font-size:12px;color:#667;text-transform:uppercase;letter-spacing:1px;display:block;margin-bottom:6px}
+input[type=text],input[type=password]{
+  width:100%;padding:12px 14px;border:1px solid #1a1a3a;
+  border-radius:10px;background:#0a0a1a;color:#e0e0f0;
+  font-size:15px;font-family:inherit;outline:none;transition:all 0.2s;margin-bottom:16px;
+}
+input:focus{border-color:#00e5ff;box-shadow:0 0 10px rgba(0,229,255,0.2)}
+.captcha-row{display:flex;align-items:center;gap:10px;margin-bottom:16px}
+.captcha-q{
+  background:rgba(0,229,255,0.08);border:1px solid rgba(0,229,255,0.25);
+  border-radius:10px;padding:10px 16px;font-size:16px;font-weight:600;
+  color:#00e5ff;white-space:nowrap;
+}
+.captcha-row input{margin-bottom:0;flex:1}
+button{
+  width:100%;padding:13px;border:none;border-radius:10px;
+  background:linear-gradient(135deg,#00e5ff,#bf00ff);
+  color:#fff;font-size:15px;font-weight:600;cursor:pointer;font-family:inherit;
+  transition:opacity 0.2s,transform 0.1s,box-shadow 0.2s;
+  text-shadow:0 1px 2px rgba(0,0,0,0.3);
+}
+button:hover{opacity:0.9;box-shadow:0 0 20px rgba(0,229,255,0.3)}
+button:active{transform:scale(0.98)}
+button:disabled{opacity:0.4;cursor:not-allowed}
+</style>
+</head><body>
+<div class="login-box">
+  <div class="logo">
+    <svg class="cyber-logo" viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg">
+      <defs>
+        <linearGradient id="cg" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#00e5ff"/><stop offset="100%" stop-color="#bf00ff"/></linearGradient>
+        <filter id="glow"><feGaussianBlur stdDeviation="2" result="blur"/><feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
+      </defs>
+      <polygon points="50,8 90,28 90,72 50,92 10,72 10,28" fill="none" stroke="url(#cg)" stroke-width="2" filter="url(#glow)"/>
+      <polygon points="50,16 82,32 82,68 50,84 18,68 18,32" fill="rgba(0,229,255,0.05)" stroke="url(#cg)" stroke-width="0.5"/>
+      <rect x="28" y="38" width="16" height="10" rx="2" fill="#00e5ff" opacity="0.9"><animate attributeName="opacity" values="0.9;0.4;0.9" dur="2s" repeatCount="indefinite"/></rect>
+      <rect x="56" y="38" width="16" height="10" rx="2" fill="#bf00ff" opacity="0.9"><animate attributeName="opacity" values="0.9;0.4;0.9" dur="2s" begin="0.3s" repeatCount="indefinite"/></rect>
+      <line x1="30" y1="58" x2="70" y2="58" stroke="#00e5ff" stroke-width="1" opacity="0.4"/>
+      <line x1="35" y1="62" x2="65" y2="62" stroke="#bf00ff" stroke-width="1" opacity="0.3"/>
+      <line x1="40" y1="66" x2="60" y2="66" stroke="#00e5ff" stroke-width="1" opacity="0.2"/>
+      <circle cx="50" cy="50" r="3" fill="none" stroke="url(#cg)" stroke-width="0.5" opacity="0.6"><animate attributeName="r" values="3;5;3" dur="3s" repeatCount="indefinite"/></circle>
+    </svg>
+    <h1>Stasik Trading Bot</h1>
+    <p>Авторизация в панели управления</p>
+  </div>
+  {{error}}
+  <form method="POST" action="/login">
+    <label>Логин</label>
+    <input type="text" name="username" autocomplete="username" required {{blocked}}>
+    <label>Пароль</label>
+    <input type="password" name="password" autocomplete="current-password" required {{blocked}}>
+    <label>Капча: сколько будет {{captcha_question}} ?</label>
+    <div class="captcha-row">
+      <div class="captcha-q">{{captcha_question}} = ?</div>
+      <input type="text" name="captcha" inputmode="numeric" required {{blocked}}>
+    </div>
+    <input type="hidden" name="captcha_token" value="{{captcha_token}}">
+    <button type="submit" {{blocked}}>Войти</button>
+  </form>
+</div>
+</body></html>
