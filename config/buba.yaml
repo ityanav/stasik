@@ -37,13 +37,13 @@ strategy:
   htf_min_sma_dev: 0.0
   htf_score_min: 0
   market_bias: false
-  fng_extreme_greed: 100
-  fng_extreme_fear: 0
+  fng_extreme_greed: 75            # block BUY above 75 (Extreme Greed)
+  fng_extreme_fear: 25             # block SELL below 25 (Extreme Fear)
   funding_rate_max: 999
   orderbook_enabled: false
   patterns_enabled: false
   reversal_confirmation: false
-  combo_set: lev              # config/combos.yaml → lev
+  avoid_asia: true              # kill zone: skip Asian session (21-08 UTC)
   macd_fast: 12
   macd_slow: 26
   macd_signal: 9
@@ -51,6 +51,8 @@ strategy:
 smc:
   swing_lookback: 5
   swing_min_distance: 10
+  fib_required: true           # no entry without Fibonacci zone
+  fib_premium_only: true       # only premium zone (0.618-0.786)
   fib_premium_min: 0.618
   fib_premium_max: 0.786
   fib_standard_min: 0.382
@@ -96,6 +98,7 @@ risk:
   commission_rate: 0.055
   max_margin_usdt: 20000
   min_tp_net: 0
+  stale_timeout_min: 60             # close if not in profit after 60 min (1H TF)
   cooldown_after_loss: 30   # 30 min cooldown (half a candle on 1H)
   stop_loss: 3.0
   take_profit: 6.0

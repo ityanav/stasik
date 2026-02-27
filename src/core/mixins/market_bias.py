@@ -208,6 +208,19 @@ class MarketBiasMixin:
             if result.signal == Signal.HOLD:
                 return
 
+            # Sentiment filter: Fear & Greed Index (crypto only)
+            if self.exchange_type == "bybit":
+                fng_value = await self._get_fear_greed()
+                if fng_value is not None:
+                    if fng_value > self._fng_extreme_greed and result.signal == Signal.BUY:
+                        logger.info("FnG фильтр: отклонён BUY %s (FnG=%d > %d — Extreme Greed)",
+                                    symbol, fng_value, self._fng_extreme_greed)
+                        return
+                    if fng_value < self._fng_extreme_fear and result.signal == Signal.SELL:
+                        logger.info("FnG фильтр: отклонён SELL %s (FnG=%d < %d — Extreme Fear)",
+                                    symbol, fng_value, self._fng_extreme_fear)
+                        return
+
             # Combo filter + reverse
             combo_filter = self._get_combo_filter()
             combo_reverse = self.config.get("strategy", {}).get("combo_reverse", False)

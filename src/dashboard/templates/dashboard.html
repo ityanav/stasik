@@ -45,6 +45,20 @@ body{font-family:'Inter',system-ui,-apple-system,sans-serif;background:var(--bg)
 .hsep{color:var(--muted)}
 .hmarket{display:flex;align-items:center;gap:5px}
 .hm-label{color:var(--muted);font-size:12px}
+.sessions-bar{
+  display:flex;gap:12px;align-items:center;margin-top:4px;flex-wrap:wrap;
+}
+.session-item{
+  display:flex;align-items:center;gap:4px;font-size:11px;
+  padding:3px 8px;border-radius:6px;background:var(--bg3);border:1px solid var(--border);
+  font-variant-numeric:tabular-nums;
+}
+.session-item .sess-flag{font-size:13px}
+.session-item .sess-name{color:var(--muted);font-weight:500}
+.session-item .sess-time{color:var(--text);font-weight:600}
+.session-item .sess-msk{color:var(--text-secondary);font-size:10px}
+.session-item.active{border-color:var(--green);background:rgba(34,197,94,0.06)}
+.session-item.active .sess-name{color:var(--green)}
 .header-right{display:flex;align-items:center;gap:16px;flex-shrink:0}
 #status-badge{
   padding:5px 14px;border-radius:20px;font-size:12px;font-weight:600;letter-spacing:0.5px;
@@ -410,6 +424,27 @@ body.archive-mode .header{border-bottom-color:rgba(245,158,11,0.2)}
       <span class="market-hours" id="moex-hours"></span>
       <span class="market-bal" id="tbank-bal">—</span>
       <span class="today-pnl" id="tbank-pnl"></span>
+    </div>
+    <span class="hsep">|</span>
+    <div class="sessions-bar" id="sessions-bar">
+      <div class="session-item" id="sess-asia">
+        <span class="sess-flag">🌏</span>
+        <span class="sess-name">Asia</span>
+        <span class="sess-time" id="sess-asia-time">--:--</span>
+        <span class="sess-msk" id="sess-asia-msk"></span>
+      </div>
+      <div class="session-item" id="sess-london">
+        <span class="sess-flag">🇬🇧</span>
+        <span class="sess-name">London</span>
+        <span class="sess-time" id="sess-london-time">--:--</span>
+        <span class="sess-msk" id="sess-london-msk"></span>
+      </div>
+      <div class="session-item" id="sess-ny">
+        <span class="sess-flag">🇺🇸</span>
+        <span class="sess-name">NY</span>
+        <span class="sess-time" id="sess-ny-time">--:--</span>
+        <span class="sess-msk" id="sess-ny-msk"></span>
+      </div>
     </div>
   </div>
   <div class="header-right">
@@ -1527,6 +1562,25 @@ function updateMarketBar(){
     if(t<mainOpen){moexSt.textContent='Закрыта';moexHr.textContent='откроется в 10:00'}
     else{moexSt.textContent='Закрыта';moexHr.textContent='откроется в 10:00'}
   }
+  // Session clocks: Asia (Tokyo), London, New York
+  const tokyo=new Date(now.toLocaleString('en-US',{timeZone:'Asia/Tokyo'}));
+  const london=new Date(now.toLocaleString('en-US',{timeZone:'Europe/London'}));
+  const ny=new Date(now.toLocaleString('en-US',{timeZone:'America/New_York'}));
+  document.getElementById('sess-asia-time').textContent=pad(tokyo.getHours())+':'+pad(tokyo.getMinutes());
+  document.getElementById('sess-london-time').textContent=pad(london.getHours())+':'+pad(london.getMinutes());
+  document.getElementById('sess-ny-time').textContent=pad(ny.getHours())+':'+pad(ny.getMinutes());
+  // Trading windows in MSK
+  // Asia: 02:00-11:00 MSK (avoid), London: 10:00-19:00 MSK, NY: 16:00-01:00 MSK
+  document.getElementById('sess-asia-msk').textContent='02-11 МСК';
+  document.getElementById('sess-london-msk').textContent='10-19 МСК';
+  document.getElementById('sess-ny-msk').textContent='16-01 МСК';
+  // Highlight active sessions
+  const asiaH=tokyo.getHours();
+  const londonH=london.getHours();
+  const nyH=ny.getHours();
+  document.getElementById('sess-asia').className='session-item'+(asiaH>=9&&asiaH<18?' active':'');
+  document.getElementById('sess-london').className='session-item'+(londonH>=8&&londonH<16?' active':'');
+  document.getElementById('sess-ny').className='session-item'+(nyH>=8&&nyH<17?' active':'');
 }
 updateMarketBar();setInterval(updateMarketBar,10000);
 

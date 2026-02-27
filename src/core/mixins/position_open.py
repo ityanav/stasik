@@ -289,7 +289,7 @@ class PositionOpenMixin:
         # Score breakdown: which indicators contributed
         if details:
             active = [f"{k}={v:+d}" for k, v in details.items()
-                      if isinstance(v, (int, float)) and v != 0]
+                      if isinstance(v, int) and v != 0]
             if active:
                 msg += f"\n   [{score}] {' '.join(active)}"
 

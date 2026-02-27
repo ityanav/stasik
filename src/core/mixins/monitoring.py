@@ -1,7 +1,10 @@
 import asyncio
 import logging
+from datetime import datetime, timedelta, timezone
 
 logger = logging.getLogger(__name__)
+
+MSK = timezone(timedelta(hours=3))
 
 
 class MonitoringMixin:
@@ -123,6 +126,12 @@ class MonitoringMixin:
                             await self._check_db_take_profit(trade)
                         except Exception:
                             logger.exception("TP poll error %s", trade.get("symbol"))
+                # Fast trade timeout: close if not in profit after N minutes
+                stale_timeout = getattr(self, '_stale_timeout_min', 0)
+                if stale_timeout > 0:
+                    for trade in open_trades:
+                        await self._check_stale_trade(trade, stale_timeout)
+
                 # Detect manually closed positions (every 6th poll = ~30s)
                 self._reconcile_poll_counter += 1
                 if open_trades and self._reconcile_poll_counter >= 6:
@@ -171,3 +180,57 @@ class MonitoringMixin:
                                    exch_sizes[key], db_qty[key], trade["side"], trade["symbol"])
         except Exception:
             logger.exception("_detect_closed_positions error")
+
+    async def _check_stale_trade(self, trade: dict, timeout_min: int):
+        """Close position if not in profit after timeout_min minutes."""
+        opened_at = trade.get("opened_at")
+        if not opened_at:
+            return
+        try:
+            opened_dt = datetime.fromisoformat(opened_at)
+            if opened_dt.tzinfo is None:
+                opened_dt = opened_dt.replace(tzinfo=MSK)
+            age_sec = (datetime.now(timezone.utc) - opened_dt).total_seconds()
+            if age_sec < timeout_min * 60:
+                return
+
+            symbol = trade["symbol"]
+            side = trade["side"]
+            entry = trade["entry_price"]
+
+            # Get current price
+            if self.exchange_type == "tbank":
+                cur_price = self.client.get_last_price(symbol)
+            else:
+                cur_price = self._ws_prices.get(symbol) or self.client.get_last_price(symbol, category="linear")
+
+            if not cur_price or cur_price <= 0:
+                return
+
+            # Check if in profit (gross, before commission)
+            if side == "Buy":
+                in_profit = cur_price > entry
+            else:
+                in_profit = cur_price < entry
+
+            if in_profit:
+                return
+
+            # Not in profit after timeout — close
+            age_min = int(age_sec // 60)
+            inst = getattr(self, 'instance_name', 'BOT')
+            logger.info("%s Stale timeout: %s %s (age=%dm, entry=%.4f, cur=%.4f) — closing",
+                        inst, side, symbol, age_min, entry, cur_price)
+
+            close_side = "Sell" if side == "Buy" else "Buy"
+            qty = trade["qty"]
+            try:
+                if self.exchange_type == "tbank":
+                    self.client.place_order(symbol=symbol, side=close_side, qty=qty)
+                else:
+                    self.client.place_order(symbol=symbol, side=close_side, qty=qty,
+                                            category="linear", reduce_only=True)
+            except Exception:
+                logger.exception("Failed to close stale trade %s %s", side, symbol)
+        except Exception:
+            logger.exception("_check_stale_trade error for trade #%d", trade.get("id", 0))

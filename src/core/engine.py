@@ -109,6 +109,12 @@ class TradingEngine(
             self._trading_hour_start = 0
             self._trading_hour_end = 24
 
+        # Kill zone: avoid Asian session (21:00-08:00 UTC = 00:00-11:00 MSK)
+        self._avoid_asia: bool = config.get("strategy", {}).get("avoid_asia", False)
+
+        # Fast trade timeout: close if not in profit after N minutes (0 = disabled)
+        self._stale_timeout_min: int = config.get("risk", {}).get("stale_timeout_min", 0)
+
         # Swing mode: candle dedup
         candle_sec = self._timeframe_to_seconds(str(config["trading"]["timeframe"]))
         self._is_swing = candle_sec >= 3600
@@ -298,6 +304,12 @@ class TradingEngine(
             logger.info("Вне торговой сессии (UTC %d:00, окно %d-%d). Мониторинг позиций продолжается.",
                         current_hour, self._trading_hour_start, self._trading_hour_end)
             return
+
+        # Kill zone: avoid Asian session (21:00-08:00 UTC)
+        if self._avoid_asia:
+            if current_hour >= 21 or current_hour < 8:
+                logger.info("Kill Zone: Азия (UTC %d:00). Пропуск сигналов.", current_hour)
+                return
 
         categories = self._get_categories()
 

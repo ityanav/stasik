@@ -44,12 +44,6 @@ strategy:
   orderbook_enabled: false
   patterns_enabled: false
   reversal_confirmation: false
-  combo_filter:
-    - [fib, fvg, sweep]
-    - [cluster, fib, fvg]
-    - [cluster, fib, ob, sweep]
-    - [cluster, fib, ob]
-    - [cluster, fib, sweep]
   macd_fast: 12
   macd_slow: 26
   macd_signal: 9
@@ -57,6 +51,8 @@ strategy:
 smc:
   swing_lookback: 5
   swing_min_distance: 10
+  fib_required: true           # no entry without Fibonacci zone
+  fib_premium_only: true       # only premium zone (0.618-0.786)
   fib_premium_min: 0.618
   fib_premium_max: 0.786
   fib_standard_min: 0.382

@@ -623,6 +623,10 @@ class SMCGenerator:
         self.murray_period = smc.get("murray_period", 64)
         self.murray_proximity_pct = smc.get("murray_proximity_pct", 0.3)
 
+        # Fib strictness
+        self.fib_required = smc.get("fib_required", False)
+        self.fib_premium_only = smc.get("fib_premium_only", False)
+
         # ADX max (optional regime filter)
         self.adx_max = smc.get("adx_max", 0)
 
@@ -635,6 +639,7 @@ class SMCGenerator:
 
         # Scoring
         self.min_score = strat.get("min_score", 3)
+        self.short_bias = strat.get("short_bias", 0)  # bonus to SELL struct score
 
         # EMA for HTF trend
         self.ema_fast = strat.get("ema_fast", 9)
@@ -717,12 +722,12 @@ class SMCGenerator:
         if direction == "bullish":
             if premium_low <= close <= premium_high:
                 return 2, "premium_buy"
-            if standard_low <= close <= standard_high:
+            if not self.fib_premium_only and standard_low <= close <= standard_high:
                 return 1, "standard_buy"
         else:
             if premium_low <= close <= premium_high:
                 return -2, "premium_sell"
-            if standard_low <= close <= standard_high:
+            if not self.fib_premium_only and standard_low <= close <= standard_high:
                 return -1, "standard_sell"
         return 0, ""
 
@@ -914,6 +919,17 @@ class SMCGenerator:
                 details["mm_price"] = mm["nearest_price"]
         scores["murray"] = mm_score
 
+        # ── Fib required gate ──
+        if self.fib_required and scores["fib_zone"] == 0:
+            logger.info(
+                "%s %s: HOLD (fib_required, no fib zone)",
+                self.instance_name, symbol,
+            )
+            return SignalResult(
+                signal=Signal.HOLD, score=0,
+                details={**details, **scores, "fib_gate": True},
+            )
+
         # ── Split into STRUCTURE vs MOMENTUM ──
         # Structure: WHERE to enter (determines signal direction)
         structure_keys = ("fib_zone", "liq_sweep", "fvg", "order_block",
@@ -923,6 +939,11 @@ class SMCGenerator:
 
         struct_score = sum(scores[k] for k in structure_keys if k in scores)
         mom_score = sum(scores[k] for k in momentum_keys if k in scores)
+
+        # Short bias: bonus to bearish structure score
+        if self.short_bias and struct_score < 0:
+            struct_score -= self.short_bias  # make negative score more negative
+            details["short_bias"] = self.short_bias
 
         # Signal from structure only
         if struct_score >= self.min_score:
