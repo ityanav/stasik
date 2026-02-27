@@ -65,6 +65,7 @@ class PositionOpenMixin:
         # SMC SL/TP: behind swept_level + 0.5 ATR buffer; TP from Fib extension
         smc_sl = None
         smc_tp = None
+        inst = getattr(self, 'instance_name', 'BOT')
         if isinstance(self.signal_gen, SMCGenerator) and details:
             sweep_level = details.get("sweep_level", 0)
             tp1_level = details.get("tp1_level", 0)
@@ -82,8 +83,8 @@ class PositionOpenMixin:
                         smc_sl = round(price - min_sl_dist, 6)
                     else:
                         smc_sl = round(price + min_sl_dist, 6)
-                    logger.info("FIBA SL widened: %s %.6f → %.6f (min 1 ATR=%.6f)",
-                                symbol, sweep_level - atr_buf if side == "Buy" else sweep_level + atr_buf,
+                    logger.info("%s SL widened: %s %.6f → %.6f (min 1 ATR=%.6f)",
+                                inst, symbol, sweep_level - atr_buf if side == "Buy" else sweep_level + atr_buf,
                                 smc_sl, min_sl_dist)
             if tp1_level and tp1_level > 0:
                 smc_tp = round(tp1_level, 6)
@@ -93,20 +94,22 @@ class PositionOpenMixin:
                     if side == "Buy":
                         atr_cap = round(price + max_tp_dist, 6)
                         if smc_tp > atr_cap:
-                            logger.info("FIBA TP capped: %s %.6f → %.6f (ATR cap %.2f%%)",
+                            logger.info("%s TP capped: %s %.6f → %.6f (ATR cap %.2f%%)",
+                                        inst,
                                         symbol, smc_tp, atr_cap, max_tp_dist / price * 100)
                             smc_tp = atr_cap
                     else:
                         atr_cap = round(price - max_tp_dist, 6)
                         if smc_tp < atr_cap:
-                            logger.info("FIBA TP capped: %s %.6f → %.6f (ATR cap %.2f%%)",
+                            logger.info("%s TP capped: %s %.6f → %.6f (ATR cap %.2f%%)",
+                                        inst,
                                         symbol, smc_tp, atr_cap, max_tp_dist / price * 100)
                             smc_tp = atr_cap
 
         if smc_sl is not None:
             sl = smc_sl
             sl_dist_pct = abs(price - sl) / price * 100
-            sl_source = f"FIBA:sweep({sl_dist_pct:.2f}%)"
+            sl_source = f"SMC:sweep({sl_dist_pct:.2f}%)"
         elif ai_sl_pct is not None and 0.3 <= ai_sl_pct <= 5.0:
             sl = price * (1 - ai_sl_pct / 100) if side == "Buy" else price * (1 + ai_sl_pct / 100)
             sl = round(sl, 6)
@@ -133,7 +136,7 @@ class PositionOpenMixin:
         if smc_tp is not None:
             tp = smc_tp
             tp_dist_pct = abs(tp - price) / price * 100
-            tp_source = f"FIBA:fib_ext({tp_dist_pct:.2f}%)"
+            tp_source = f"SMC:fib_ext({tp_dist_pct:.2f}%)"
         elif ai_tp_pct is not None and 0.5 <= ai_tp_pct <= 10.0:
             tp = price * (1 + ai_tp_pct / 100) if side == "Buy" else price * (1 - ai_tp_pct / 100)
             tp = round(tp, 6)

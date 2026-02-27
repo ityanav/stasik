@@ -560,6 +560,7 @@ class SMCGenerator:
     def __init__(self, config: dict):
         smc = config.get("smc", {})
         strat = config.get("strategy", {})
+        self.instance_name = config.get("instance_name", "BOT")
 
         # Swing detection
         self.swing_lookback = smc.get("swing_lookback", 5)
@@ -745,7 +746,7 @@ class SMCGenerator:
         if self.adx_max > 0 and len(df) >= 30:
             adx = calculate_adx(df, period=14)
             if adx > self.adx_max:
-                logger.info("FIBA %s: HOLD (ADX=%.1f > %d)", symbol, adx, self.adx_max)
+                logger.info("%s %s: HOLD (ADX=%.1f > %d)", self.instance_name, symbol, adx, self.adx_max)
                 return SignalResult(signal=Signal.HOLD, score=0,
                                     details={"regime_filter": True, "adx": round(adx, 1)})
 
@@ -956,8 +957,8 @@ class SMCGenerator:
         mom_str = f", mom={mom_score}" if mom_score != 0 else ""
         block_str = " [MOMENTUM BLOCK]" if momentum_blocked else ""
         logger.info(
-            "FIBA %s: %s (score=%d%s%s, fib=%d[%s], sweep=%d[%s], fvg=%d, ob=%d, cluster=%d, disp=%d, vol=%d, rsi_div=%d)",
-            symbol, signal.value, total, mom_str, block_str,
+            "%s %s: %s (score=%d%s%s, fib=%d[%s], sweep=%d[%s], fvg=%d, ob=%d, cluster=%d, disp=%d, vol=%d, rsi_div=%d)",
+            self.instance_name, symbol, signal.value, total, mom_str, block_str,
             scores["fib_zone"], fib_zone_name,
             scores["liq_sweep"], sweep["type"],
             scores["fvg"], scores["order_block"],
@@ -985,7 +986,7 @@ class SMCGenerator:
 
         symbol = df.attrs.get("symbol", "?")
         logger.info(
-            "FIBA HTF %s: %s (EMA%d=%.4f, EMA%d=%.4f, price=%.4f)",
-            symbol, trend.value, self.ema_fast, fast_val, self.ema_slow, slow_val, price,
+            "%s HTF %s: %s (EMA%d=%.4f, EMA%d=%.4f, price=%.4f)",
+            self.instance_name, symbol, trend.value, self.ema_fast, fast_val, self.ema_slow, slow_val, price,
         )
         return trend

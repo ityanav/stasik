@@ -158,7 +158,7 @@ class MarketBiasMixin:
                 self._smc_htf_structure_cache[symbol] = (swings, now)
 
                 if not swings.get("last_swing_high") or not swings.get("last_swing_low"):
-                    logger.debug("FIBA %s: no swing structure found on HTF", symbol)
+                    logger.debug("%s %s: no swing structure found on HTF", self.instance_name, symbol)
                     return
 
                 # 2. Update signal generator with HTF structure
@@ -179,7 +179,7 @@ class MarketBiasMixin:
                             self._smc_daily_klines_cache[symbol] = (daily_df, now)
                             self.signal_gen.update_pivots(symbol, daily_df)
                     except Exception:
-                        logger.debug("FIBA %s: failed to fetch daily klines for pivots", symbol)
+                        logger.debug("%s %s: failed to fetch daily klines for pivots", self.instance_name, symbol)
 
             # 3. Fetch entry TF klines (15m)
             df = self.client.get_klines(
@@ -205,6 +205,9 @@ class MarketBiasMixin:
                 old_side = side
                 side = "Sell" if side == "Buy" else "Buy"
                 logger.info("Combo reverse: %s %s → %s", symbol, old_side, side)
+                # Clear SMC levels — they're for the original direction, not reversed
+                result.details.pop("sweep_level", None)
+                result.details.pop("tp1_level", None)
 
             # 5. Check existing positions
             open_trades = await self.db.get_open_trades()
@@ -232,8 +235,8 @@ class MarketBiasMixin:
                 if len(group_symbols) >= self._max_per_group:
                     # Allow extra positions in own symbol (already in group)
                     if symbol not in group_symbols:
-                        logger.info("FIBA корреляция: отклонён %s — %d/%d символов в группе '%s'",
-                                    symbol, len(group_symbols), self._max_per_group, group)
+                        logger.info("%s корреляция: отклонён %s — %d/%d символов в группе '%s'",
+                                    self.instance_name, symbol, len(group_symbols), self._max_per_group, group)
                         return
 
             # 6. Open trade with SMC SL/TP
@@ -245,8 +248,8 @@ class MarketBiasMixin:
             if atr > 0 and price > 0:
                 atr_pct = atr / price * 100
                 if atr_pct < 0.3:
-                    logger.info("FIBA %s: skip — ATR=%.4f (%.3f%%) too small, commission would eat profits",
-                                symbol, atr, atr_pct)
+                    logger.info("%s %s: skip — ATR=%.4f (%.3f%%) too small, commission would eat profits",
+                                self.instance_name, symbol, atr, atr_pct)
                     return
 
             # Combo reverse size multiplier (e.g. 0.3 = 30% of normal size)
