@@ -147,13 +147,22 @@ class MarketBiasMixin:
 
             # Combo filter: only allow winning indicator combinations
             combo_filter = self.config.get("strategy", {}).get("combo_filter")
+            combo_reverse = self.config.get("strategy", {}).get("combo_reverse", False)
             if combo_filter:
                 _KEY_MAP = {
                     "fib": "fib_zone", "sweep": "liq_sweep", "fvg": "fvg",
                     "ob": "order_block", "cluster": "cluster_bonus",
+                    "cd": "cum_delta", "ote": "ote_bonus", "mm": "murray",
+                    "mom": "displacement", "disp": "displacement",
+                    "vol": "volume", "rsi_div": "rsi_div",
+                    "pivot": "pivot_bonus", "vp": "vol_profile",
                 }
-                _structure = set(_KEY_MAP.values())
-                active = frozenset(k for k in _structure if result.details.get(k, 0) != 0)
+                # Build check-set from combo definitions (backward compatible)
+                _check_keys = set()
+                for combo in combo_filter:
+                    for x in combo:
+                        _check_keys.add(_KEY_MAP.get(x, x))
+                active = frozenset(k for k in _check_keys if result.details.get(k, 0) != 0)
                 allowed = [frozenset(_KEY_MAP.get(x, x) for x in combo) for combo in combo_filter]
                 if active not in allowed:
                     _short = {v: k for k, v in _KEY_MAP.items()}
@@ -163,6 +172,12 @@ class MarketBiasMixin:
                     return
 
             side = "Buy" if result.signal == Signal.BUY else "Sell"
+
+            # Combo reverse: contrarian mode — flip direction
+            if combo_reverse:
+                side = "Sell" if side == "Buy" else "Buy"
+                logger.info("Combo reverse (ГИЕНА): %s %s → %s", symbol,
+                            "Sell" if side == "Buy" else "Buy", side)
 
             # 5. Check existing positions
             open_trades = await self.db.get_open_trades()

@@ -1,0 +1,137 @@
+instance_name: "GIENA"
+initial_balance: 164235
+
+database:
+  path: "/root/stasik/data/giena.db"
+
+bybit:
+  testnet: false
+  demo: true
+  api_key: "Ct24OvPFimR3vLSlcW"
+  api_secret: "CNzK2w9eQ41j4A4dszBLvvOkAH61Z5BQG9oq"
+
+trading:
+  pairs: ["BTCUSDT", "ETHUSDT", "SOLUSDT", "SUIUSDT", "APTUSDT"]
+  market_type: "futures"
+  timeframe: "15"          # 15m entry
+  htf_timeframe: "60"      # 1H structure
+  leverage: 3
+  trading_hours: [0, 24]
+  tick_interval: 60
+
+strategy:
+  strategy_mode: "smc"
+  min_score: 2             # lower threshold — combo filter does the real filtering
+  adx_min: 0
+  adx_max: 0
+  adx_period: 14
+  ema_fast: 9
+  ema_slow: 21
+  rsi_period: 14
+  bb_period: 20
+  bb_std: 2.0
+  vol_period: 20
+  vol_threshold: 1.5
+  sma_period: 25
+  htf_filter: true
+  htf_min_sma_dev: 0.0
+  htf_score_min: 0
+  market_bias: false
+  fng_extreme_greed: 100
+  fng_extreme_fear: 0
+  funding_rate_max: 999
+  orderbook_enabled: false
+  patterns_enabled: false
+  reversal_confirmation: false
+  # Contrarian combos — these are losing combos, so we flip direction
+  combo_filter:
+    - [cd, cluster, fib, mom, ote]
+    - [cluster, fib, fvg, mm, sweep]
+    - [cluster, fib, ote, sweep]
+  combo_reverse: true        # ГИЕНА: open in opposite direction
+  macd_fast: 12
+  macd_slow: 26
+  macd_signal: 9
+
+smc:
+  swing_lookback: 5
+  swing_min_distance: 10
+  fib_premium_min: 0.618
+  fib_premium_max: 0.786
+  fib_standard_min: 0.382
+  fib_standard_max: 0.618
+  sweep_lookback: 30
+  sweep_fresh_candles: 5
+  fvg_lookback: 20
+  fvg_proximity_pct: 0.5
+  displacement_body_pct: 0.3
+  displacement_vol_mult: 1.5
+  ob_lookback: 50
+  ob_proximity_pct: 1.0
+  ob_displacement_pct: 1.5
+  tp_extension_1: 1.0
+  tp_extension_2: 1.272
+  adx_max: 0
+  # Enable all indicators for combo detection
+  ote_bonus: true
+  ote_proximity_pct: 0.3
+  zigzag_enabled: true
+  zigzag_atr_period: 14
+  zigzag_atr_mult: 2.0
+  cluster_enabled: true
+  cluster_threshold_pct: 1.0
+  cluster_min_levels: 3
+  fib_pivots: false
+  fib_pivot_proximity_pct: 0.3
+  volume_profile_enabled: false
+  # Enabled for combo detection
+  cum_delta_enabled: true
+  cum_delta_lookback: 50
+  cum_delta_divergence_lookback: 20
+  murray_enabled: true
+  murray_period: 64
+  murray_proximity_pct: 0.3
+
+risk:
+  risk_per_trade: 0.5
+  max_open_positions: 4
+  max_per_symbol: 1
+  max_per_group: 2
+  commission_rate: 0.055
+  max_margin_usdt: 50000
+  min_tp_net: 0
+  cooldown_after_loss: 5
+  stop_loss: 1.5
+  take_profit: 4.0
+  atr_period: 14
+  atr_sl_multiplier: 1.0
+  atr_tp_multiplier: 2.5
+  atr_trailing_multiplier: 1.0
+  atr_sl_max: 5.0
+  atr_sl_min: 0.5
+  atr_tp_max: 5.0
+  atr_tp_min: 1.0
+  atr_trail_max: 3.0
+  atr_trail_min: 0.3
+  trailing_stop: 0
+  trailing_activation: 0
+  breakeven_activation: 0
+  max_daily_loss: 0
+  smart_exit_min: 0
+  partial_close_enabled: false
+  correlation_groups:
+    majors:
+      - BTCUSDT
+      - ETHUSDT
+    alt_l1:
+      - SOLUSDT
+      - SUIUSDT
+      - APTUSDT
+
+ai:
+  enabled: false
+
+telegram:
+  token: "7852966698:AAFA_L6ovqXtTmMO05DBZg3UYbx4DklIY7k"
+  chat_id: "885025581"
+  notify_only: true
