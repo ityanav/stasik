@@ -21,7 +21,7 @@ trading:
 
 strategy:
   strategy_mode: "smc"
-  min_score: 6              # stricter on 1H — fewer but better signals
+  min_score: 4              # stricter on 1H — fewer but better signals
   adx_min: 0
   adx_max: 0
   adx_period: 14
@@ -43,6 +43,10 @@ strategy:
   orderbook_enabled: false
   patterns_enabled: false
   reversal_confirmation: false
+  combo_filter:
+    - [fib, fvg, sweep]
+    - [cluster, fib, fvg]
+    - [cluster, fib, ob, sweep]
   macd_fast: 12
   macd_slow: 26
   macd_signal: 9
@@ -66,7 +70,7 @@ smc:
   tp_extension_1: 1.0
   tp_extension_2: 1.272
   adx_max: 0
-  ote_bonus: true
+  ote_bonus: false
   ote_proximity_pct: 0.3
   zigzag_enabled: true
   zigzag_atr_period: 14
@@ -74,26 +78,26 @@ smc:
   cluster_enabled: true
   cluster_threshold_pct: 1.0
   cluster_min_levels: 3
-  fib_pivots: true
+  fib_pivots: false
   fib_pivot_proximity_pct: 0.3
-  volume_profile_enabled: true
+  volume_profile_enabled: false
   volume_profile_bins: 50
   volume_profile_value_area_pct: 70.0
   volume_profile_proximity_pct: 0.3
-  cum_delta_enabled: true
+  cum_delta_enabled: false
   cum_delta_lookback: 50
   cum_delta_divergence_lookback: 20
-  murray_enabled: true
+  murray_enabled: false
   murray_period: 64
   murray_proximity_pct: 0.3
 
 risk:
   risk_per_trade: 1.0       # higher risk — fewer but higher conviction trades
-  max_open_positions: 2
+  max_open_positions: 4
   max_per_symbol: 1
-  max_per_group: 1
+  max_per_group: 2
   commission_rate: 0.055
-  max_margin_usdt: 10000
+  max_margin_usdt: 20000
   min_tp_net: 0
   cooldown_after_loss: 30   # 30 min cooldown (half a candle on 1H)
   stop_loss: 3.0

@@ -30,6 +30,11 @@ class PositionCloseMixin:
                 logger.exception("Error checking trade %s", trade["id"])
 
     async def _check_trade_closed(self, trade: dict):
+        # Skip if already closed by TP/SL check earlier in the loop
+        current = await self.db.get_trade(trade["id"])
+        if not current or current.get("status") == "closed":
+            return
+
         symbol = trade["symbol"]
         category = trade["category"]
         if self.exchange_type == "tbank":

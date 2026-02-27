@@ -64,6 +64,27 @@ class Database:
         """)
         await self._db.commit()
 
+        # Signal scores table for entry analysis
+        await self._db.execute("""
+            CREATE TABLE IF NOT EXISTS signal_scores (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                trade_id INTEGER NOT NULL,
+                score INTEGER NOT NULL,
+                details TEXT NOT NULL,
+                net_pnl REAL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (trade_id) REFERENCES trades(id)
+            )
+        """)
+        await self._db.commit()
+
+        # Migration: add net_pnl to signal_scores
+        try:
+            await self._db.execute("ALTER TABLE signal_scores ADD COLUMN net_pnl REAL")
+            await self._db.commit()
+        except Exception:
+            pass
+
         # Migration: add partial_closed column if not exists
         try:
             await self._db.execute(
@@ -114,7 +135,16 @@ class Database:
                WHERE id = ?""",
             (exit_price, pnl, now_msk_iso(), trade_id),
         )
+        await self._db.execute(
+            "UPDATE signal_scores SET net_pnl = ? WHERE trade_id = ?",
+            (pnl, trade_id),
+        )
         await self._db.commit()
+
+    async def get_trade(self, trade_id: int) -> dict | None:
+        cursor = await self._db.execute("SELECT * FROM trades WHERE id = ?", (trade_id,))
+        row = await cursor.fetchone()
+        return dict(row) if row else None
 
     async def get_open_trades(self) -> list[dict]:
         await self._db.commit()  # flush WAL — ensure fresh read
@@ -190,6 +220,17 @@ class Database:
         )
         rows = await cursor.fetchall()
         return [dict(r) for r in rows]
+
+    # ── Signal Scores ─────────────────────────────────────────
+
+    async def insert_signal_scores(self, trade_id: int, score: int, details: dict):
+        """Save signal indicator scores for a trade entry."""
+        import json
+        await self._db.execute(
+            "INSERT INTO signal_scores (trade_id, score, details, created_at) VALUES (?, ?, ?, ?)",
+            (trade_id, score, json.dumps(details, ensure_ascii=False), now_msk_iso()),
+        )
+        await self._db.commit()
 
     # ── Daily PnL ────────────────────────────────────────────
 

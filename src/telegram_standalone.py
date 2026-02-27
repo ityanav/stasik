@@ -30,6 +30,7 @@ from src.telegram_actions import (
     close_tbank_position,
     update_db_closed,
 )
+from src.telegram_analytics import get_all_trades_with_scores, analyze_trades
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +38,7 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
     [
         [KeyboardButton("📊 Статус"), KeyboardButton("📈 Позиции")],
         [KeyboardButton("▶️ Старт"), KeyboardButton("🛑 Стоп")],
+        [KeyboardButton("🔬 Аналитик")],
     ],
     resize_keyboard=True,
 )
@@ -95,6 +97,7 @@ class StandaloneTelegramBot:
             "📈 Позиции": self._cmd_positions,
             "▶️ Старт": self._cmd_run,
             "🛑 Стоп": self._cmd_stop,
+            "🔬 Аналитик": self._cmd_analytics,
         }
         handler = handlers.get(text)
         if handler:
@@ -110,7 +113,8 @@ class StandaloneTelegramBot:
             "📊 Статус — дашборд с балансом и PnL\n"
             "📈 Позиции — открытые сделки + закрытие\n"
             "▶️ Старт — запустить бота\n"
-            "🛑 Стоп — остановить бота",
+            "🛑 Стоп — остановить бота\n"
+            "🔬 Аналитик — AI-анализ сделок",
             reply_markup=MAIN_KEYBOARD,
         )
 
@@ -120,6 +124,17 @@ class StandaloneTelegramBot:
         loop = asyncio.get_event_loop()
         text = await loop.run_in_executor(None, format_dashboard)
         await update.message.reply_text(text, reply_markup=MAIN_KEYBOARD)
+
+    async def _cmd_analytics(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        if not self._check_auth(update):
+            return
+        await update.message.reply_text("🔬 Анализирую сделки...", reply_markup=MAIN_KEYBOARD)
+        loop = asyncio.get_event_loop()
+        trades = await loop.run_in_executor(None, get_all_trades_with_scores)
+        text = await loop.run_in_executor(None, analyze_trades, trades)
+        # Telegram limit 4096 chars — split if needed
+        for i in range(0, len(text), 4096):
+            await update.message.reply_text(text[i:i + 4096], reply_markup=MAIN_KEYBOARD)
 
     async def _cmd_positions(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not self._check_auth(update):

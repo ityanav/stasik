@@ -916,9 +916,9 @@ class SMCGenerator:
         # ── Split into STRUCTURE vs MOMENTUM ──
         # Structure: WHERE to enter (determines signal direction)
         structure_keys = ("fib_zone", "liq_sweep", "fvg", "order_block",
-                          "ote_bonus", "cluster_bonus", "pivot_bonus", "murray")
+                          "cluster_bonus")
         # Momentum: WHEN to enter (confirms or blocks entry)
-        momentum_keys = ("displacement", "volume", "rsi_div", "cum_delta", "vol_profile")
+        momentum_keys = ("displacement", "volume", "rsi_div")
 
         struct_score = sum(scores[k] for k in structure_keys if k in scores)
         mom_score = sum(scores[k] for k in momentum_keys if k in scores)
@@ -956,15 +956,13 @@ class SMCGenerator:
         mom_str = f", mom={mom_score}" if mom_score != 0 else ""
         block_str = " [MOMENTUM BLOCK]" if momentum_blocked else ""
         logger.info(
-            "FIBA %s: %s (score=%d%s%s, fib=%d[%s], ote=%d, sweep=%d[%s], fvg=%d, ob=%d, disp=%d, vol=%d, rsi_div=%d, cluster=%d, pivot=%d, vp=%d, cd=%d, mm=%d)",
+            "FIBA %s: %s (score=%d%s%s, fib=%d[%s], sweep=%d[%s], fvg=%d, ob=%d, cluster=%d, disp=%d, vol=%d, rsi_div=%d)",
             symbol, signal.value, total, mom_str, block_str,
             scores["fib_zone"], fib_zone_name,
-            scores.get("ote_bonus", 0),
             scores["liq_sweep"], sweep["type"],
             scores["fvg"], scores["order_block"],
+            scores.get("cluster_bonus", 0),
             scores["displacement"], scores["volume"], scores["rsi_div"],
-            scores.get("cluster_bonus", 0), scores.get("pivot_bonus", 0),
-            scores.get("vol_profile", 0), scores.get("cum_delta", 0), scores.get("murray", 0),
         )
         return SignalResult(signal=signal, score=total, details={**details, **scores})
 

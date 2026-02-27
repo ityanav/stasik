@@ -39,7 +39,7 @@ strategy:
   bb_std: 2.0
   vol_period: 20
   vol_threshold: 1.5                 # 1.5x средний объём
-  min_score: 3                       # 3 сигнала — волатильность позволяет
+  min_score: 1                       # 1 сигнал — волатильность позволяет
   adx_period: 14
   adx_min: 16
   adx_max: 50                       # 50 — драгметаллы трендовее акций

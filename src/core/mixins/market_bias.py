@@ -145,6 +145,23 @@ class MarketBiasMixin:
             if result.signal == Signal.HOLD:
                 return
 
+            # Combo filter: only allow winning indicator combinations
+            combo_filter = self.config.get("strategy", {}).get("combo_filter")
+            if combo_filter:
+                _KEY_MAP = {
+                    "fib": "fib_zone", "sweep": "liq_sweep", "fvg": "fvg",
+                    "ob": "order_block", "cluster": "cluster_bonus",
+                }
+                _structure = set(_KEY_MAP.values())
+                active = frozenset(k for k in _structure if result.details.get(k, 0) != 0)
+                allowed = [frozenset(_KEY_MAP.get(x, x) for x in combo) for combo in combo_filter]
+                if active not in allowed:
+                    _short = {v: k for k, v in _KEY_MAP.items()}
+                    active_str = "+".join(sorted(_short.get(k, k) for k in active))
+                    logger.info("Combo фильтр: отклонён %s %s (комбо [%s] не в разрешённых)",
+                                result.signal.value, symbol, active_str)
+                    return
+
             side = "Buy" if result.signal == Signal.BUY else "Sell"
 
             # 5. Check existing positions

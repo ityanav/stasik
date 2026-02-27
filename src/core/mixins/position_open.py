@@ -208,7 +208,7 @@ class PositionOpenMixin:
             return
 
         order_id = order.get("orderId", "")
-        await self.db.insert_trade(
+        trade_id = await self.db.insert_trade(
             symbol=symbol,
             side=side,
             category=category,
@@ -218,6 +218,13 @@ class PositionOpenMixin:
             take_profit=tp,
             order_id="scale_in" if is_scale_in else order_id,
         )
+
+        # Save signal scores for analysis
+        if details and trade_id:
+            try:
+                await self.db.insert_signal_scores(trade_id, score, details)
+            except Exception:
+                logger.warning("Failed to save signal scores for trade %s", trade_id)
 
         # Set trailing stop for futures / tbank (ATR-based or fixed)
         # Skip exchange-level trailing if multiple positions per symbol
@@ -275,6 +282,14 @@ class PositionOpenMixin:
         inst = self.instance_name or "BOT"
         lev = self.leverage if hasattr(self, 'leverage') and self.leverage else 1
         msg = f"📥 {inst} | {direction} {symbol}\n   {ps_fmt} {cur} × {lev}x | {msk_time} MSK"
+
+        # Score breakdown: which indicators contributed
+        if details:
+            active = [f"{k}={v:+d}" for k, v in details.items()
+                      if isinstance(v, (int, float)) and v != 0]
+            if active:
+                msg += f"\n   [{score}] {' '.join(active)}"
+
         logger.info(msg)
         await self._notify(msg)
 
