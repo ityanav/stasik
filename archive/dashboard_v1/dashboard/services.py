@@ -8,11 +8,8 @@ logger = logging.getLogger(__name__)
 _ARCHIVE_MAP = {
     "trades.db": "archive_scalp.db",
     "degen.db": "archive_degen.db",
-    "fiba.db": "archive_fiba_v1.db",
-    "buba.db": "archive_buba_v1.db",
-    "midas.db": "archive_midas_v1.db",
-    "tbank_scalp.db": "archive_tbank_scalp_v1.db",
-    "tbank_swing.db": "archive_tbank_swing_v1.db",
+    "tbank_scalp.db": "archive_tbank_scalp.db",
+    "tbank_swing.db": "archive_tbank_swing.db",
 }
 
 

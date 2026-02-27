@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="ru"><head>
+<meta charset="utf-8">
+<title>Stasik — Вход</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{
+  font-family:'Inter',system-ui,-apple-system,sans-serif;
+  background:#0C0E18;
+  min-height:100vh;display:flex;align-items:center;justify-content:center;
+  color:#E8E9ED;-webkit-font-smoothing:antialiased;
+}
+.login-box{
+  background:rgba(19,21,31,0.8);backdrop-filter:blur(16px);-webkit-backdrop-filter:blur(16px);
+  border:1px solid rgba(255,255,255,0.06);
+  border-radius:20px;padding:40px 36px;width:100%;max-width:400px;
+  box-shadow:0 4px 24px rgba(0,0,0,0.4);
+}
+.logo{text-align:center;margin-bottom:28px}
+.logo .logo-icon{
+  width:56px;height:56px;border-radius:16px;
+  background:rgba(59,130,246,0.1);border:1px solid rgba(59,130,246,0.2);
+  display:flex;align-items:center;justify-content:center;
+  margin:0 auto 12px;font-size:28px;font-weight:800;color:#3B82F6;letter-spacing:-1px;
+}
+.logo h1{font-size:22px;font-weight:700;color:#E8E9ED}
+.logo p{font-size:13px;color:#5A5C66;margin-top:4px}
+.error{
+  background:rgba(239,68,68,0.08);color:#EF4444;
+  padding:10px 14px;border-radius:10px;font-size:13px;
+  margin-bottom:16px;text-align:center;border:1px solid rgba(239,68,68,0.2);
+}
+label{font-size:12px;color:#5A5C66;text-transform:uppercase;letter-spacing:1px;display:block;margin-bottom:6px}
+input[type=text],input[type=password]{
+  width:100%;padding:12px 14px;border:1px solid rgba(255,255,255,0.06);
+  border-radius:10px;background:#1A1C28;color:#E8E9ED;
+  font-size:15px;font-family:inherit;outline:none;transition:all 0.2s;margin-bottom:16px;
+}
+input:focus{border-color:#3B82F6;box-shadow:0 0 0 3px rgba(59,130,246,0.15)}
+.captcha-row{display:flex;align-items:center;gap:10px;margin-bottom:16px}
+.captcha-q{
+  background:rgba(59,130,246,0.08);border:1px solid rgba(59,130,246,0.2);
+  border-radius:10px;padding:10px 16px;font-size:16px;font-weight:600;
+  color:#3B82F6;white-space:nowrap;
+}
+.captcha-row input{margin-bottom:0;flex:1}
+button{
+  width:100%;padding:13px;border:none;border-radius:10px;
+  background:#3B82F6;
+  color:#fff;font-size:15px;font-weight:600;cursor:pointer;font-family:inherit;
+  transition:opacity 0.2s,transform 0.1s;
+}
+button:hover{opacity:0.9}
+button:active{transform:scale(0.98)}
+button:disabled{opacity:0.4;cursor:not-allowed}
+@supports not (backdrop-filter:blur(1px)){
+  .login-box{background:#13151F}
+}
+</style>
+</head><body>
+<div class="login-box">
+  <div class="logo">
+    <div class="logo-icon">S</div>
+    <h1>Stasik Trading Bot</h1>
+    <p>Авторизация в панели управления</p>
+  </div>
+  {{error}}
+  <form method="POST" action="/login">
+    <label>Логин</label>
+    <input type="text" name="username" autocomplete="username" required {{blocked}}>
+    <label>Пароль</label>
+    <input type="password" name="password" autocomplete="current-password" required {{blocked}}>
+    <label>Капча: сколько будет {{captcha_question}} ?</label>
+    <div class="captcha-row">
+      <div class="captcha-q">{{captcha_question}} = ?</div>
+      <input type="text" name="captcha" inputmode="numeric" required {{blocked}}>
+    </div>
+    <input type="hidden" name="captcha_token" value="{{captcha_token}}">
+    <button type="submit" {{blocked}}>Войти</button>
+  </form>
+</div>
+</body></html>
