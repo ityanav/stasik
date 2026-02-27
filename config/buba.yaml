@@ -21,7 +21,7 @@ trading:
 
 strategy:
   strategy_mode: "smc"
-  min_score: 4              # stricter on 1H — fewer but better signals
+  min_score: 3              # stricter on 1H — fewer but better signals
   adx_min: 0
   adx_max: 0
   adx_period: 14
@@ -47,6 +47,8 @@ strategy:
     - [fib, fvg, sweep]
     - [cluster, fib, fvg]
     - [cluster, fib, ob, sweep]
+    - [cluster, fib, ob]
+    - [cluster, fib, sweep]
   macd_fast: 12
   macd_slow: 26
   macd_signal: 9
