@@ -26,7 +26,7 @@ class RouteControlMixin:
             if not service or action not in ("start", "stop", "restart"):
                 return web.json_response({"ok": False, "error": "Bad request"}, status=400)
             # Whitelist: only known stasik services
-            allowed = {"stasik", "stasik-degen", "stasik-tbank-scalp", "stasik-tbank-swing", "stasik-dashboard", "stasik-midas", "stasik-turtle", "stasik-turtle-tbank", "stasik-smc", "stasik-fiba", "stasik-buba", "stasik-shakal", "stasik-shakal1h", "stasik-fin"}
+            allowed = {"stasik", "stasik-degen", "stasik-tbank-scalp", "stasik-tbank-swing", "stasik-dashboard", "stasik-midas", "stasik-turtle", "stasik-turtle-tbank", "stasik-smc", "stasik-fiba", "stasik-buba", "stasik-shakal", "stasik-fin"}
             if service not in allowed:
                 return web.json_response({"ok": False, "error": "Unknown service"}, status=400)
 

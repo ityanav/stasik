@@ -183,12 +183,6 @@ other_instances:
     timeframe: "15м"
     leverage: "3x"
     pairs: ["BTCUSDT", "ETHUSDT", "SOLUSDT", "SUIUSDT", "APTUSDT"]
-  - name: "SHAKAL-1H"
-    db_path: "/root/stasik/data/shakal1h.db"
-    service: "stasik-shakal1h"
-    timeframe: "1H"
-    leverage: "3x"
-    pairs: ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "AVAXUSDT", "LINKUSDT", "SUIUSDT", "APTUSDT"]
   - name: "MIDAS"
     db_path: "/root/stasik/data/midas.db"
     config_path: "/root/stasik/config/midas.yaml"
