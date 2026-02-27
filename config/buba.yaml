@@ -102,13 +102,13 @@ risk:
   atr_period: 14
   atr_sl_multiplier: 2.0    # wider SL for 1H — more room to breathe
   atr_tp_multiplier: 2.5    # wider TP — bigger moves on higher TF
-  atr_trailing_multiplier: 1.5
+  atr_trailing_multiplier: 2.5
   atr_sl_max: 6.0
   atr_sl_min: 1.0
   atr_tp_max: 8.0
   atr_tp_min: 2.0
-  atr_trail_max: 4.0
-  atr_trail_min: 0.5
+  atr_trail_max: 5.0
+  atr_trail_min: 1.0
   trailing_stop: 0
   trailing_activation: 0
   breakeven_activation: 0
