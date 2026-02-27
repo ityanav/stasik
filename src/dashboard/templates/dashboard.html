@@ -396,6 +396,27 @@ body.archive-mode .header{border-bottom-color:rgba(245,158,11,0.2)}
 @supports not (backdrop-filter:blur(1px)){
   .header,.card,.instance-card,.summary-bar{background:var(--bg2)}
 }
+
+/* ── Market Monitor ──────────────────────────────────── */
+.market-section{margin-bottom:20px}
+.market-section h3{font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:1.2px;margin:0 0 8px 4px}
+.market-grid{display:flex;gap:8px;overflow-x:auto;padding-bottom:4px;scrollbar-width:thin}
+.market-grid::-webkit-scrollbar{height:4px}
+.market-grid::-webkit-scrollbar-thumb{background:rgba(255,255,255,0.08);border-radius:2px}
+.mk-card{
+  background:var(--glass-bg);backdrop-filter:var(--glass-blur);
+  border:1px solid var(--border);border-radius:var(--radius-sm);
+  padding:8px 12px;min-width:110px;flex-shrink:0;
+  display:flex;align-items:center;gap:8px;
+  transition:border-color 0.2s;
+}
+.mk-card:hover{border-color:var(--border-hover)}
+.mk-card.fib-active{border-color:var(--accent);box-shadow:0 0 8px rgba(34,197,94,0.15)}
+.mk-arrow{font-size:16px;line-height:1}
+.mk-sym{font-size:12px;font-weight:700;color:var(--text);min-width:36px}
+.mk-dev{font-size:12px;font-weight:700;font-variant-numeric:tabular-nums;min-width:50px;text-align:right}
+.mk-fib{font-size:10px;color:var(--muted);min-width:42px;text-align:right}
+.mk-fib.active{color:var(--accent);font-weight:700}
 </style>
 </head><body>
 
@@ -502,6 +523,18 @@ body.archive-mode .header{border-bottom-color:rgba(245,158,11,0.2)}
         <span class="summary-item-label">Всего PnL</span>
         <span class="summary-item-val" id="summary-all">—</span>
       </div>
+    </div>
+  </div>
+
+  <!-- Market Monitor -->
+  <div id="market-wrap">
+    <div class="market-section">
+      <h3>FIBA 15м — EMA тренд + Fib</h3>
+      <div class="market-grid" id="market-fiba"></div>
+    </div>
+    <div class="market-section">
+      <h3>BUBA 1H — EMA тренд + Fib</h3>
+      <div class="market-grid" id="market-buba"></div>
     </div>
   </div>
 
@@ -760,6 +793,7 @@ function setSource(src){
   const dateNav=document.getElementById('date-nav');
   const instances=document.getElementById('instances');
   const bulkActs=document.getElementById('bulk-actions');
+  const marketWrap=document.getElementById('market-wrap');
   const nightWrap=document.getElementById('night-mode-wrap');
   const saleWrap=document.getElementById('sale-mode-wrap');
   if(src==='archive'){
@@ -770,6 +804,7 @@ function setSource(src){
     bulkActs.style.display='none';
     nightWrap.style.display='none';
     saleWrap.style.display='none';
+    marketWrap.style.display='none';
     document.body.classList.add('archive-mode');
   }else{
     banner.style.display='none';
@@ -779,6 +814,7 @@ function setSource(src){
     bulkActs.style.display='';
     nightWrap.style.display='flex';
     saleWrap.style.display='flex';
+    marketWrap.style.display='';
     document.body.classList.remove('archive-mode');
   }
   loadAll();
@@ -858,6 +894,30 @@ async function loadInstances(){
     if(tbankAll!==0){const c=tbankAll>=0?'#22C55E':'#EF4444';allParts.push(`<span style="color:${c}">${tbankAll>0?'+':''}${tbankAll.toFixed(0)}\u20bd</span>`)}
     allEl.innerHTML=allParts.length?allParts.join(' / '):'0';
   }catch(e){console.error('instances',e)}
+}
+
+async function loadMarket(){
+  if(currentSource==='archive'){
+    document.getElementById('market-wrap').style.display='none';return;
+  }
+  document.getElementById('market-wrap').style.display='';
+  try{
+    const d=await(await fetch('/api/market')).json();
+    renderMarketGrid('market-fiba',d.fiba||[]);
+    renderMarketGrid('market-buba',d.buba||[]);
+  }catch(e){console.error('market',e)}
+}
+function renderMarketGrid(id,items){
+  const el=document.getElementById(id);
+  el.innerHTML=items.map(t=>{
+    const arrow=t.bullish?'↗️':'↘️';
+    const col=t.bullish?'#22C55E':'#EF4444';
+    const sign=t.dev>=0?'+':'';
+    const fibClass=t.in_fib?'active':'';
+    const fibText=t.in_fib?'🎯 FIB':t.fib_dist!=null?'~'+t.fib_dist+'%':'';
+    const cardClass=t.in_fib?'mk-card fib-active':'mk-card';
+    return`<div class="${cardClass}"><span class="mk-arrow">${arrow}</span><span class="mk-sym">${t.symbol}</span><span class="mk-dev" style="color:${col}">${sign}${t.dev}%</span><span class="mk-fib ${fibClass}">${fibText}</span></div>`;
+  }).join('');
 }
 
 async function loadPairPnl(){
@@ -1526,7 +1586,7 @@ async function loadTrades(page){
 function changePage(d){loadTrades(currentPage+d)}
 
 async function loadAll(){
-  await Promise.all([loadInstances(),loadStats(),loadChart(),loadPositions(),loadTrades(currentPage),loadPairPnl()]);
+  await Promise.all([loadInstances(),loadStats(),loadChart(),loadPositions(),loadTrades(currentPage),loadPairPnl(),loadMarket()]);
   document.getElementById('last-update').textContent=
     'Обновлено: '+new Date().toLocaleTimeString('ru-RU');
 }

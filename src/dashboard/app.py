@@ -12,6 +12,7 @@ from src.dashboard.sale_mode import SaleModeMixin
 from src.dashboard.routes_stats import RouteStatsMixin
 from src.dashboard.routes_control import RouteControlMixin
 from src.dashboard.routes_settings import RouteSettingsMixin
+from src.dashboard.routes_market import RouteMarketMixin
 from src.dashboard.services import _get_db_path, _other_instances, _ARCHIVE_MAP
 from src.storage.database import Database
 
@@ -29,6 +30,7 @@ class Dashboard(
     RouteStatsMixin,
     RouteControlMixin,
     RouteSettingsMixin,
+    RouteMarketMixin,
 ):
     def __init__(self, config: dict, db: Database, engine=None):
         self.config = config
@@ -203,6 +205,7 @@ class Dashboard(
         self.app.router.add_post("/api/night-settings", self._api_night_settings_post)
         self.app.router.add_get("/api/sale-settings", self._api_sale_settings_get)
         self.app.router.add_post("/api/sale-settings", self._api_sale_settings_post)
+        self.app.router.add_get("/api/market", self._api_market)
 
     # ── Lifecycle ────────────────────────────────────────────────────
 
