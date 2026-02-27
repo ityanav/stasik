@@ -47,8 +47,8 @@ class RiskManager:
     def record_pnl(self, pnl: float, balance: float):
         self._check_day_reset()
         self._daily_pnl += pnl
-        # Classic daily loss limit (% of balance)
-        if balance > 0 and abs(self._daily_pnl) / balance >= self.max_daily_loss_pct and self._daily_pnl < 0:
+        # Classic daily loss limit (% of balance); 0 = disabled
+        if self.max_daily_loss_pct > 0 and balance > 0 and abs(self._daily_pnl) / balance >= self.max_daily_loss_pct and self._daily_pnl < 0:
             self._halted = True
             logger.warning(
                 "Daily loss limit reached: %.2f (%.1f%% of %.2f)",
