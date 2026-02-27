@@ -31,14 +31,15 @@ from src.telegram_actions import (
     update_db_closed,
 )
 from src.telegram_analytics import get_all_trades_with_scores, analyze_trades
+from src.telegram_market import get_market_overview
 
 logger = logging.getLogger(__name__)
 
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     [
         [KeyboardButton("📊 Статус"), KeyboardButton("📈 Позиции")],
+        [KeyboardButton("📊 Рынок"), KeyboardButton("🔬 Аналитик")],
         [KeyboardButton("▶️ Старт"), KeyboardButton("🛑 Стоп")],
-        [KeyboardButton("🔬 Аналитик")],
     ],
     resize_keyboard=True,
 )
@@ -94,6 +95,7 @@ class StandaloneTelegramBot:
         text = update.message.text.strip()
         handlers = {
             "📊 Статус": self._cmd_status,
+            "📊 Рынок": self._cmd_market,
             "📈 Позиции": self._cmd_positions,
             "▶️ Старт": self._cmd_run,
             "🛑 Стоп": self._cmd_stop,
@@ -123,6 +125,14 @@ class StandaloneTelegramBot:
             return
         loop = asyncio.get_event_loop()
         text = await loop.run_in_executor(None, format_dashboard)
+        await update.message.reply_text(text, reply_markup=MAIN_KEYBOARD)
+
+    async def _cmd_market(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        if not self._check_auth(update):
+            return
+        await update.message.reply_text("📊 Загружаю рынок...", reply_markup=MAIN_KEYBOARD)
+        loop = asyncio.get_event_loop()
+        text = await loop.run_in_executor(None, get_market_overview)
         await update.message.reply_text(text, reply_markup=MAIN_KEYBOARD)
 
     async def _cmd_analytics(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
