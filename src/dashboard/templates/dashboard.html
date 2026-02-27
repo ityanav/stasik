@@ -490,7 +490,7 @@ body.archive-mode .header{border-bottom-color:rgba(245,158,11,0.2)}
     <div class="tbl-wrap">
       <table>
         <thead><tr>
-          <th>Bot</th><th>Pair</th><th>Side</th><th>Lev</th><th>Size</th><th>Entry</th><th>Exit</th><th>PS</th><th>Gross PnL</th><th>Net PnL</th><th>Time</th><th>Dur</th><th>Status</th>
+          <th>Bot</th><th>Pair</th><th>Side</th><th>Lev</th><th>Size</th><th>Entry</th><th>Exit</th><th>PS</th><th>Gross PnL</th><th>Net PnL</th><th>Time</th><th>Dur</th><th>Тип</th>
         </tr></thead>
         <tbody id="tbody"></tbody>
       </table>
@@ -1483,7 +1483,7 @@ async function loadTrades(page){
         <td class="${cls(netPnl)}"><strong>${p?netPnl.toFixed(2):'-'}</strong></td>
         <td style="color:var(--muted);font-size:12px">${tFmt}</td>
         <td style="color:var(--muted);font-size:11px;white-space:nowrap">${dur}</td>
-        <td class="${t.status==='closed'?'status-closed':'status-open'}">${t.status==='closed'?'Closed':'Open'}</td></tr>`;
+        <td style="font-size:13px">${inst.includes('SHAKAL')?'🐺 Шакал':'🦁 Лев'}</td></tr>`;
     }).join('');
   }catch(e){console.error('trades',e)}
 }

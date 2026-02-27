@@ -222,9 +222,13 @@ class MarketBiasMixin:
                                 symbol, atr, atr_pct)
                     return
 
+            # Combo reverse size multiplier (e.g. 0.3 = 30% of normal size)
+            reverse_size = self.config.get("strategy", {}).get("combo_reverse_size") if combo_reverse else None
+
             await self._open_trade(
                 symbol, side, category, result.score, result.details,
                 atr=atr, df=df,
+                ai_size_mult=reverse_size,
             )
             return
 

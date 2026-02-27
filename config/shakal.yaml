@@ -1,8 +1,8 @@
-instance_name: "GIENA"
+instance_name: "SHAKAL"
 initial_balance: 164235
 
 database:
-  path: "/root/stasik/data/giena.db"
+  path: "/root/stasik/data/shakal.db"
 
 bybit:
   testnet: false
@@ -48,7 +48,9 @@ strategy:
     - [cd, cluster, fib, mom, ote]
     - [cluster, fib, fvg, mm, sweep]
     - [cluster, fib, ote, sweep]
+    - [cluster, fib, sweep]
   combo_reverse: true        # ГИЕНА: open in opposite direction
+  combo_reverse_size: 0.3    # 30% of normal position size
   macd_fast: 12
   macd_slow: 26
   macd_signal: 9
