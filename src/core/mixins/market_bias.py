@@ -11,6 +11,33 @@ logger = logging.getLogger(__name__)
 class MarketBiasMixin:
     """Mixin for market bias detection, category helpers, and pair processing."""
 
+    # Short name → internal key in result.details
+    _COMBO_KEY_MAP = {
+        "fib": "fib_zone", "sweep": "liq_sweep", "fvg": "fvg",
+        "ob": "order_block", "cluster": "cluster_bonus",
+        "cd": "cum_delta", "ote": "ote_bonus", "mm": "murray",
+        "mom": "displacement", "disp": "displacement",
+        "vol": "volume", "rsi_div": "rsi_div",
+        "pivot": "pivot_bonus", "vp": "vol_profile",
+    }
+
+    def _check_combo(self, combo_filter: list, details: dict, signal: str, symbol: str) -> bool:
+        """Check if active indicators match an allowed combo. Returns True if passed."""
+        km = self._COMBO_KEY_MAP
+        check_keys = set()
+        for combo in combo_filter:
+            for x in combo:
+                check_keys.add(km.get(x, x))
+        active = frozenset(k for k in check_keys if details.get(k, 0) != 0)
+        allowed = [frozenset(km.get(x, x) for x in combo) for combo in combo_filter]
+        if active not in allowed:
+            short = {v: k for k, v in km.items()}
+            active_str = "+".join(sorted(short.get(k, k) for k in active))
+            logger.info("Combo фильтр: отклонён %s %s (комбо [%s] не в разрешённых)",
+                        signal, symbol, active_str)
+            return False
+        return True
+
     # ── Market Bias ──────────────────────────────────────────────────────
 
     def _update_market_bias(self):
@@ -145,39 +172,18 @@ class MarketBiasMixin:
             if result.signal == Signal.HOLD:
                 return
 
-            # Combo filter: only allow winning indicator combinations
+            # Combo filter + reverse
             combo_filter = self.config.get("strategy", {}).get("combo_filter")
             combo_reverse = self.config.get("strategy", {}).get("combo_reverse", False)
-            if combo_filter:
-                _KEY_MAP = {
-                    "fib": "fib_zone", "sweep": "liq_sweep", "fvg": "fvg",
-                    "ob": "order_block", "cluster": "cluster_bonus",
-                    "cd": "cum_delta", "ote": "ote_bonus", "mm": "murray",
-                    "mom": "displacement", "disp": "displacement",
-                    "vol": "volume", "rsi_div": "rsi_div",
-                    "pivot": "pivot_bonus", "vp": "vol_profile",
-                }
-                # Build check-set from combo definitions (backward compatible)
-                _check_keys = set()
-                for combo in combo_filter:
-                    for x in combo:
-                        _check_keys.add(_KEY_MAP.get(x, x))
-                active = frozenset(k for k in _check_keys if result.details.get(k, 0) != 0)
-                allowed = [frozenset(_KEY_MAP.get(x, x) for x in combo) for combo in combo_filter]
-                if active not in allowed:
-                    _short = {v: k for k, v in _KEY_MAP.items()}
-                    active_str = "+".join(sorted(_short.get(k, k) for k in active))
-                    logger.info("Combo фильтр: отклонён %s %s (комбо [%s] не в разрешённых)",
-                                result.signal.value, symbol, active_str)
-                    return
+            if combo_filter and not self._check_combo(combo_filter, result.details, result.signal.value, symbol):
+                return
 
             side = "Buy" if result.signal == Signal.BUY else "Sell"
 
-            # Combo reverse: contrarian mode — flip direction
             if combo_reverse:
+                old_side = side
                 side = "Sell" if side == "Buy" else "Buy"
-                logger.info("Combo reverse (ГИЕНА): %s %s → %s", symbol,
-                            "Sell" if side == "Buy" else "Buy", side)
+                logger.info("Combo reverse: %s %s → %s", symbol, old_side, side)
 
             # 5. Check existing positions
             open_trades = await self.db.get_open_trades()

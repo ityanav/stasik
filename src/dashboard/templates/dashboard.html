@@ -1377,7 +1377,7 @@ function _renderPosRow(p){
       const key=`${p.instance||''}_${p.symbol}_${p.side}`;
       const lev=p.leverage||'?';
       return`<tr data-pos-key="${key}" class="fade-in">
-        <td><span class="inst-tag ${isCls}">${iLabel}</span></td>
+        <td><span class="inst-tag ${isCls}">${iLabel}</span> ${inst.includes('SHAKAL')?'🐺':'🦁'}</td>
         <td style="color:var(--muted)">${p.symbol}${soBadge}</td>
         <td style="color:var(--muted)">${p.side==='Buy'?'<span style="color:#22C55E">\u2191</span> LONG':'<span style="color:#EF4444">\u2193</span> SHORT'}</td>
         <td style="color:var(--accent);font-size:11px">x${lev}</td>
@@ -1483,7 +1483,7 @@ async function loadTrades(page){
         <td class="${cls(netPnl)}"><strong>${p?netPnl.toFixed(2):'-'}</strong></td>
         <td style="color:var(--muted);font-size:12px">${tFmt}</td>
         <td style="color:var(--muted);font-size:11px;white-space:nowrap">${dur}</td>
-        <td style="font-size:13px">${inst.includes('SHAKAL')?'🐺 Шакал':'🦁 Лев'}</td></tr>`;
+        <td style="font-size:15px" title="${inst.includes('SHAKAL')?'Шакал':'Лев'}">${inst.includes('SHAKAL')?'🐺':'🦁'}</td></tr>`;
     }).join('');
   }catch(e){console.error('trades',e)}
 }
