@@ -25,13 +25,18 @@ class MarketBiasMixin:
     }
 
     @staticmethod
-    def _load_combo_set(name: str) -> list | None:
-        """Load combo list from config/combos.yaml by set name."""
+    def _load_combo_yaml() -> dict:
+        """Load full combos.yaml."""
         path = Path("config/combos.yaml")
         if not path.exists():
-            return None
+            return {}
         with open(path) as f:
-            data = yaml.safe_load(f) or {}
+            return yaml.safe_load(f) or {}
+
+    @staticmethod
+    def _load_combo_set(name: str) -> list | None:
+        """Load combo list from config/combos.yaml by set name."""
+        data = MarketBiasMixin._load_combo_yaml()
         return data.get(name)
 
     def _get_combo_filter(self) -> list | None:
@@ -42,8 +47,18 @@ class MarketBiasMixin:
             return self._load_combo_set(combo_set)
         return strat.get("combo_filter")
 
-    def _check_combo(self, combo_filter: list, details: dict, signal: str, symbol: str) -> bool:
-        """Check if active indicators match an allowed combo. Returns True if passed."""
+    def _get_combo_sizes(self) -> dict[str, float]:
+        """Load per-combo size multipliers from combos.yaml ({set_name}_sizes)."""
+        strat = self.config.get("strategy", {})
+        combo_set = strat.get("combo_set")
+        if not combo_set:
+            return {}
+        data = self._load_combo_yaml()
+        return data.get(f"{combo_set}_sizes", {})
+
+    def _check_combo(self, combo_filter: list, details: dict, signal: str, symbol: str) -> str | None:
+        """Check if active indicators match an allowed combo.
+        Returns matched combo key (e.g. 'cluster+fib+sweep') or None if rejected."""
         km = self._COMBO_KEY_MAP
         check_keys = set()
         for combo in combo_filter:
@@ -56,8 +71,8 @@ class MarketBiasMixin:
             active_str = "+".join(sorted(short.get(k, k) for k in active))
             logger.info("Combo фильтр: отклонён %s %s (комбо [%s] не в разрешённых)",
                         signal, symbol, active_str)
-            return False
-        return True
+            return None
+        return "+".join(sorted(active))
 
     # ── Market Bias ──────────────────────────────────────────────────────
 
@@ -196,8 +211,11 @@ class MarketBiasMixin:
             # Combo filter + reverse
             combo_filter = self._get_combo_filter()
             combo_reverse = self.config.get("strategy", {}).get("combo_reverse", False)
-            if combo_filter and not self._check_combo(combo_filter, result.details, result.signal.value, symbol):
-                return
+            matched_combo = None
+            if combo_filter:
+                matched_combo = self._check_combo(combo_filter, result.details, result.signal.value, symbol)
+                if matched_combo is None:
+                    return
 
             side = "Buy" if result.signal == Signal.BUY else "Sell"
 
@@ -252,13 +270,20 @@ class MarketBiasMixin:
                                 self.instance_name, symbol, atr, atr_pct)
                     return
 
-            # Combo reverse size multiplier (e.g. 0.3 = 30% of normal size)
-            reverse_size = self.config.get("strategy", {}).get("combo_reverse_size") if combo_reverse else None
+            # Size multiplier: combo_reverse_size OR per-combo size from combos.yaml
+            size_mult = None
+            if combo_reverse:
+                size_mult = self.config.get("strategy", {}).get("combo_reverse_size")
+            elif matched_combo:
+                combo_sizes = self._get_combo_sizes()
+                if matched_combo in combo_sizes:
+                    size_mult = combo_sizes[matched_combo]
+                    logger.info("Combo size: %s %s → %.0f%%", symbol, matched_combo, size_mult * 100)
 
             await self._open_trade(
                 symbol, side, category, result.score, result.details,
                 atr=atr, df=df,
-                ai_size_mult=reverse_size,
+                ai_size_mult=size_mult,
             )
             return
 
