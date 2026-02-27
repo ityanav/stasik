@@ -165,7 +165,22 @@ class NightModeMixin:
         if db_path and Path(db_path).exists():
             try:
                 mark = 0
-                if not is_tbank:
+                if is_tbank:
+                    try:
+                        from src.exchange.tbank_client import TBankClient
+                        for inst in _other_instances(self.config):
+                            if inst.get("name", "").upper() == (instance or "").upper():
+                                cfg_path = inst.get("config_path", "")
+                                if cfg_path and Path(cfg_path).exists():
+                                    import yaml
+                                    with open(cfg_path) as f:
+                                        tcfg = yaml.safe_load(f)
+                                    tc = TBankClient(tcfg)
+                                    mark = tc.get_last_price(symbol)
+                                break
+                    except Exception:
+                        pass
+                else:
                     client = self._get_client()
                     if client:
                         try:
