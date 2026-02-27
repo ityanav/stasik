@@ -240,6 +240,18 @@ class MarketBiasMixin:
                 result.details.pop("sweep_level", None)
                 result.details.pop("tp1_level", None)
 
+            # 4b. HTF trend filter: block counter-trend trades
+            if self.config.get("strategy", {}).get("htf_filter", True):
+                htf_trend, _, _ = self._get_htf_data(symbol, category)
+                if htf_trend == Trend.BEARISH and side == "Buy":
+                    logger.info("SMC HTF фильтр: отклонён BUY %s (тренд медвежий, EMA%d < EMA%d)",
+                                symbol, self.signal_gen.ema_fast, self.signal_gen.ema_slow)
+                    return
+                if htf_trend == Trend.BULLISH and side == "Sell":
+                    logger.info("SMC HTF фильтр: отклонён SELL %s (тренд бычий, EMA%d > EMA%d)",
+                                symbol, self.signal_gen.ema_fast, self.signal_gen.ema_slow)
+                    return
+
             # 5. Check existing positions
             open_trades = await self.db.get_open_trades()
             symbol_open = [t for t in open_trades if t["symbol"] == symbol]

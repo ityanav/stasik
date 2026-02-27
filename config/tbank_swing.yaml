@@ -34,7 +34,7 @@ strategy:
   vol_period: 20
   vol_threshold: 1.5
   sma_period: 25
-  htf_filter: false
+  htf_filter: true
   htf_min_sma_dev: 0.0
   htf_score_min: 0
   market_bias: false

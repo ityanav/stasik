@@ -43,7 +43,7 @@ strategy:
   orderbook_enabled: false
   patterns_enabled: false
   reversal_confirmation: false
-  avoid_asia: true              # kill zone: skip Asian session (21-08 UTC)
+  avoid_asia: false             # disabled — HTF trend filter handles direction
   macd_fast: 12
   macd_slow: 26
   macd_signal: 9
@@ -177,12 +177,6 @@ other_instances:
     timeframe: "1H"
     leverage: "3x"
     pairs: ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "AVAXUSDT", "LINKUSDT", "SUIUSDT", "APTUSDT"]
-  - name: "SHAKAL"
-    db_path: "/root/stasik/data/shakal.db"
-    service: "stasik-shakal"
-    timeframe: "15м"
-    leverage: "3x"
-    pairs: ["BTCUSDT", "ETHUSDT", "SOLUSDT", "SUIUSDT", "APTUSDT"]
   - name: "MIDAS"
     db_path: "/root/stasik/data/midas.db"
     config_path: "/root/stasik/config/midas.yaml"

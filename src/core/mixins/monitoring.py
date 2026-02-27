@@ -2,6 +2,8 @@ import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
 
+from src.strategy.signals import Trend
+
 logger = logging.getLogger(__name__)
 
 MSK = timezone(timedelta(hours=3))
@@ -91,8 +93,15 @@ class MonitoringMixin:
                         except Exception:
                             logger.exception("TP monitor error %s", sym)
 
-                # Detect manually closed positions (every 15th iteration = ~30s)
+                # Trend reversal exit (every 15th iteration = ~30s)
                 self._ws_reconcile_counter += 1
+                if open_trades and self._ws_reconcile_counter % 15 == 0:
+                    for trade in open_trades:
+                        cur_price = self._ws_prices.get(trade["symbol"])
+                        if cur_price:
+                            await self._check_trend_exit(trade, cur_price)
+
+                # Detect manually closed positions (every 15th iteration = ~30s)
                 if open_trades and self._ws_reconcile_counter >= 15:
                     self._ws_reconcile_counter = 0
                     await self._detect_closed_positions(open_trades)
@@ -132,8 +141,13 @@ class MonitoringMixin:
                     for trade in open_trades:
                         await self._check_stale_trade(trade, stale_timeout)
 
-                # Detect manually closed positions (every 6th poll = ~30s)
+                # Trend reversal exit (every 6th poll = ~30s)
                 self._reconcile_poll_counter += 1
+                if open_trades and self._reconcile_poll_counter % 6 == 0:
+                    for trade in open_trades:
+                        await self._check_trend_exit(trade)
+
+                # Detect manually closed positions (every 6th poll = ~30s)
                 if open_trades and self._reconcile_poll_counter >= 6:
                     self._reconcile_poll_counter = 0
                     await self._detect_closed_positions(open_trades)
@@ -180,6 +194,68 @@ class MonitoringMixin:
                                    exch_sizes[key], db_qty[key], trade["side"], trade["symbol"])
         except Exception:
             logger.exception("_detect_closed_positions error")
+
+    async def _check_trend_exit(self, trade: dict, cur_price: float = None):
+        """Close position when HTF trend reverses against it.
+
+        When htf_filter is on, positions only open with the trend. If the
+        trend later flips against the position, we close immediately —
+        no point holding a counter-trend position.
+        """
+        if not self.config.get("strategy", {}).get("htf_filter", True):
+            return
+
+        symbol = trade["symbol"]
+        side = trade["side"]
+        entry = trade["entry_price"]
+
+        # Current price
+        if cur_price is None:
+            try:
+                if self.exchange_type == "tbank":
+                    cur_price = self.client.get_last_price(symbol)
+                else:
+                    cur_price = (getattr(self, '_ws_prices', {}).get(symbol)
+                                 or self.client.get_last_price(symbol, category="linear"))
+            except Exception:
+                return
+        if not cur_price or cur_price <= 0:
+            return
+
+        # HTF trend
+        category = "tbank" if self.exchange_type == "tbank" else "linear"
+        htf_trend, _, _ = self._get_htf_data(symbol, category)
+
+        # Is trend against position?
+        if side == "Buy" and htf_trend != Trend.BEARISH:
+            return
+        if side == "Sell" and htf_trend != Trend.BULLISH:
+            return
+
+        # PnL estimate
+        if side == "Buy":
+            pnl_pct = (cur_price - entry) / entry * 100
+        else:
+            pnl_pct = (entry - cur_price) / entry * 100
+
+        inst = getattr(self, 'instance_name', 'BOT')
+        logger.info("%s Trend exit: %s %s (trend=%s, pnl=%.2f%%, price=%.4f) — closing",
+                    inst, side, symbol, htf_trend.value, pnl_pct, cur_price)
+
+        close_side = "Sell" if side == "Buy" else "Buy"
+        qty = trade["qty"]
+        try:
+            if self.exchange_type == "tbank":
+                self.client.place_order(symbol=symbol, side=close_side, qty=qty)
+            else:
+                self.client.place_order(symbol=symbol, side=close_side, qty=qty,
+                                        category="linear", reduce_only=True)
+            msg = (f"🔄 {inst} | Trend exit {side} {symbol}\n"
+                   f"Тренд развернулся ({htf_trend.value}) — закрыт\n"
+                   f"PnL: {pnl_pct:+.2f}%")
+            await self._notify(msg)
+        except Exception:
+            logger.exception("Failed to close trend-exit trade %s %s", side, symbol)
 
     async def _check_stale_trade(self, trade: dict, timeout_min: int):
         """Close position if not in profit after timeout_min minutes."""

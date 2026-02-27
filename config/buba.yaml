@@ -43,8 +43,8 @@ strategy:
   orderbook_enabled: false
   patterns_enabled: false
   reversal_confirmation: false
-  avoid_asia: true              # kill zone: skip Asian session (21-08 UTC)
-  combo_set: lev              # config/combos.yaml → lev
+  avoid_asia: false             # disabled — HTF trend filter handles direction
+  # combo_set: lev            # disabled — combo filter off
   macd_fast: 12
   macd_slow: 26
   macd_signal: 9
