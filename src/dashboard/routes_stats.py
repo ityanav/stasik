@@ -11,7 +11,7 @@ logger = logging.getLogger(__name__)
 
 def _get_db_path(live_path: str, source: str) -> str:
     """Return archive DB path if source='archive', else the live path."""
-    from src.dashboard.app import _get_db_path as _orig
+    from src.dashboard.services import _get_db_path as _orig
     return _orig(live_path, source)
 
 
