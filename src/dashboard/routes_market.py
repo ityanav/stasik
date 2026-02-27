@@ -36,11 +36,11 @@ class RouteMarketMixin:
             if not r["error"]:
                 fiba.append({
                     "symbol": sym.replace("USDT", ""),
-                    "price": r["price"],
-                    "bullish": r["bullish"],
-                    "dev": r["dev_pct"],
-                    "in_fib": r["in_fib"],
-                    "fib_dist": r["fib_dist"],
+                    "price": float(r["price"]),
+                    "bullish": bool(r["bullish"]),
+                    "dev": float(r["dev_pct"]),
+                    "in_fib": bool(r["in_fib"]),
+                    "fib_dist": float(r["fib_dist"]) if r["fib_dist"] is not None else None,
                 })
 
         buba = []
@@ -49,11 +49,11 @@ class RouteMarketMixin:
             if not r["error"]:
                 buba.append({
                     "symbol": sym.replace("USDT", ""),
-                    "price": r["price"],
-                    "bullish": r["bullish"],
-                    "dev": r["dev_pct"],
-                    "in_fib": r["in_fib"],
-                    "fib_dist": r["fib_dist"],
+                    "price": float(r["price"]),
+                    "bullish": bool(r["bullish"]),
+                    "dev": float(r["dev_pct"]),
+                    "in_fib": bool(r["in_fib"]),
+                    "fib_dist": float(r["fib_dist"]) if r["fib_dist"] is not None else None,
                 })
 
         return {"fiba": fiba, "buba": buba}
