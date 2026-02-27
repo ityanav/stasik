@@ -1,0 +1,10 @@
+pybit>=5.8.0
+python-telegram-bot>=21.0
+pandas>=2.0
+ta>=0.11.0
+pyyaml>=6.0
+aiosqlite>=0.20.0
+aiohttp>=3.9.0
+bcrypt>=4.0.0
+# T-Invest SDK (install from: --index-url https://opensource.tbank.ru/api/v4/projects/238/packages/pypi/simple)
+# t-tech-investments>=0.3.0

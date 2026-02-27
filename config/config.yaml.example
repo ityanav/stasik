@@ -1,0 +1,47 @@
+bybit:
+  testnet: true
+  demo: false
+  api_key: "YOUR_API_KEY"
+  api_secret: "YOUR_API_SECRET"
+
+trading:
+  pairs: ["BTCUSDT", "ETHUSDT", "SOLUSDT", "DOGEUSDT", "TRUMPUSDT", "WIFUSDT", "1000PEPEUSDT", "SHIB1000USDT"]
+  market_type: "futures"       # spot / futures / both
+  timeframe: "1"               # minutes: 1, 3, 5, 15
+  leverage: 10                 # futures only
+
+strategy:
+  rsi_period: 14
+  rsi_overbought: 60           # aggressive: easier to trigger sell
+  rsi_oversold: 40             # aggressive: easier to trigger buy
+  ema_fast: 9
+  ema_slow: 21
+  macd_fast: 12
+  macd_slow: 26
+  macd_signal: 9
+  bb_period: 20                # Bollinger Bands period
+  bb_std: 2.0                  # Bollinger Bands std deviation
+  vol_period: 20               # Volume MA period
+  vol_threshold: 1.1           # Volume spike threshold
+  min_score: 1                 # min matching signals to enter
+
+risk:
+  risk_per_trade: 5.0          # % of balance per trade
+  stop_loss: 1.0               # % stop-loss
+  take_profit: 2.0             # % take-profit
+  max_open_positions: 5
+  max_daily_loss: 15.0         # % — auto-stop on breach
+  trailing_stop: 0.5           # % trailing distance
+  trailing_activation: 0.3     # activate after % profit
+
+ai:
+  enabled: true
+  api_key: "YOUR_OPENROUTER_API_KEY"
+  model: "google/gemini-2.0-flash-001"
+  min_confidence: 4            # AI confidence threshold (1-10)
+  timeout: 10                  # API timeout in seconds
+  review_interval: 60          # strategy review every N ticks
+
+telegram:
+  token: "YOUR_TELEGRAM_BOT_TOKEN"
+  chat_id: "YOUR_CHAT_ID"

@@ -1,0 +1,46 @@
+instance_name: "FIN"
+
+bybit:
+  testnet: false
+  demo: true
+  api_key: "Ct24OvPFimR3vLSlcW"
+  api_secret: "CNzK2w9eQ41j4A4dszBLvvOkAH61Z5BQG9oq"
+
+# Dummy trading section for BybitClient init
+trading:
+  leverage: 1
+
+accountant:
+  check_interval: 10
+  breakeven_pct: 0.06        # Shield: move SL to entry at 0.06% net profit
+  min_profit_pct: 0.10       # AI review when net PnL >= 0.10% (if AI enabled)
+  auto_close_pct: 0.15       # hard close at 0.15%+ net profit (~$120 on $80K)
+  auto_close_usd: 0          # disabled — was grabbing $20 crumbs on $80K positions
+  loss_review_sl_pct: 50     # review when loss >= 50% of SL distance
+  ai_enabled: false           # AI for profits disabled — pure logic (shield + auto-close)
+  ai_loss_review: true        # AI for losses enabled — reviews when loss >= 50% SL distance
+  min_confidence: 6          # confidence for profit-side actions (if AI enabled)
+  loss_min_confidence: 9     # confidence for loss-side CLOSE (if AI enabled)
+  ai_cooldown: 120           # seconds between AI calls for same trade (if AI enabled)
+  timeframe: "15"
+
+databases:
+  - path: "/root/stasik/data/trades.db"
+    instance: "SCALP"
+    commission_rate: 0.055
+  - path: "/root/stasik/data/fiba.db"
+    instance: "FIBA"
+    commission_rate: 0.055
+  - path: "/root/stasik/data/buba.db"
+    instance: "BUBA"
+    commission_rate: 0.055
+
+ai:
+  api_key: "sk-2dec36c8752d48b6b2cfdedd21337126"
+  provider: deepseek
+  model: deepseek-chat
+  timeout: 15
+
+telegram:
+  token: "7852966698:AAFA_L6ovqXtTmMO05DBZg3UYbx4DklIY7k"
+  chat_id: "885025581"

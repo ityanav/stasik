@@ -1,0 +1,180 @@
+instance_name: "FIBA"
+initial_balance: 164235
+
+database:
+  path: "/root/stasik/data/fiba.db"
+
+bybit:
+  testnet: false
+  demo: true
+  api_key: "Ct24OvPFimR3vLSlcW"
+  api_secret: "CNzK2w9eQ41j4A4dszBLvvOkAH61Z5BQG9oq"
+
+trading:
+  pairs: ["BTCUSDT", "ETHUSDT", "SOLUSDT", "SUIUSDT", "APTUSDT"]
+  market_type: "futures"
+  timeframe: "15"          # 15m entry
+  htf_timeframe: "60"      # 1H structure (swings + fib)
+  leverage: 3
+  trading_hours: [0, 24]
+  tick_interval: 60          # every minute
+
+strategy:
+  strategy_mode: "smc"
+  min_score: 6
+  adx_min: 0
+  adx_max: 0
+  adx_period: 14
+  ema_fast: 9
+  ema_slow: 21
+  rsi_period: 14
+  bb_period: 20
+  bb_std: 2.0
+  vol_period: 20
+  vol_threshold: 1.5
+  sma_period: 25
+  htf_filter: true
+  htf_min_sma_dev: 0.0
+  htf_score_min: 0
+  market_bias: false
+  fng_extreme_greed: 100
+  fng_extreme_fear: 0
+  funding_rate_max: 999
+  orderbook_enabled: false
+  patterns_enabled: false
+  reversal_confirmation: false
+  macd_fast: 12
+  macd_slow: 26
+  macd_signal: 9
+
+smc:
+  swing_lookback: 5
+  swing_min_distance: 10
+  fib_premium_min: 0.618
+  fib_premium_max: 0.786
+  fib_standard_min: 0.382
+  fib_standard_max: 0.618
+  sweep_lookback: 30
+  sweep_fresh_candles: 5
+  fvg_lookback: 20
+  fvg_proximity_pct: 0.5
+  displacement_body_pct: 0.3
+  displacement_vol_mult: 1.5
+  ob_lookback: 50
+  ob_proximity_pct: 1.0
+  ob_displacement_pct: 1.5
+  tp_extension_1: 1.0
+  tp_extension_2: 1.272
+  adx_max: 0
+  # OTE 0.705 bonus (+1 score near optimal trade entry)
+  ote_bonus: true
+  ote_proximity_pct: 0.3
+  # ZigZag ATR-based swing detection (adaptive to volatility)
+  zigzag_enabled: true
+  zigzag_atr_period: 14
+  zigzag_atr_mult: 2.0
+  # Fibonacci Clusters (multi-swing confluence zones)
+  cluster_enabled: true
+  cluster_threshold_pct: 1.0
+  cluster_min_levels: 3
+  # Fibonacci Pivot Points (daily S/R levels)
+  fib_pivots: true
+  fib_pivot_proximity_pct: 0.3
+  # Volume Profile (POC/VAH/VAL from price-volume distribution)
+  volume_profile_enabled: true
+  volume_profile_bins: 50
+  volume_profile_value_area_pct: 70.0
+  volume_profile_proximity_pct: 0.3
+  # Cumulative Delta (buy/sell pressure divergence)
+  cum_delta_enabled: true
+  cum_delta_lookback: 50
+  cum_delta_divergence_lookback: 20
+  # Murray Math Lines (harmonic support/resistance)
+  murray_enabled: true
+  murray_period: 64
+  murray_proximity_pct: 0.3
+
+risk:
+  risk_per_trade: 0.5
+  max_open_positions: 2
+  max_per_symbol: 1
+  max_per_group: 1
+  commission_rate: 0.055
+  max_margin_usdt: 60000             # Max initial margin for this instance ($)
+  min_tp_net: 0
+  cooldown_after_loss: 5
+  stop_loss: 1.5
+  take_profit: 4.0
+  atr_period: 14
+  atr_sl_multiplier: 1.0
+  atr_tp_multiplier: 2.5
+  atr_trailing_multiplier: 1.0
+  atr_sl_max: 5.0
+  atr_sl_min: 0.5
+  atr_tp_max: 5.0
+  atr_tp_min: 1.0
+  atr_trail_max: 3.0
+  atr_trail_min: 0.3
+  trailing_stop: 0
+  trailing_activation: 0
+  breakeven_activation: 0
+  max_daily_loss: 0
+  smart_exit_min: 0
+  partial_close_enabled: false
+  correlation_groups:
+    majors:
+      - BTCUSDT
+      - ETHUSDT
+    alt_l1:
+      - SOLUSDT
+      - SUIUSDT
+      - APTUSDT
+
+ai:
+  enabled: false
+  api_key: "sk-2dec36c8752d48b6b2cfdedd21337126"
+  provider: deepseek
+  model: deepseek-chat
+  min_confidence: 6
+  timeout: 10
+  review_interval: 9999
+  style: smc
+  extra_timeframes: ["5", "15", "60"]
+
+telegram:
+  token: "7852966698:AAFA_L6ovqXtTmMO05DBZg3UYbx4DklIY7k"
+  chat_id: "885025581"
+  notify_only: true
+
+dashboard:
+  enabled: false
+  port: 8080
+  username: "ityanav"
+  password_hash: "$2b$12$nkNYfoUba3r6SkwXealnduvAay.TzvkLvLNfBRxvICjfLxC.osU1e"
+  secret: "f390917c31c0730992cef29d79739f023c15e555ed045b9cc5b5282298fa29eb"
+
+other_instances:
+  - name: "TBANK-SCALP"
+    db_path: "/root/stasik/data/tbank_scalp.db"
+    service: "stasik-tbank-scalp"
+    timeframe: "15м"
+    leverage: "1x"
+    pairs: ["SBER", "GAZP", "YDEX", "LKOH", "ROSN"]
+  - name: "TBANK-SWING"
+    db_path: "/root/stasik/data/tbank_swing.db"
+    service: "stasik-tbank-swing"
+    timeframe: "D"
+    leverage: "1x"
+    pairs: ["SBER", "GAZP", "LKOH"]
+  - name: "BUBA"
+    db_path: "/root/stasik/data/buba.db"
+    service: "stasik-buba"
+    timeframe: "1H"
+    leverage: "3x"
+    pairs: ["BTCUSDT", "ETHUSDT", "SOLUSDT", "SUIUSDT", "APTUSDT"]
+  - name: "MIDAS"
+    db_path: "/root/stasik/data/midas.db"
+    service: "stasik-midas"
+    timeframe: "5м"
+    leverage: "1x"
+    pairs: ["GLDRUB_TOM", "SLVRUB_TOM", "PLTRUB_TOM", "CNYRUB_TOM", "USD000UTSTOM", "KZTRUB_TOM"]

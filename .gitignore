@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.pyo
+.env
+data/
+bot.log
+config/config.yaml
+config/swing.yaml
+config/tbank_scalp.yaml
+config/tbank_swing.yaml
+*.log
+.idea/
+.vscode/

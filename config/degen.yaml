@@ -1,0 +1,137 @@
+instance_name: "DEGEN"
+initial_balance: 164235
+
+bybit:
+  testnet: false
+  demo: true
+  api_key: "Ct24OvPFimR3vLSlcW"
+  api_secret: "CNzK2w9eQ41j4A4dszBLvvOkAH61Z5BQG9oq"
+
+database:
+  path: "/root/stasik/data/degen.db"
+
+trading:
+  pairs: ["DOGEUSDT", "TRUMPUSDT", "WIFUSDT", "1000PEPEUSDT", "SHIB1000USDT", "1000BONKUSDT", "FARTCOINUSDT", "POPCATUSDT", "MOODENGUSDT", "VIRTUALUSDT"]
+  market_type: "futures"
+  timeframe: "1"                    # 1 мин — агрессивный скальп мемов
+  tick_interval: 5                  # проверка каждые 5 сек
+  htf_timeframe: "15"               # 15м HTF (раньше 1H)
+  leverage: 10                      # 10x
+  trading_hours: [0, 24]            # 24/7
+
+strategy:
+  strategy_mode: "kotegawa"
+  # SMA deviation — мемы: ослаблено, чтобы ловить средние движения
+  sma_period: 25
+  sma_deviation_mild: 1.5            # 1.5% отклонение → score +-1 (было 3% — слишком жёстко)
+  sma_deviation_extreme: 5.0         # 5% отклонение → score +-2 (было 8%)
+  # RSI — умеренные пороги для мемов
+  rsi_period: 14
+  rsi_overbought: 72                 # было 78
+  rsi_oversold: 28                   # было 22
+  rsi_extreme_low: 15                # было 12
+  rsi_extreme_high: 85               # было 88
+  # EMA для HTF
+  ema_fast: 12
+  ema_slow: 26
+  # MACD
+  macd_fast: 8
+  macd_slow: 17
+  macd_signal: 9
+  # Bollinger Bands
+  bb_period: 20
+  bb_std: 2.0
+  # Volume
+  vol_period: 14
+  vol_threshold: 1.3                 # 1.3x объём (было 1.5)
+  # Scoring
+  min_score: 3                       # 3 из 8 (было 4 — невозможно набрать)
+  adx_period: 14
+  adx_min: 15                        # 15 (было 18)
+  fng_extreme_greed: 100
+  fng_extreme_fear: 0
+  funding_rate_max: 999
+  patterns_enabled: true
+  orderbook_enabled: true
+  market_bias: false
+  htf_filter: true
+  htf_score_min: 3                   # было 4
+  htf_min_sma_dev: 0.5              # было 1.0% — мемы на часовке двигаются мало
+  reversal_confirmation: false
+  reversal_candles: 1
+  reversal_max_wait: 3
+  kotegawa_exit_ratio: 0.5
+  scale_out_enabled: true
+  scale_out_stages: [0.20, 0.40, 0.50]
+  scale_out_sizes: [0.35, 0.35, 0.30]
+  # Liquidity filter
+  min_24h_turnover: 3000000          # $3M (было $5M — отсекало мелкие мемы)
+  max_spread_pct: 0.05
+  # Anti-pump filter
+  pump_filter: true
+  pump_candle_pct: 5.0
+  pump_vol_spike: 3.0
+  pump_min_steps: 2
+
+risk:
+  risk_per_trade: 1.0                # 1% баланса (было 0.5%)
+  stop_loss: 2.0                     # фолбэк SL 2%
+  take_profit: 4.0                   # фолбэк TP 4%
+  max_open_positions: 5
+  max_daily_loss: 5.0
+  daily_drawdown_from_profit: 50
+  trailing_stop: 1.0
+  trailing_activation: 2.0
+  partial_close_enabled: false
+  # ATR-based dynamic SL/TP
+  atr_period: 14
+  atr_sl_multiplier: 2.0
+  atr_tp_multiplier: 4.0
+  atr_trailing_multiplier: 1.5
+  # ATR clamp
+  atr_sl_min: 1.0
+  atr_sl_max: 4.0
+  atr_tp_min: 2.0
+  atr_tp_max: 8.0
+  atr_trail_min: 0.8
+  atr_trail_max: 3.0
+  # Cooldown
+  cooldown_after_loss: 10            # 10 мин (было 30 — слишком долго)
+  breakeven_activation: 0
+  # Commission-aware TP
+  commission_rate: 0.055
+  min_tp_net: 100                    # $100 чистой прибыли (было $500 — нереально при 1% risk)
+  # Correlation
+  max_per_group: 2
+  correlation_groups:
+    dog_memes: ["DOGEUSDT", "SHIB1000USDT", "1000BONKUSDT"]
+    sol_memes: ["WIFUSDT", "POPCATUSDT", "MOODENGUSDT"]
+    degen: ["1000PEPEUSDT", "FARTCOINUSDT"]
+    political: ["TRUMPUSDT"]
+    ai_agents: ["VIRTUALUSDT"]
+
+ai:
+  enabled: true
+  provider: "deepseek"
+  api_key: "sk-2dec36c8752d48b6b2cfdedd21337126"
+  model: "deepseek-chat"
+  style: "kotegawa"
+  min_confidence: 4                   # было 6 — слишком строго
+  timeout: 10
+  review_interval: 0
+  extra_timeframes: ["1", "5", "15"]
+
+other_instances:
+  - name: "SCALP"
+    db_path: "/root/stasik/data/trades.db"
+    service: "stasik"
+    timeframe: "5м"
+    leverage: "10x"
+    pairs: ["BTCUSDT", "ETHUSDT", "XRPUSDT", "ADAUSDT", "AVAXUSDT", "LINKUSDT", "NEARUSDT", "SUIUSDT", "APTUSDT"]
+telegram:
+  token: "7852966698:AAFA_L6ovqXtTmMO05DBZg3UYbx4DklIY7k"
+  chat_id: "885025581"
+  notify_only: true
+
+dashboard:
+  enabled: false

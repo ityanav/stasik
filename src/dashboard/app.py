@@ -1,0 +1,3640 @@
+import asyncio
+import json
+import logging
+import subprocess
+import time
+from datetime import date, datetime, timedelta
+from pathlib import Path
+
+import aiohttp
+import aiosqlite
+from aiohttp import web
+
+from src.dashboard.auth import AuthManager, COOKIE_NAME
+from src.storage.database import Database
+
+logger = logging.getLogger(__name__)
+
+
+_ARCHIVE_MAP = {
+    "trades.db": "archive_scalp.db",
+    "degen.db": "archive_degen.db",
+"tbank_scalp.db": "archive_tbank_scalp.db",
+    "tbank_swing.db": "archive_tbank_swing.db",
+}
+
+
+def _get_db_path(live_path: str, source: str) -> str:
+    """Return archive DB path if source='archive', else the live path."""
+    if source != "archive":
+        return live_path
+    p = Path(live_path)
+    archive_name = _ARCHIVE_MAP.get(p.name)
+    if archive_name:
+        return str(p.parent / archive_name)
+    return live_path
+
+
+def _other_instances(config: dict) -> list[dict]:
+    """Return other_instances from config."""
+    return config.get("other_instances", [])
+
+
+class Dashboard:
+    def __init__(self, config: dict, db: Database, engine=None):
+        self.config = config
+        self.db = db
+        self.engine = engine
+        self.port = config.get("dashboard", {}).get("port", 8080)
+        self.auth = AuthManager(config)
+        self.app = web.Application(middlewares=[self.auth.middleware()])
+        self._setup_routes()
+        self._runner: web.AppRunner | None = None
+        self._night_settings_path = Path("config/night_settings.json")
+        self._sale_settings_path = Path("config/sale_settings.json")
+
+        # Standalone Bybit client (used when engine is None)
+        self._client = None
+        if not engine and config.get("bybit"):
+            try:
+                from src.exchange.client import BybitClient
+                self._client = BybitClient(config)
+                logger.info("Dashboard: standalone BybitClient initialized")
+            except Exception:
+                logger.warning("Dashboard: failed to init standalone BybitClient")
+
+        # Cached TBank client (avoid re-init on every request)
+        self._tbank_client = None
+        self._init_tbank_client()
+
+        # TTL caches for expensive operations
+        import time as _time
+        self._cache = {}  # key -> (value, expires_at)
+        self._cache_time = _time
+
+    def _get_client(self):
+        """Get Bybit client from engine or standalone."""
+        if self.engine:
+            return self.engine.client
+        return self._client
+
+    def _init_tbank_client(self):
+        """Init cached TBank client from first available config."""
+        try:
+            from src.exchange.tbank_client import TBankClient
+            import yaml as _yaml
+            for cfg_path in ("config/tbank_scalp.yaml", "config/midas.yaml"):
+                if Path(cfg_path).exists():
+                    with open(cfg_path) as f:
+                        tcfg = _yaml.safe_load(f)
+                    self._tbank_client = TBankClient(tcfg)
+                    logger.info("Dashboard: standalone TBankClient initialized")
+                    return
+        except Exception as e:
+            logger.warning("Dashboard: failed to init TBankClient: %s", e)
+
+    def _get_tbank_client(self):
+        """Get cached TBank client."""
+        return self._tbank_client
+
+    def _cache_get(self, key: str):
+        """Get value from TTL cache, returns None if expired/missing."""
+        entry = self._cache.get(key)
+        if entry and self._cache_time.time() < entry[1]:
+            return entry[0]
+        return None
+
+    def _cache_set(self, key: str, value, ttl: float = 5.0):
+        """Set value in TTL cache."""
+        self._cache[key] = (value, self._cache_time.time() + ttl)
+
+    def _get_bybit_positions_cached(self):
+        """Get Bybit positions with 5s cache."""
+        cached = self._cache_get("bybit_positions")
+        if cached is not None:
+            return cached
+        client = self._get_client()
+        if not client:
+            return []
+        try:
+            raw = client.get_positions(category="linear")
+            self._cache_set("bybit_positions", raw, 5.0)
+            return raw
+        except Exception:
+            return []
+
+    def _get_tbank_positions_cached(self):
+        """Get TBank positions with 5s cache."""
+        cached = self._cache_get("tbank_positions")
+        if cached is not None:
+            return cached
+        tc = self._get_tbank_client()
+        if not tc:
+            return []
+        try:
+            raw = tc.get_positions()
+            self._cache_set("tbank_positions", raw, 5.0)
+            return raw
+        except Exception:
+            return []
+
+    def _get_bybit_balance_cached(self):
+        """Get Bybit balance with 10s cache."""
+        cached = self._cache_get("bybit_balance")
+        if cached is not None:
+            return cached
+        client = self._get_client()
+        if not client:
+            return 0.0
+        try:
+            bal = client.get_balance()
+            self._cache_set("bybit_balance", bal, 10.0)
+            return bal
+        except Exception:
+            return 0.0
+
+    def _get_tbank_balance_cached(self):
+        """Get TBank balance with 10s cache."""
+        cached = self._cache_get("tbank_balance")
+        if cached is not None:
+            return cached
+        tc = self._get_tbank_client()
+        if not tc:
+            return 0.0
+        try:
+            bal = tc.get_balance()
+            self._cache_set("tbank_balance", bal, 10.0)
+            return bal
+        except Exception:
+            return 0.0
+
+    def _check_service_active(self, service: str) -> bool:
+        """Check systemctl is-active with 10s cache."""
+        cache_key = f"svc_{service}"
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            return cached
+        try:
+            result = subprocess.run(
+                ["systemctl", "is-active", service],
+                capture_output=True, text=True, timeout=3,
+            )
+            active = result.stdout.strip() == "active"
+            self._cache_set(cache_key, active, 10.0)
+            return active
+        except Exception:
+            self._cache_set(cache_key, False, 10.0)
+            return False
+
+    def _setup_routes(self):
+        self.app.router.add_get("/login", self._login_page)
+        self.app.router.add_post("/login", self._login_post)
+        self.app.router.add_get("/logout", self._logout)
+        self.app.router.add_get("/", self._index)
+        self.app.router.add_get("/api/stats", self._api_stats)
+        self.app.router.add_get("/api/trades", self._api_trades)
+        self.app.router.add_get("/api/pnl", self._api_pnl)
+        self.app.router.add_get("/api/positions", self._api_positions)
+        self.app.router.add_post("/api/toggle-service", self._api_toggle_service)
+        self.app.router.add_post("/api/close-position", self._api_close_position)
+        self.app.router.add_post("/api/close-all", self._api_close_all)
+        self.app.router.add_post("/api/double-position", self._api_double_position)
+        self.app.router.add_post("/api/set-sl", self._api_set_sl)
+        self.app.router.add_post("/api/set-tp", self._api_set_tp)
+        self.app.router.add_get("/api/instances", self._api_instances)
+        self.app.router.add_get("/api/pair-pnl", self._api_pair_pnl)
+        self.app.router.add_post("/api/set-leverage", self._api_set_leverage)
+        self.app.router.add_get("/api/events", self._api_events)
+        self.app.router.add_get("/api/night-settings", self._api_night_settings_get)
+        self.app.router.add_post("/api/night-settings", self._api_night_settings_post)
+        self.app.router.add_get("/api/sale-settings", self._api_sale_settings_get)
+        self.app.router.add_post("/api/sale-settings", self._api_sale_settings_post)
+
+    async def start(self):
+        self._runner = web.AppRunner(self.app)
+        await self._runner.setup()
+        site = web.TCPSite(self._runner, "127.0.0.1", self.port)
+        await site.start()
+        logger.info("Dashboard started on 127.0.0.1:%d", self.port)
+        self._night_task = asyncio.create_task(self._night_loop())
+        self._sale_task = asyncio.create_task(self._sale_loop())
+
+    async def stop(self):
+        if hasattr(self, "_night_task") and self._night_task:
+            self._night_task.cancel()
+        if hasattr(self, "_sale_task") and self._sale_task:
+            self._sale_task.cancel()
+        if self._runner:
+            await self._runner.cleanup()
+            logger.info("Dashboard stopped")
+
+    # --- Night mode (server-side) ---
+
+    def _night_read_settings(self) -> dict:
+        """Read night mode settings from JSON file."""
+        try:
+            if self._night_settings_path.exists():
+                return json.loads(self._night_settings_path.read_text())
+        except Exception:
+            pass
+        return {"enabled": False, "target": 0}
+
+    async def _night_get_positions_with_pnl(self) -> list[dict]:
+        """Get all open positions with unrealised PnL (reuses existing logic)."""
+        positions = []
+        instance_name = self.config.get("instance_name", "SCALP")
+
+        # Main instance
+        main_open = await self.db.get_open_trades()
+        for t in main_open:
+            positions.append({
+                "symbol": t["symbol"],
+                "side": t["side"],
+                "size": float(t["qty"]),
+                "entry_price": float(t["entry_price"]),
+                "unrealised_pnl": 0.0,
+                "instance": instance_name,
+            })
+
+        # Other instances
+        for inst in _other_instances(self.config):
+            inst_name = inst.get("name", "???")
+            db_path = inst.get("db_path", "")
+            if db_path and Path(db_path).exists():
+                try:
+                    async with aiosqlite.connect(db_path) as db:
+                        db.row_factory = aiosqlite.Row
+                        cur = await db.execute(
+                            "SELECT symbol, side, entry_price, qty FROM trades WHERE status = 'open'"
+                        )
+                        rows = await cur.fetchall()
+                        for r in rows:
+                            positions.append({
+                                "symbol": r["symbol"],
+                                "side": r["side"],
+                                "size": float(r["qty"]),
+                                "entry_price": float(r["entry_price"]),
+                                "unrealised_pnl": 0.0,
+                                "instance": inst_name,
+                            })
+                except Exception:
+                    pass
+
+        # Enrich with live prices — Bybit
+        client = self._get_client()
+        if client:
+            try:
+                raw = self._get_bybit_positions_cached()
+                live_mark = {p["symbol"]: float(p.get("mark_price") or 0) for p in raw}
+                for pos in positions:
+                    inst_upper = (pos["instance"] or "").upper()
+                    if "TBANK" in inst_upper or "MIDAS" in inst_upper:
+                        continue
+                    mark = live_mark.get(pos["symbol"], 0)
+                    if not mark:
+                        try:
+                            mark = client.get_last_price(pos["symbol"], category="linear")
+                        except Exception:
+                            pass
+                    if mark > 0:
+                        direction = 1 if pos["side"] == "Buy" else -1
+                        pos["unrealised_pnl"] = round(
+                            (mark - float(pos["entry_price"])) * float(pos["size"]) * direction, 2
+                        )
+            except Exception:
+                pass
+
+        # Enrich — TBank/Midas
+        tc = self._get_tbank_client()
+        if tc:
+            try:
+                tbank_raw = self._get_tbank_positions_cached()
+                tbank_mark = {p["symbol"]: p for p in tbank_raw}
+                for pos in positions:
+                    inst_upper = (pos["instance"] or "").upper()
+                    if "TBANK" not in inst_upper and "MIDAS" not in inst_upper:
+                        continue
+                    live = tbank_mark.get(pos["symbol"])
+                    if live:
+                        pos["unrealised_pnl"] = round(float(live.get("unrealised_pnl", 0)), 2)
+                    else:
+                        try:
+                            mark = tc.get_last_price(pos["symbol"])
+                            if mark > 0:
+                                direction = 1 if pos["side"] == "Buy" else -1
+                                pos["unrealised_pnl"] = round(
+                                    (mark - float(pos["entry_price"])) * float(pos["size"]) * direction, 2
+                                )
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+        return positions
+
+    async def _night_close_position(self, instance: str, symbol: str, side: str):
+        """Close a position via exchange + DB (reuses close-position logic)."""
+        is_tbank = any(k in (instance or "").upper() for k in ("TBANK", "MIDAS"))
+        exchange_closed = False
+
+        if is_tbank:
+            try:
+                from src.exchange.tbank_client import TBankClient
+                for inst in _other_instances(self.config):
+                    if inst.get("name", "").upper() == (instance or "").upper():
+                        cfg_path = inst.get("config_path", "")
+                        if cfg_path and Path(cfg_path).exists():
+                            import yaml
+                            with open(cfg_path) as f:
+                                tcfg = yaml.safe_load(f)
+                            tc = TBankClient(tcfg)
+                            positions = tc.get_positions(symbol=symbol)
+                            for p in positions:
+                                if p["symbol"] == symbol and p["size"] > 0:
+                                    close_side = "Sell" if p["side"] == "Buy" else "Buy"
+                                    tc.place_order(symbol=symbol, side=close_side, qty=p["size"])
+                                    exchange_closed = True
+                            break
+            except Exception as e:
+                logger.warning("[NIGHT] Failed to close %s on TBank: %s", symbol, e)
+        else:
+            client = self._get_client()
+            if client:
+                try:
+                    positions = client.get_positions(symbol=symbol, category="linear")
+                    for p in positions:
+                        if p["symbol"] == symbol and p["size"] > 0:
+                            close_side = "Sell" if p["side"] == "Buy" else "Buy"
+                            client.place_order(
+                                symbol=symbol, side=close_side, qty=p["size"],
+                                category="linear", reduce_only=True,
+                            )
+                            exchange_closed = True
+                except Exception:
+                    logger.warning("[NIGHT] Failed to close %s on Bybit", symbol)
+
+        # Close in DB
+        db_path = self._resolve_instance_db(instance)
+        if db_path and Path(db_path).exists():
+            try:
+                mark = 0
+                if not is_tbank:
+                    client = self._get_client()
+                    if client:
+                        try:
+                            mark = client.get_last_price(symbol, category="linear")
+                        except Exception:
+                            pass
+                async with aiosqlite.connect(db_path) as db:
+                    db.row_factory = aiosqlite.Row
+                    cur = await db.execute(
+                        "SELECT id, side, entry_price, qty FROM trades WHERE symbol=? AND status='open'",
+                        (symbol,),
+                    )
+                    rows = await cur.fetchall()
+                    for r in rows:
+                        entry = float(r["entry_price"])
+                        qty = float(r["qty"])
+                        pnl = 0.0
+                        if mark > 0:
+                            direction = 1 if r["side"] == "Buy" else -1
+                            pnl = round((mark - entry) * qty * direction, 2)
+                        await db.execute(
+                            "UPDATE trades SET exit_price=?, pnl=?, status='closed', closed_at=? WHERE id=?",
+                            (mark if mark > 0 else entry, pnl, datetime.now(timezone(timedelta(hours=3))).strftime("%Y-%m-%dT%H:%M:%S.%f"), r["id"]),
+                        )
+                    await db.commit()
+            except Exception:
+                logger.exception("[NIGHT] Failed to close %s in DB", symbol)
+
+        logger.info("[NIGHT] Closed %s/%s (exchange=%s)", instance, symbol, exchange_closed)
+
+    async def _night_notify(self, instance: str, symbol: str, side: str, net_pnl: float, target: int):
+        """Send Telegram notification about night-mode close."""
+        tg = self.config.get("telegram", {})
+        token = tg.get("token")
+        chat_id = tg.get("chat_id")
+        if not token or not chat_id:
+            return
+        currency = "RUB" if any(k in (instance or "").upper() for k in ("TBANK", "MIDAS")) else "USDT"
+        icon = "🟢" if net_pnl >= 0 else "🔴"
+        from datetime import timezone, timedelta
+        msk = datetime.now(timezone(timedelta(hours=3)))
+        msk_time = msk.strftime("%H:%M")
+        text = f"{icon} {net_pnl:+,.2f} {currency} [{instance}] [{msk_time} MSK]"
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        try:
+            async with aiohttp.ClientSession() as session:
+                await session.post(url, json={"chat_id": chat_id, "text": text})
+        except Exception as e:
+            logger.warning("[NIGHT] Telegram notify failed: %s", e)
+
+    async def _night_loop(self):
+        """Background loop: check positions and auto-close when net PnL >= target."""
+        logger.info("[NIGHT] Background loop started")
+        closing = set()  # track in-flight closes
+        while True:
+            try:
+                await asyncio.sleep(10)
+                settings = self._night_read_settings()
+                if not settings.get("enabled") or not settings.get("target"):
+                    continue
+
+                target = settings["target"]
+                positions = await self._night_get_positions_with_pnl()
+
+                for pos in positions:
+                    gross_pnl = pos.get("unrealised_pnl", 0)
+                    inst_upper = (pos.get("instance") or "").upper()
+                    fee_rate = 0.0004 if ("TBANK" in inst_upper or "MIDAS" in inst_upper) else 0.00055
+                    entry_amount = float(pos["entry_price"]) * float(pos["size"])
+                    fee = entry_amount * fee_rate * 2
+                    net_pnl = gross_pnl - fee
+
+                    if net_pnl >= target:
+                        key = f"{pos['instance']}_{pos['symbol']}"
+                        if key in closing:
+                            continue
+                        closing.add(key)
+                        logger.info(
+                            "[NIGHT] Target hit: %s net=%.2f target=%d — closing",
+                            key, net_pnl, target,
+                        )
+                        try:
+                            await self._night_close_position(
+                                pos["instance"], pos["symbol"], pos["side"],
+                            )
+                            await self._night_notify(
+                                pos["instance"], pos["symbol"], pos["side"],
+                                net_pnl, target,
+                            )
+                        except Exception:
+                            logger.exception("[NIGHT] Error closing %s", key)
+                        finally:
+                            closing.discard(key)
+            except asyncio.CancelledError:
+                logger.info("[NIGHT] Background loop stopped")
+                return
+            except Exception:
+                logger.exception("[NIGHT] Loop error")
+
+    # --- SALE mode (Bybit only, GROSS PnL) ---
+
+    def _sale_read_settings(self) -> dict:
+        try:
+            if self._sale_settings_path.exists():
+                return json.loads(self._sale_settings_path.read_text())
+        except Exception:
+            pass
+        return {"enabled": False, "target": 0}
+
+    async def _sale_close_position(self, instance: str, symbol: str, side: str):
+        """Close a Bybit position (SALE mode — Bybit only)."""
+        exchange_closed = False
+        client = self._get_client()
+        if client:
+            try:
+                positions = client.get_positions(symbol=symbol, category="linear")
+                for p in positions:
+                    if p["symbol"] == symbol and p["size"] > 0:
+                        close_side = "Sell" if p["side"] == "Buy" else "Buy"
+                        client.place_order(
+                            symbol=symbol, side=close_side, qty=p["size"],
+                            category="linear", reduce_only=True,
+                        )
+                        exchange_closed = True
+            except Exception:
+                logger.warning("[SALE] Failed to close %s on Bybit", symbol)
+
+        db_path = self._resolve_instance_db(instance)
+        if db_path and Path(db_path).exists():
+            try:
+                mark = 0
+                if client:
+                    try:
+                        mark = client.get_last_price(symbol, category="linear")
+                    except Exception:
+                        pass
+                async with aiosqlite.connect(db_path) as db:
+                    db.row_factory = aiosqlite.Row
+                    cur = await db.execute(
+                        "SELECT id, side, entry_price, qty FROM trades WHERE symbol=? AND status='open'",
+                        (symbol,),
+                    )
+                    rows = await cur.fetchall()
+                    for r in rows:
+                        entry = float(r["entry_price"])
+                        qty = float(r["qty"])
+                        pnl = 0.0
+                        if mark > 0:
+                            direction = 1 if r["side"] == "Buy" else -1
+                            pnl = round((mark - entry) * qty * direction, 2)
+                        await db.execute(
+                            "UPDATE trades SET exit_price=?, pnl=?, status='closed', closed_at=? WHERE id=?",
+                            (mark if mark > 0 else entry, pnl, datetime.now(timezone(timedelta(hours=3))).strftime("%Y-%m-%dT%H:%M:%S.%f"), r["id"]),
+                        )
+                    await db.commit()
+            except Exception:
+                logger.exception("[SALE] Failed to close %s in DB", symbol)
+
+        logger.info("[SALE] Closed %s/%s (exchange=%s)", instance, symbol, exchange_closed)
+
+    async def _sale_notify(self, instance: str, symbol: str, side: str, gross_pnl: float, target: int):
+        tg = self.config.get("telegram", {})
+        token = tg.get("token")
+        chat_id = tg.get("chat_id")
+        if not token or not chat_id:
+            return
+        # Calculate net PnL
+        inst_upper = (instance or "").upper()
+        fee_rate = 0.0004 if ("TBANK" in inst_upper or "MIDAS" in inst_upper) else 0.00055
+        net_pnl = gross_pnl  # gross_pnl passed from sale_loop already
+        icon = "🟢" if net_pnl >= 0 else "🔴"
+        from datetime import timezone, timedelta
+        msk = datetime.now(timezone(timedelta(hours=3)))
+        msk_time = msk.strftime("%H:%M")
+        text = f"{icon} {net_pnl:+,.2f} USDT [{instance}] [{msk_time} MSK]"
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        try:
+            async with aiohttp.ClientSession() as session:
+                await session.post(url, json={"chat_id": chat_id, "text": text})
+        except Exception as e:
+            logger.warning("[SALE] Telegram notify failed: %s", e)
+
+    async def _sale_loop(self):
+        """Background loop: close Bybit positions when GROSS PnL >= target."""
+        logger.info("[SALE] Background loop started")
+        closing = set()
+        while True:
+            try:
+                await asyncio.sleep(10)
+                settings = self._sale_read_settings()
+                if not settings.get("enabled") or not settings.get("target"):
+                    continue
+
+                target = settings["target"]
+                positions = await self._night_get_positions_with_pnl()
+
+                for pos in positions:
+                    inst_upper = (pos.get("instance") or "").upper()
+                    # SALE only for Bybit
+                    if "TBANK" in inst_upper or "MIDAS" in inst_upper:
+                        continue
+
+                    gross_pnl = pos.get("unrealised_pnl", 0)
+                    if gross_pnl >= target:
+                        key = f"{pos['instance']}_{pos['symbol']}"
+                        if key in closing:
+                            continue
+                        closing.add(key)
+                        logger.info(
+                            "[SALE] Target hit: %s gross=%.2f target=%d — closing",
+                            key, gross_pnl, target,
+                        )
+                        try:
+                            await self._sale_close_position(
+                                pos["instance"], pos["symbol"], pos["side"],
+                            )
+                            await self._sale_notify(
+                                pos["instance"], pos["symbol"], pos["side"],
+                                gross_pnl, target,
+                            )
+                        except Exception:
+                            logger.exception("[SALE] Error closing %s", key)
+                        finally:
+                            closing.discard(key)
+            except asyncio.CancelledError:
+                logger.info("[SALE] Background loop stopped")
+                return
+            except Exception:
+                logger.exception("[SALE] Loop error")
+
+    # --- Auth routes ---
+
+    async def _login_page(self, request: web.Request) -> web.Response:
+        ip = request.headers.get("X-Real-IP", request.remote)
+        error = ""
+        blocked = self.auth.is_blocked(ip)
+        if blocked:
+            error = '<div class="error">IP заблокирован. Подождите 15 минут.</div>'
+        question, token = self.auth.generate_captcha()
+        html = _LOGIN_HTML.replace("{{error}}", error)
+        html = html.replace("{{captcha_question}}", question)
+        html = html.replace("{{captcha_token}}", token)
+        html = html.replace("{{blocked}}", "disabled" if blocked else "")
+        return web.Response(text=html, content_type="text/html")
+
+    async def _login_post(self, request: web.Request) -> web.Response:
+        ip = request.headers.get("X-Real-IP", request.remote)
+        if self.auth.is_blocked(ip):
+            raise web.HTTPFound("/login")
+
+        data = await request.post()
+        username = data.get("username", "")
+        password = data.get("password", "")
+        captcha_answer = data.get("captcha", "")
+        captcha_token = data.get("captcha_token", "")
+
+        if not self.auth.verify_captcha(captcha_token, captcha_answer):
+            self.auth.record_fail(ip)
+            raise web.HTTPFound("/login")
+
+        if not self.auth.check_password(username, password):
+            self.auth.record_fail(ip)
+            raise web.HTTPFound("/login")
+
+        self.auth.clear_fails(ip)
+        cookie_value = self.auth.create_session_cookie(username)
+        resp = web.HTTPFound("/")
+        resp.set_cookie(
+            COOKIE_NAME,
+            cookie_value,
+            max_age=86400,
+            httponly=True,
+            secure=True,
+            samesite="Lax",
+        )
+        return resp
+
+    async def _logout(self, request: web.Request) -> web.Response:
+        resp = web.HTTPFound("/login")
+        resp.del_cookie(COOKIE_NAME)
+        return resp
+
+    # --- API routes ---
+
+    async def _index(self, request: web.Request) -> web.Response:
+        return web.Response(text=_DASHBOARD_HTML, content_type="text/html",
+                            headers={"Cache-Control": "no-cache, no-store, must-revalidate"})
+
+    async def _api_stats(self, request: web.Request) -> web.Response:
+        source = request.query.get("source", "live")
+        is_archive = source == "archive"
+
+        if is_archive:
+            archive_path = _get_db_path(str(self.db.db_path), source)
+            daily_pnl = 0.0
+            total_pnl = 0.0
+            open_count = 0
+            total = 0
+            wins = 0
+            losses = 0
+            if Path(archive_path).exists():
+                try:
+                    async with aiosqlite.connect(archive_path) as db:
+                        db.row_factory = aiosqlite.Row
+                        cur = await db.execute(
+                            "SELECT COALESCE(SUM(pnl), 0) as total FROM trades WHERE status = 'closed'"
+                        )
+                        row = await cur.fetchone()
+                        if row:
+                            total_pnl = float(row["total"])
+                        cur = await db.execute("SELECT COUNT(*) as cnt FROM trades WHERE status = 'open'")
+                        row = await cur.fetchone()
+                        if row:
+                            open_count = int(row["cnt"])
+                        cur = await db.execute(
+                            "SELECT COUNT(*) as total, "
+                            "COALESCE(SUM(CASE WHEN pnl >= 0 THEN 1 ELSE 0 END), 0) as wins, "
+                            "COALESCE(SUM(CASE WHEN pnl < 0 THEN 1 ELSE 0 END), 0) as losses "
+                            "FROM trades WHERE status = 'closed'"
+                        )
+                        row = await cur.fetchone()
+                        if row:
+                            total = int(row["total"])
+                            wins = int(row["wins"])
+                            losses = int(row["losses"])
+                except Exception:
+                    logger.warning("Failed to read archive stats from %s", archive_path)
+        else:
+            daily_pnl = await self.db.get_daily_pnl()
+            total_pnl = await self.db.get_total_pnl()
+            open_trades = await self.db.get_open_trades()
+            stats = await self.db.get_trade_stats()
+            total = stats["total"]
+            wins = stats["wins"]
+            losses = stats["losses"]
+            open_count = len(open_trades)
+
+        balance = 0.0
+        running = False
+        tbank_balance = 0.0
+        if not is_archive:
+            balance = self._get_bybit_balance_cached()
+            _all_services = [
+                "stasik-fiba", "stasik-tbank-scalp", "stasik-tbank-swing",
+                "stasik-midas", "stasik-fin",
+            ]
+            running = any(self._check_service_active(s) for s in _all_services)
+
+        exchange = self.config.get("exchange", "bybit")
+        currency = "RUB" if exchange == "tbank" else "USDT"
+
+        # Total trades across all instances + today's net PnL per currency
+        all_trades = total
+        today_pnl_usdt = daily_pnl  # main instance (SCALP) is USDT
+        today_pnl_rub = 0.0
+        _today_sql = (
+            "SELECT COALESCE(SUM(pnl), 0) as total FROM trades "
+            "WHERE status = 'closed' AND date(closed_at) = date('now')"
+        )
+        _combined_sql = (
+            "SELECT COUNT(*) as cnt, "
+            "COALESCE(SUM(CASE WHEN date(closed_at) = date('now') THEN pnl ELSE 0 END), 0) as today "
+            "FROM trades WHERE status='closed'"
+        )
+        for inst in _other_instances(self.config):
+            db_path = _get_db_path(inst.get("db_path", ""), source)
+            inst_name = inst.get("name", "")
+            is_rub = "TBANK" in inst_name.upper() or "MIDAS" in inst_name.upper()
+            if db_path and Path(db_path).exists():
+                try:
+                    async with aiosqlite.connect(db_path) as db:
+                        db.row_factory = aiosqlite.Row
+                        cur = await db.execute(_combined_sql)
+                        row = await cur.fetchone()
+                        if row:
+                            all_trades += int(row["cnt"])
+                            if not is_archive:
+                                pnl_val = float(row["today"])
+                                if is_rub:
+                                    today_pnl_rub += pnl_val
+                                else:
+                                    today_pnl_usdt += pnl_val
+                except Exception:
+                    pass
+            if not is_archive and "TBANK" in inst_name.upper() and tbank_balance == 0:
+                tbank_balance = self._get_tbank_balance_cached()
+
+        data = {
+            "balance": balance,
+            "tbank_balance": tbank_balance,
+            "daily_pnl": daily_pnl,
+            "total_pnl": total_pnl,
+            "today_pnl_usdt": round(today_pnl_usdt, 2),
+            "today_pnl_rub": round(today_pnl_rub, 2),
+            "open_positions": open_count,
+            "total_trades": total,
+            "all_trades": all_trades,
+            "wins": wins,
+            "losses": losses,
+            "win_rate": (wins / total * 100) if total > 0 else 0,
+            "running": running,
+            "currency": currency,
+            "source": source,
+        }
+        return web.json_response(data)
+
+    async def _api_trades(self, request: web.Request) -> web.Response:
+        page = int(request.query.get("page", "1"))
+        per_page = int(request.query.get("per_page", "20"))
+        source = request.query.get("source", "live")
+        date_param = request.query.get("date", "")
+        range_param = request.query.get("range", "day")
+
+        instance_name = self.config.get("instance_name", "SCALP")
+
+        # Build date filter for SQL
+        if date_param:
+            if range_param == "week":
+                try:
+                    end = (datetime.strptime(date_param, "%Y-%m-%d") + timedelta(days=7)).strftime("%Y-%m-%d")
+                except ValueError:
+                    end = date_param
+                date_where = f" AND date(closed_at) >= '{date_param}' AND date(closed_at) < '{end}'"
+            else:
+                date_where = f" AND date(closed_at) = '{date_param}'"
+        elif source == "archive":
+            date_where = ""
+        else:
+            # Live, today only
+            date_where = " AND date(closed_at) = date('now')"
+
+        # Collect all trades from all instances
+        all_trades = []
+
+        # Main instance trades — always use direct SQL for date filtering
+        main_db_path = _get_db_path(str(self.db.db_path), source)
+        if source == "archive":
+            if Path(main_db_path).exists():
+                try:
+                    async with aiosqlite.connect(main_db_path) as db:
+                        db.row_factory = aiosqlite.Row
+                        cur = await db.execute(
+                            f"SELECT * FROM trades WHERE 1=1{date_where} ORDER BY id DESC LIMIT 1000"
+                        )
+                        rows = await cur.fetchall()
+                        for r in rows:
+                            t = dict(r)
+                            t["instance"] = t.get("instance") or instance_name
+                            all_trades.append(t)
+                except Exception:
+                    logger.warning("Failed to read archive trades from %s", main_db_path)
+        else:
+            try:
+                async with aiosqlite.connect(str(self.db.db_path)) as db:
+                    db.row_factory = aiosqlite.Row
+                    cur = await db.execute(
+                        f"SELECT * FROM trades WHERE 1=1{date_where} ORDER BY id DESC LIMIT 1000"
+                    )
+                    rows = await cur.fetchall()
+                    for r in rows:
+                        t = dict(r)
+                        t["instance"] = t.get("instance") or instance_name
+                        all_trades.append(t)
+            except Exception:
+                logger.warning("Failed to read trades from main DB")
+
+        # Other instances trades
+        for inst in _other_instances(self.config):
+            db_path = _get_db_path(inst.get("db_path", ""), source)
+            inst_name = inst.get("name", "???")
+            if db_path and Path(db_path).exists():
+                try:
+                    async with aiosqlite.connect(db_path) as db:
+                        db.row_factory = aiosqlite.Row
+                        cur = await db.execute(
+                            f"SELECT * FROM trades WHERE 1=1{date_where} ORDER BY id DESC LIMIT 1000"
+                        )
+                        rows = await cur.fetchall()
+                        for r in rows:
+                            t = dict(r)
+                            t["instance"] = t.get("instance") or inst_name
+                            all_trades.append(t)
+                except Exception:
+                    logger.warning("Failed to read trades from %s", inst_name)
+
+        # Sort: open trades on top (newest first), then closed (newest first)
+        all_trades.sort(key=lambda t: (
+            0 if t.get("status") == "open" else 1,
+            t.get("closed_at") or t.get("opened_at") or "",
+        ), reverse=False)
+        # Reverse within groups: newest open first, newest closed first
+        open_trades = [t for t in all_trades if t.get("status") == "open"]
+        closed_trades = [t for t in all_trades if t.get("status") != "open"]
+        open_trades.sort(key=lambda t: t.get("opened_at") or "", reverse=True)
+        closed_trades.sort(key=lambda t: t.get("closed_at") or "", reverse=True)
+        all_trades = open_trades + closed_trades
+
+        # Enrich with leverage from config
+        for t in all_trades:
+            if "leverage" not in t or not t.get("leverage"):
+                t["leverage"] = self._get_instance_config_leverage(t.get("instance", ""))
+
+        # Paginate
+        offset = (page - 1) * per_page
+        page_trades = all_trades[offset:offset + per_page + 1]
+        has_next = len(page_trades) > per_page
+        if has_next:
+            page_trades = page_trades[:per_page]
+
+        return web.json_response({"trades": page_trades, "page": page, "has_next": has_next})
+
+    async def _api_pnl(self, request: web.Request) -> web.Response:
+        days = int(request.query.get("days", "30"))
+        tf = request.query.get("tf", "1D")  # 10m, 30m, 1H, 1D, 1M
+        source = request.query.get("source", "live")
+        date_param = request.query.get("date", "")
+        range_param = request.query.get("range", "day")
+
+        instance_name = self.config.get("instance_name", "SCALP")
+
+        return await self._pnl_intraday(tf, instance_name, source, date_param, range_param)
+
+    async def _pnl_daily(self, days: int, tf: str, instance_name: str, source: str = "live") -> web.Response:
+        """Daily or monthly PnL from daily_pnl table."""
+        limit = days if tf == "1D" else days * 30
+
+        pnl_by_key: dict[str, dict] = {}
+
+        # Main instance
+        main_db_path = _get_db_path(str(self.db.db_path), source)
+        if source == "archive":
+            if Path(main_db_path).exists():
+                try:
+                    async with aiosqlite.connect(main_db_path) as db:
+                        db.row_factory = aiosqlite.Row
+                        cur = await db.execute(
+                            "SELECT trade_date, pnl, trades_count FROM daily_pnl ORDER BY trade_date DESC LIMIT ?",
+                            (limit,),
+                        )
+                        rows = await cur.fetchall()
+                        for r in rows:
+                            raw_date = r["trade_date"]
+                            key = raw_date[:7] if tf == "1M" else raw_date
+                            if key not in pnl_by_key:
+                                pnl_by_key[key] = {"trade_date": key, "pnl": 0, "trades_count": 0}
+                            pnl_by_key[key]["pnl"] += r["pnl"]
+                            pnl_by_key[key]["trades_count"] += r["trades_count"]
+                            pnl_by_key[key][instance_name] = pnl_by_key[key].get(instance_name, 0) + r["pnl"]
+                except Exception:
+                    logger.warning("Failed to read archive PnL from %s", main_db_path)
+        else:
+            main_data = await self.db.get_daily_pnl_history(limit)
+            for d in main_data:
+                raw_date = d["trade_date"]
+                key = raw_date[:7] if tf == "1M" else raw_date
+                if key not in pnl_by_key:
+                    pnl_by_key[key] = {"trade_date": key, "pnl": 0, "trades_count": 0}
+                pnl_by_key[key]["pnl"] += d["pnl"]
+                pnl_by_key[key]["trades_count"] += d["trades_count"]
+                pnl_by_key[key][instance_name] = pnl_by_key[key].get(instance_name, 0) + d["pnl"]
+
+        # Other instances
+        for inst in _other_instances(self.config):
+            db_path = _get_db_path(inst.get("db_path", ""), source)
+            inst_name = inst.get("name", "???")
+            if db_path and Path(db_path).exists():
+                try:
+                    async with aiosqlite.connect(db_path) as db:
+                        db.row_factory = aiosqlite.Row
+                        cur = await db.execute(
+                            "SELECT trade_date, pnl, trades_count FROM daily_pnl ORDER BY trade_date DESC LIMIT ?",
+                            (limit,),
+                        )
+                        rows = await cur.fetchall()
+                        for r in rows:
+                            raw_date = r["trade_date"]
+                            key = raw_date[:7] if tf == "1M" else raw_date
+                            if key not in pnl_by_key:
+                                pnl_by_key[key] = {"trade_date": key, "pnl": 0, "trades_count": 0}
+                            pnl_by_key[key]["pnl"] += r["pnl"]
+                            pnl_by_key[key]["trades_count"] += r["trades_count"]
+                            pnl_by_key[key][inst_name] = pnl_by_key[key].get(inst_name, 0) + r["pnl"]
+                except Exception:
+                    logger.warning("Failed to read PnL from %s", inst_name)
+
+        result = sorted(pnl_by_key.values(), key=lambda x: x["trade_date"])
+        return web.json_response(result)
+
+    async def _pnl_intraday(self, tf: str, instance_name: str, source: str = "live",
+                             date_param: str = "", range_param: str = "day") -> web.Response:
+        """Intraday PnL from trades table. Filters by date for live mode."""
+
+        minutes = {"1m": 1, "5m": 5, "10m": 10, "30m": 30, "1H": 60, "1D": 1440, "1M": 43200}.get(tf, 60)
+        per_trade = True  # always show each trade as a separate point
+
+        # Build date filter
+        if date_param:
+            if range_param == "week":
+                try:
+                    end = (datetime.strptime(date_param, "%Y-%m-%d") + timedelta(days=7)).strftime("%Y-%m-%d")
+                except ValueError:
+                    end = date_param
+                date_where = f" AND date(closed_at) >= '{date_param}' AND date(closed_at) < '{end}'"
+            else:
+                date_where = f" AND date(closed_at) = '{date_param}'"
+        elif source == "archive":
+            date_where = ""
+        else:
+            # Live, today only
+            date_where = " AND date(closed_at) = date('now')"
+
+        main_db_path = _get_db_path(str(self.db.db_path), source)
+        all_dbs = [(main_db_path, instance_name)]
+        for inst in _other_instances(self.config):
+            db_path = _get_db_path(inst.get("db_path", ""), source)
+            if db_path and Path(db_path).exists():
+                all_dbs.append((db_path, inst.get("name", "???")))
+
+        all_trades: list[dict] = []
+        pnl_by_bucket: dict[str, dict] = {}
+
+        for db_path, inst_name in all_dbs:
+            try:
+                async with aiosqlite.connect(db_path) as db:
+                    db.row_factory = aiosqlite.Row
+                    cur = await db.execute(
+                        f"SELECT closed_at, pnl FROM trades WHERE status='closed'{date_where} ORDER BY closed_at",
+                    )
+                    rows = await cur.fetchall()
+                    for r in rows:
+                        ts = r["closed_at"]
+                        if not ts:
+                            continue
+                        try:
+                            dt = datetime.strptime(ts[:19], "%Y-%m-%d %H:%M:%S")
+                        except ValueError:
+                            try:
+                                dt = datetime.fromisoformat(ts)
+                            except Exception:
+                                continue
+
+                        if per_trade:
+                            key = dt.strftime("%Y-%m-%d %H:%M:%S")
+                            all_trades.append({
+                                "trade_date": key, "pnl": r["pnl"] or 0,
+                                "trades_count": 1, inst_name: r["pnl"] or 0,
+                            })
+                        else:
+                            bucket_min = (dt.minute // minutes) * minutes
+                            bucket_dt = dt.replace(minute=bucket_min, second=0, microsecond=0)
+                            key = bucket_dt.strftime("%Y-%m-%d %H:%M")
+                            if key not in pnl_by_bucket:
+                                pnl_by_bucket[key] = {"trade_date": key, "pnl": 0, "trades_count": 0}
+                            pnl_by_bucket[key]["pnl"] += r["pnl"] or 0
+                            pnl_by_bucket[key]["trades_count"] += 1
+                            pnl_by_bucket[key][inst_name] = pnl_by_bucket[key].get(inst_name, 0) + (r["pnl"] or 0)
+            except Exception:
+                logger.warning("Failed to read intraday PnL from %s", inst_name)
+
+        if per_trade:
+            all_trades.sort(key=lambda x: x["trade_date"])
+            return web.json_response(all_trades)
+        result = sorted(pnl_by_bucket.values(), key=lambda x: x["trade_date"])
+        return web.json_response(result)
+
+    async def _api_positions(self, request: web.Request) -> web.Response:
+        positions = []
+        instance_name = self.config.get("instance_name", "SCALP")
+        source = request.query.get("source", "live")
+        is_archive = source == "archive"
+
+        if is_archive:
+            # Archive: show open trades from archive DB for main instance
+            main_archive = _get_db_path(str(self.db.db_path), source)
+            if Path(main_archive).exists():
+                try:
+                    async with aiosqlite.connect(main_archive) as db:
+                        db.row_factory = aiosqlite.Row
+                        cur = await db.execute(
+                            "SELECT symbol, side, entry_price, qty, stop_loss, take_profit, partial_closed, opened_at FROM trades WHERE status = 'open' ORDER BY opened_at DESC"
+                        )
+                        rows = await cur.fetchall()
+                        for r in rows:
+                            positions.append({
+                                "symbol": r["symbol"],
+                                "side": r["side"],
+                                "size": float(r["qty"]),
+                                "entry_price": float(r["entry_price"]),
+                                "stop_loss": float(r["stop_loss"] if r["stop_loss"] else 0),
+                                "take_profit": float(r["take_profit"] if r["take_profit"] else 0),
+                                "unrealised_pnl": 0.0,
+                                "instance": instance_name,
+                                "partial_closed": int(r["partial_closed"] or 0),
+                                "opened_at": r["opened_at"] or "",
+                            })
+                except Exception:
+                    logger.warning("Failed to read archive positions from %s", main_archive)
+        else:
+            # Live: read open trades from main DB (same as other instances)
+            main_open = await self.db.get_open_trades()
+            for t in main_open:
+                positions.append({
+                    "symbol": t["symbol"],
+                    "side": t["side"],
+                    "size": float(t["qty"]),
+                    "entry_price": float(t["entry_price"]),
+                    "stop_loss": float(t.get("stop_loss") or 0),
+                    "take_profit": float(t.get("take_profit") or 0),
+                    "unrealised_pnl": 0.0,
+                    "instance": instance_name,
+                    "partial_closed": t.get("partial_closed", 0) or 0,
+                    "opened_at": t.get("opened_at") or "",
+                })
+
+        # Other instances — open trades from DB
+        for inst in _other_instances(self.config):
+            inst_name = inst.get("name", "???")
+            db_path = _get_db_path(inst.get("db_path", ""), source)
+            if db_path and Path(db_path).exists():
+                try:
+                    async with aiosqlite.connect(db_path) as db:
+                        db.row_factory = aiosqlite.Row
+                        cur = await db.execute(
+                            "SELECT symbol, side, entry_price, qty, stop_loss, take_profit, partial_closed, opened_at FROM trades WHERE status = 'open' ORDER BY opened_at DESC"
+                        )
+                        rows = await cur.fetchall()
+                        for r in rows:
+                            positions.append({
+                                "symbol": r["symbol"],
+                                "side": r["side"],
+                                "size": float(r["qty"]),
+                                "entry_price": float(r["entry_price"]),
+                                "stop_loss": float(r["stop_loss"] if r["stop_loss"] else 0),
+                                "take_profit": float(r["take_profit"] if r["take_profit"] else 0),
+                                "unrealised_pnl": 0.0,
+                                "instance": inst_name,
+                                "partial_closed": int(r["partial_closed"] or 0),
+                                "opened_at": r["opened_at"] or "",
+                            })
+                except Exception:
+                    logger.warning("Failed to read positions from %s", inst_name)
+
+        # Sort all positions: newest first (by opened_at descending)
+        positions.sort(key=lambda p: p.get("opened_at") or "", reverse=True)
+
+        # Enrich positions with live unrealised PnL (calculated per-instance)
+        if not is_archive and positions:
+            # Bybit positions (cached 5s)
+            if self._get_client():
+                try:
+                    raw = self._get_bybit_positions_cached()
+                    live_mark = {p["symbol"]: p.get("mark_price", 0) for p in raw}
+                    live_leverage = {p["symbol"]: p.get("leverage", "?") for p in raw}
+                    for pos in positions:
+                        inst = (pos.get("instance") or "").upper()
+                        if "TBANK" in inst or "MIDAS" in inst:
+                            continue
+                        sym = pos["symbol"]
+                        pos["leverage"] = live_leverage.get(sym, "?")
+                        mark = 0
+                        if sym in live_mark and live_mark[sym]:
+                            mark = float(live_mark[sym])
+                        else:
+                            try:
+                                mark = self._get_client().get_last_price(sym, category="linear")
+                            except Exception:
+                                pass
+                        if mark > 0:
+                            entry = float(pos["entry_price"])
+                            qty = float(pos["size"])
+                            direction = 1 if pos["side"] == "Buy" else -1
+                            pos["unrealised_pnl"] = round((mark - entry) * qty * direction, 2)
+                except Exception:
+                    pass
+
+            # TBank/Midas positions — get mark prices via TBankClient
+            tbank_positions = [p for p in positions
+                               if ("TBANK" in (p.get("instance") or "").upper()
+                                   or "MIDAS" in (p.get("instance") or "").upper())]
+            if tbank_positions:
+                try:
+                    tc = self._get_tbank_client()
+                    if tc:
+                        # Get live positions from TBank (cached 5s)
+                        tbank_raw = self._get_tbank_positions_cached()
+                        tbank_mark = {p["symbol"]: p for p in tbank_raw}
+                        for pos in tbank_positions:
+                            pos["leverage"] = "1"
+                            sym = pos["symbol"]
+                            live = tbank_mark.get(sym)
+                            if live:
+                                pos["unrealised_pnl"] = round(float(live.get("unrealised_pnl", 0)), 2)
+                            else:
+                                # Position not on exchange — calc from last price
+                                try:
+                                    mark = tc.get_last_price(sym)
+                                    if mark > 0:
+                                        entry = float(pos["entry_price"])
+                                        qty = float(pos["size"])
+                                        direction = 1 if pos["side"] == "Buy" else -1
+                                        pos["unrealised_pnl"] = round((mark - entry) * qty * direction, 2)
+                                except Exception:
+                                    pass
+                except Exception as e:
+                    logger.debug("TBank position enrichment failed: %s", e)
+
+        for pos in positions:
+            entry = float(pos["entry_price"])
+            qty = float(pos["size"])
+            sl = float(pos.get("stop_loss") or 0)
+            tp = float(pos.get("take_profit") or 0)
+            pos["entry_amount"] = round(entry * qty, 2)
+            # SL PnL: loss in currency when stop-loss triggers
+            if sl > 0:
+                if pos["side"] == "Buy":
+                    pos["sl_pnl"] = round((sl - entry) * qty, 2)
+                else:
+                    pos["sl_pnl"] = round((entry - sl) * qty, 2)
+            else:
+                pos["sl_pnl"] = None
+            # TP PnL: profit in currency when take-profit triggers
+            if tp > 0:
+                if pos["side"] == "Buy":
+                    pos["tp_pnl"] = round((tp - entry) * qty, 2)
+                else:
+                    pos["tp_pnl"] = round((entry - tp) * qty, 2)
+            else:
+                pos["tp_pnl"] = None
+
+        return web.json_response(positions)
+
+    async def _api_toggle_service(self, request: web.Request) -> web.Response:
+        """Start or stop a systemd service."""
+        try:
+            data = await request.json()
+            service = data.get("service", "")
+            action = data.get("action", "")  # "start" or "stop"
+            if not service or action not in ("start", "stop", "restart"):
+                return web.json_response({"ok": False, "error": "Bad request"}, status=400)
+            # Whitelist: only known stasik services
+            allowed = {"stasik", "stasik-degen", "stasik-tbank-scalp", "stasik-tbank-swing", "stasik-dashboard", "stasik-midas", "stasik-turtle", "stasik-turtle-tbank", "stasik-smc", "stasik-fiba", "stasik-buba", "stasik-fin"}
+            if service not in allowed:
+                return web.json_response({"ok": False, "error": "Unknown service"}, status=400)
+
+            result = subprocess.run(
+                ["systemctl", action, service],
+                capture_output=True, text=True, timeout=10,
+            )
+            if result.returncode != 0:
+                return web.json_response({"ok": False, "error": result.stderr.strip()}, status=500)
+            return web.json_response({"ok": True, "message": f"{service} {action}ed"})
+        except Exception as e:
+            logger.exception("toggle-service error")
+            return web.json_response({"ok": False, "error": str(e)}, status=500)
+
+    async def _api_close_position(self, request: web.Request) -> web.Response:
+        """Close a single position by symbol."""
+        if self.engine:
+            try:
+                data = await request.json()
+                symbol = data.get("symbol", "")
+                if not symbol:
+                    return web.json_response({"ok": False, "error": "No symbol"}, status=400)
+                result = await self.engine.close_position(symbol)
+                return web.json_response({"ok": True, "message": result})
+            except Exception as e:
+                logger.exception("close-position error")
+                return web.json_response({"ok": False, "error": str(e)}, status=500)
+        # Standalone mode — close via exchange client directly
+        try:
+            data = await request.json()
+            symbol = data.get("symbol", "")
+            instance = data.get("instance", "")
+            if not symbol:
+                return web.json_response({"ok": False, "error": "No symbol"}, status=400)
+            # Determine exchange type from instance name
+            is_tbank = any(k in (instance or "").upper() for k in ("TBANK", "MIDAS"))
+            exchange_closed = False
+            if is_tbank:
+                try:
+                    from src.exchange.tbank_client import TBankClient
+                    # Find matching tbank config
+                    for inst in _other_instances(self.config):
+                        if inst.get("name", "").upper() == (instance or "").upper():
+                            cfg_path = inst.get("config_path", "")
+                            if cfg_path and Path(cfg_path).exists():
+                                import yaml
+                                with open(cfg_path) as f:
+                                    tcfg = yaml.safe_load(f)
+                                tc = TBankClient(tcfg)
+                                positions = tc.get_positions(symbol=symbol)
+                                for p in positions:
+                                    if p["symbol"] == symbol and p["size"] > 0:
+                                        close_side = "Sell" if p["side"] == "Buy" else "Buy"
+                                        tc.place_order(symbol=symbol, side=close_side, qty=p["size"])
+                                        exchange_closed = True
+                                break
+                except Exception as e:
+                    err_str = str(e)
+                    if "30079" in err_str or "not available" in err_str.lower():
+                        return web.json_response({"ok": False, "error": "MOEX закрыта"}, status=400)
+                    logger.warning("Failed to close %s on TBank: %s", symbol, e)
+            else:
+                client = self._get_client()
+                if client:
+                    try:
+                        positions = client.get_positions(symbol=symbol, category="linear")
+                        for p in positions:
+                            if p["symbol"] == symbol and p["size"] > 0:
+                                close_side = "Sell" if p["side"] == "Buy" else "Buy"
+                                client.place_order(symbol=symbol, side=close_side, qty=p["size"], category="linear", reduce_only=True)
+                                exchange_closed = True
+                    except Exception:
+                        logger.warning("Failed to close %s on Bybit", symbol)
+            # Close in DB (get current price for PnL)
+            db_path = self._resolve_instance_db(instance)
+            if not db_path:
+                # Fallback: find which DB has this symbol
+                all_dbs = [(str(self.db.db_path), self.config.get("instance_name", "SCALP"))]
+                for inst in _other_instances(self.config):
+                    all_dbs.append((inst.get("db_path", ""), inst.get("name", "")))
+                for dp, _ in all_dbs:
+                    if dp and Path(dp).exists():
+                        try:
+                            async with aiosqlite.connect(dp) as db:
+                                cur = await db.execute(
+                                    "SELECT id FROM trades WHERE symbol=? AND status='open'", (symbol,))
+                                if await cur.fetchone():
+                                    db_path = dp
+                                    break
+                        except Exception:
+                            pass
+            if db_path and Path(db_path).exists():
+                try:
+                    mark = 0
+                    try:
+                        mark = client.get_last_price(symbol, category="linear")
+                    except Exception:
+                        pass
+                    async with aiosqlite.connect(db_path) as db:
+                        db.row_factory = aiosqlite.Row
+                        cur = await db.execute(
+                            "SELECT id, side, entry_price, qty FROM trades WHERE symbol=? AND status='open'",
+                            (symbol,))
+                        rows = await cur.fetchall()
+                        for r in rows:
+                            entry = float(r["entry_price"])
+                            qty = float(r["qty"])
+                            pnl = 0.0
+                            if mark > 0:
+                                direction = 1 if r["side"] == "Buy" else -1
+                                pnl = round((mark - entry) * qty * direction, 2)
+                            await db.execute(
+                                "UPDATE trades SET exit_price=?, pnl=?, status='closed', closed_at=? WHERE id=?",
+                                (mark if mark > 0 else entry, pnl, __import__('datetime').datetime.now(timezone(timedelta(hours=3))).strftime("%Y-%m-%dT%H:%M:%S.%f"), r["id"]))
+                        await db.commit()
+                        logger.info("Closed %d trade(s) in DB for %s (pnl per trade calculated)", len(rows), symbol)
+                except Exception:
+                    logger.exception("Failed to close %s in DB", symbol)
+            msg = f"Закрыто: {symbol}" + ("" if exchange_closed else " (только в БД)")
+            return web.json_response({"ok": True, "message": msg})
+        except Exception as e:
+            logger.exception("close-position error")
+            return web.json_response({"ok": False, "error": str(e)}, status=500)
+
+    async def _api_close_all(self, request: web.Request) -> web.Response:
+        """Close all open positions."""
+        if self.engine:
+            try:
+                result = await self.engine.close_all_positions()
+                return web.json_response({"ok": True, "message": result})
+            except Exception as e:
+                logger.exception("close-all error")
+                return web.json_response({"ok": False, "error": str(e)}, status=500)
+        # Standalone mode
+        client = self._get_client()
+        if not client:
+            return web.json_response({"ok": False, "error": "No client"}, status=503)
+        try:
+            positions = client.get_positions(category="linear")
+            count = 0
+            for p in positions:
+                if p["size"] > 0:
+                    close_side = "Sell" if p["side"] == "Buy" else "Buy"
+                    client.place_order(symbol=p["symbol"], side=close_side, qty=p["size"], category="linear", reduce_only=True)
+                    count += 1
+            return web.json_response({"ok": True, "message": f"Закрыто {count} позиций"})
+        except Exception as e:
+            logger.exception("close-all error")
+            return web.json_response({"ok": False, "error": str(e)}, status=500)
+
+    async def _api_double_position(self, request: web.Request) -> web.Response:
+        """Open a new position with 2x size in the same direction."""
+        client = self._get_client()
+        if not client:
+            return web.json_response({"ok": False, "error": "No client"}, status=503)
+        try:
+            data = await request.json()
+            symbol = data.get("symbol", "")
+            side = data.get("side", "")
+            qty = float(data.get("qty", 0))
+            instance = data.get("instance", "")
+            if not symbol or not side or qty <= 0:
+                return web.json_response({"ok": False, "error": "Missing symbol/side/qty"}, status=400)
+            # Add same qty to double the position (existing + new = 2x)
+            client.place_order(symbol=symbol, side=side, qty=qty, category="linear")
+            # Update qty in the correct DB so dashboard reflects the change
+            db_path = self._resolve_instance_db(instance)
+            if db_path and Path(db_path).exists():
+                try:
+                    async with aiosqlite.connect(db_path) as db:
+                        await db.execute(
+                            "UPDATE trades SET qty = qty + ? WHERE symbol = ? AND status = 'open'",
+                            (qty, symbol),
+                        )
+                        await db.commit()
+                except Exception:
+                    logger.warning("Failed to update qty in DB for %s", symbol)
+            return web.json_response({"ok": True, "message": f"X2: {side} +{qty} {symbol}"})
+        except Exception as e:
+            logger.exception("double-position error")
+            return web.json_response({"ok": False, "error": str(e)}, status=500)
+
+    async def _api_set_sl(self, request: web.Request) -> web.Response:
+        """Set stop-loss by loss amount (USDT). Calculates SL price and sets on exchange + DB."""
+        client = self._get_client()
+        if not client:
+            return web.json_response({"ok": False, "error": "No client"}, status=503)
+        try:
+            data = await request.json()
+            symbol = data.get("symbol", "")
+            loss_amount = float(data.get("amount", 0))
+            instance = data.get("instance", "")
+            side = data.get("side", "")
+            entry_price = float(data.get("entry_price", 0))
+            qty = float(data.get("qty", 0))
+            if not symbol or loss_amount <= 0 or not side or entry_price <= 0 or qty <= 0:
+                return web.json_response({"ok": False, "error": "Missing params"}, status=400)
+
+            # Calculate SL price from loss amount
+            # Buy: sl_price = entry - loss / qty
+            # Sell: sl_price = entry + loss / qty
+            if side == "Buy":
+                sl_price = entry_price - loss_amount / qty
+            else:
+                sl_price = entry_price + loss_amount / qty
+
+            if sl_price <= 0:
+                return web.json_response({"ok": False, "error": "SL price <= 0"}, status=400)
+
+            sl_price = round(sl_price, 6)
+
+            # Update SL in DB first
+            db_path = self._resolve_instance_db(instance)
+            if db_path and Path(db_path).exists():
+                try:
+                    async with aiosqlite.connect(db_path) as db:
+                        await db.execute(
+                            "UPDATE trades SET stop_loss = ? WHERE symbol = ? AND status = 'open'",
+                            (sl_price, symbol),
+                        )
+                        await db.commit()
+                except Exception:
+                    logger.warning("Failed to update SL in DB for %s", symbol)
+
+            # Set SL on Bybit (may fail if no position on exchange)
+            exchange_ok = False
+            try:
+                client.session.set_trading_stop(
+                    category="linear", symbol=symbol,
+                    stopLoss=str(sl_price), positionIdx=0,
+                )
+                exchange_ok = True
+            except Exception:
+                logger.warning("set_trading_stop failed for %s (no position on exchange?)", symbol)
+
+            logger.info("SL set: %s %s @ %s (loss=%s, exchange=%s)", side, symbol, sl_price, loss_amount, exchange_ok)
+            return web.json_response({"ok": True, "sl_price": sl_price, "exchange": exchange_ok})
+        except Exception as e:
+            logger.exception("set-sl error")
+            return web.json_response({"ok": False, "error": str(e)}, status=500)
+
+    async def _api_set_tp(self, request: web.Request) -> web.Response:
+        """Set take-profit by profit amount (USDT). Calculates TP price and sets on exchange + DB."""
+        client = self._get_client()
+        if not client:
+            return web.json_response({"ok": False, "error": "No client"}, status=503)
+        try:
+            data = await request.json()
+            symbol = data.get("symbol", "")
+            profit_amount = float(data.get("amount", 0))
+            instance = data.get("instance", "")
+            side = data.get("side", "")
+            entry_price = float(data.get("entry_price", 0))
+            qty = float(data.get("qty", 0))
+            if not symbol or profit_amount <= 0 or not side or entry_price <= 0 or qty <= 0:
+                return web.json_response({"ok": False, "error": "Missing params"}, status=400)
+
+            # Calculate TP price from profit amount
+            # Buy: tp_price = entry + profit / qty
+            # Sell: tp_price = entry - profit / qty
+            if side == "Buy":
+                tp_price = entry_price + profit_amount / qty
+            else:
+                tp_price = entry_price - profit_amount / qty
+
+            if tp_price <= 0:
+                return web.json_response({"ok": False, "error": "TP price <= 0"}, status=400)
+
+            tp_price = round(tp_price, 6)
+
+            # Update TP in DB first
+            db_path = self._resolve_instance_db(instance)
+            if db_path and Path(db_path).exists():
+                try:
+                    async with aiosqlite.connect(db_path) as db:
+                        await db.execute(
+                            "UPDATE trades SET take_profit = ? WHERE symbol = ? AND status = 'open'",
+                            (tp_price, symbol),
+                        )
+                        await db.commit()
+                except Exception:
+                    logger.warning("Failed to update TP in DB for %s", symbol)
+
+            # Set TP on Bybit (may fail if no position on exchange)
+            exchange_ok = False
+            try:
+                client.session.set_trading_stop(
+                    category="linear", symbol=symbol,
+                    takeProfit=str(tp_price), positionIdx=0,
+                )
+                exchange_ok = True
+            except Exception:
+                logger.warning("set_trading_stop (TP) failed for %s (no position on exchange?)", symbol)
+
+            logger.info("TP set: %s %s @ %s (profit=%s, exchange=%s)", side, symbol, tp_price, profit_amount, exchange_ok)
+            return web.json_response({"ok": True, "tp_price": tp_price, "exchange": exchange_ok})
+        except Exception as e:
+            logger.exception("set-tp error")
+            return web.json_response({"ok": False, "error": str(e)}, status=500)
+
+    def _resolve_instance_db(self, instance: str) -> str | None:
+        """Map instance name to its DB path."""
+        instance_upper = (instance or "").upper()
+        main_name = self.config.get("instance_name", "SCALP").upper()
+        if not instance_upper or instance_upper == main_name:
+            return str(self.db.db_path)
+        for inst in _other_instances(self.config):
+            if inst.get("name", "").upper() == instance_upper:
+                return inst.get("db_path", "")
+        return None
+
+    _ALLOWED_LEVERAGE = {1, 2, 3, 5, 10, 15, 20}
+
+    def _get_instance_pairs(self, instance: str) -> list[str]:
+        instance_upper = (instance or "").upper()
+        main_name = self.config.get("instance_name", "SCALP").upper()
+        if instance_upper == main_name:
+            return self.config.get("trading", {}).get("pairs", [])
+        for inst in _other_instances(self.config):
+            if inst.get("name", "").upper() == instance_upper:
+                return inst.get("pairs", [])
+        return []
+
+    def _get_instance_config_leverage(self, instance: str) -> int:
+        """Get configured leverage for an instance from its YAML config."""
+        import yaml as _yaml
+        instance_upper = (instance or "").upper()
+        main_name = self.config.get("instance_name", "SCALP").upper()
+        if instance_upper == main_name:
+            return int(self.config.get("trading", {}).get("leverage", 10))
+        for inst in _other_instances(self.config):
+            if inst.get("name", "").upper() == instance_upper:
+                # Try loading the actual config file for accurate leverage
+                svc = inst.get("service", "")
+                cfg_map = {
+                    "stasik-degen": "config/degen.yaml",
+                }
+                cfg_path = cfg_map.get(svc, "")
+                if cfg_path:
+                    try:
+                        with open(cfg_path) as f:
+                            inst_cfg = _yaml.safe_load(f)
+                        return int(inst_cfg.get("trading", {}).get("leverage", 10))
+                    except Exception:
+                        pass
+                # Fallback: parse from "10x" string
+                lev_str = str(inst.get("leverage", "10x")).replace("x", "")
+                try:
+                    return int(lev_str)
+                except ValueError:
+                    return 10
+        return 10
+
+    async def _api_set_leverage(self, request: web.Request) -> web.Response:
+        client = self._get_client()
+        if not client:
+            return web.json_response({"ok": False, "error": "No client"}, status=503)
+        try:
+            data = await request.json()
+            raw_leverage = data.get("leverage", 0)
+            restore_config = raw_leverage == "config"
+            leverage = 0 if restore_config else int(raw_leverage)
+            symbol = data.get("symbol", "")
+            instance = data.get("instance", "")
+
+            if not restore_config and leverage not in self._ALLOWED_LEVERAGE:
+                return web.json_response(
+                    {"ok": False, "error": f"Invalid leverage: {leverage}"},
+                    status=400,
+                )
+
+            results = {"ok": [], "failed": []}
+
+            if symbol:
+                try:
+                    client.set_leverage(symbol, leverage, category="linear")
+                    results["ok"].append(symbol)
+                except Exception as e:
+                    results["failed"].append({"symbol": symbol, "error": str(e)})
+            elif instance:
+                pairs = self._get_instance_pairs(instance)
+                if not pairs:
+                    return web.json_response(
+                        {"ok": False, "error": f"Unknown instance: {instance}"},
+                        status=400,
+                    )
+                inst_leverage = self._get_instance_config_leverage(instance) if restore_config else leverage
+                for pair in pairs:
+                    try:
+                        client.set_leverage(pair, inst_leverage, category="linear")
+                        results["ok"].append(pair)
+                    except Exception as e:
+                        if "leverage not modified" not in str(e).lower():
+                            results["failed"].append({"symbol": pair, "error": str(e)})
+                        else:
+                            results["ok"].append(pair)
+                leverage = inst_leverage
+            else:
+                return web.json_response(
+                    {"ok": False, "error": "Provide 'symbol' or 'instance'"},
+                    status=400,
+                )
+
+            success = len(results["failed"]) == 0
+            logger.info("set-leverage: %sx, ok=%s, failed=%s", leverage, results["ok"], results["failed"])
+            return web.json_response({"ok": success, "leverage": leverage, "results": results})
+        except Exception as e:
+            logger.exception("set-leverage error")
+            return web.json_response({"ok": False, "error": str(e)}, status=500)
+
+    async def _get_last_trade_id(self) -> int:
+        """Get max trade id across all instances for fast change detection."""
+        max_id = 0
+        _sql = "SELECT MAX(id) FROM trades"
+        try:
+            async with aiosqlite.connect(str(self.db.db_path)) as db:
+                cur = await db.execute(_sql)
+                row = await cur.fetchone()
+                if row and row[0]:
+                    max_id = max(max_id, row[0])
+        except Exception:
+            pass
+        for inst in _other_instances(self.config):
+            db_path = inst.get("db_path", "")
+            if db_path and Path(db_path).exists():
+                try:
+                    async with aiosqlite.connect(db_path) as db:
+                        cur = await db.execute(_sql)
+                        row = await cur.fetchone()
+                        if row and row[0]:
+                            max_id = max(max_id, row[0])
+                except Exception:
+                    pass
+        return max_id
+
+    async def _get_open_count(self) -> int:
+        """Fast open trade count across all instances."""
+        cnt = 0
+        _sql = "SELECT COUNT(*) FROM trades WHERE status='open'"
+        try:
+            async with aiosqlite.connect(str(self.db.db_path)) as db:
+                cur = await db.execute(_sql)
+                row = await cur.fetchone()
+                if row:
+                    cnt += row[0]
+        except Exception:
+            pass
+        for inst in _other_instances(self.config):
+            db_path = inst.get("db_path", "")
+            if db_path and Path(db_path).exists():
+                try:
+                    async with aiosqlite.connect(db_path) as db:
+                        cur = await db.execute(_sql)
+                        row = await cur.fetchone()
+                        if row:
+                            cnt += row[0]
+                except Exception:
+                    pass
+        return cnt
+
+    async def _api_night_settings_get(self, request: web.Request) -> web.Response:
+        """Return night mode settings from server file."""
+        try:
+            if self._night_settings_path.exists():
+                data = json.loads(self._night_settings_path.read_text())
+            else:
+                data = {"enabled": False, "target": 0}
+        except Exception:
+            data = {"enabled": False, "target": 0}
+        return web.json_response(data)
+
+    async def _api_night_settings_post(self, request: web.Request) -> web.Response:
+        """Save night mode settings to server file."""
+        try:
+            body = await request.json()
+            data = {
+                "enabled": bool(body.get("enabled", False)),
+                "target": int(body.get("target", 0)),
+            }
+            self._night_settings_path.parent.mkdir(parents=True, exist_ok=True)
+            self._night_settings_path.write_text(json.dumps(data))
+            return web.json_response({"ok": True})
+        except Exception as e:
+            return web.json_response({"error": str(e)}, status=400)
+
+    async def _api_sale_settings_get(self, request: web.Request) -> web.Response:
+        try:
+            if self._sale_settings_path.exists():
+                data = json.loads(self._sale_settings_path.read_text())
+            else:
+                data = {"enabled": False, "target": 0}
+        except Exception:
+            data = {"enabled": False, "target": 0}
+        return web.json_response(data)
+
+    async def _api_sale_settings_post(self, request: web.Request) -> web.Response:
+        try:
+            body = await request.json()
+            data = {
+                "enabled": bool(body.get("enabled", False)),
+                "target": int(body.get("target", 0)),
+            }
+            self._sale_settings_path.parent.mkdir(parents=True, exist_ok=True)
+            self._sale_settings_path.write_text(json.dumps(data))
+            return web.json_response({"ok": True})
+        except Exception as e:
+            return web.json_response({"error": str(e)}, status=400)
+
+    async def _api_events(self, request: web.Request) -> web.StreamResponse:
+        """SSE endpoint — pushes events when trades open or close."""
+        resp = web.StreamResponse()
+        resp.content_type = "text/event-stream"
+        resp.headers["Cache-Control"] = "no-cache"
+        resp.headers["X-Accel-Buffering"] = "no"
+        await resp.prepare(request)
+
+        last_id = await self._get_last_trade_id()
+        last_open = await self._get_open_count()
+
+        try:
+            while True:
+                await asyncio.sleep(3)
+                cur_id = await self._get_last_trade_id()
+                cur_open = await self._get_open_count()
+                if cur_id != last_id:
+                    # New trade appeared or status changed
+                    if cur_open < last_open:
+                        await resp.write(b"event: trade_closed\ndata: {}\n\n")
+                    else:
+                        await resp.write(b"event: trade_opened\ndata: {}\n\n")
+                    last_id = cur_id
+                    last_open = cur_open
+                elif cur_open != last_open:
+                    if cur_open < last_open:
+                        await resp.write(b"event: trade_closed\ndata: {}\n\n")
+                    else:
+                        await resp.write(b"event: trade_opened\ndata: {}\n\n")
+                    last_open = cur_open
+        except (asyncio.CancelledError, ConnectionResetError):
+            pass
+        return resp
+
+    async def _api_pair_pnl(self, request: web.Request) -> web.Response:
+        """Per-pair PnL across all instances."""
+        pairs: dict[str, dict] = {}
+        db_cfg = self.config.get("database", {})
+        main_db = db_cfg.get("path", "data/trades.db") if isinstance(db_cfg, dict) else str(db_cfg)
+        other = _other_instances(self.config)
+        all_dbs = [{"db_path": main_db, "name": self.config.get("instance_name", "MAIN")}] + other
+        for inst in all_dbs:
+            db_path = inst.get("db_path", "")
+            inst_name = inst.get("name", "")
+            if not db_path or not Path(db_path).exists():
+                continue
+            is_tbank = "TBANK" in inst_name.upper() or "MIDAS" in inst_name.upper()
+            cur = "RUB" if is_tbank else "USDT"
+            try:
+                async with aiosqlite.connect(db_path) as db:
+                    async_cur = await db.execute(
+                        "SELECT symbol, COUNT(*) as cnt, COALESCE(SUM(pnl),0) as total "
+                        "FROM trades WHERE status='closed' GROUP BY symbol"
+                    )
+                    rows = await async_cur.fetchall()
+                for symbol, cnt, total in rows:
+                    key = f"{symbol}_{cur}"
+                    if key not in pairs:
+                        pairs[key] = {"symbol": symbol, "cur": cur, "trades": 0, "pnl": 0.0}
+                    pairs[key]["trades"] += cnt
+                    pairs[key]["pnl"] += total
+            except Exception:
+                continue
+        result = sorted(pairs.values(), key=lambda x: x["pnl"], reverse=True)
+        return web.json_response(result)
+
+    async def _api_instances(self, request: web.Request) -> web.Response:
+        source = request.query.get("source", "live")
+        is_archive = source == "archive"
+        instances = []
+
+        # Current instance (scalper)
+        if is_archive:
+            archive_path = _get_db_path(str(self.db.db_path), source)
+            scalp_daily = 0.0
+            scalp_total = 0.0
+            scalp_open_count = 0
+            scalp_total_trades = 0
+            scalp_wins = 0
+            scalp_losses = 0
+            if Path(archive_path).exists():
+                try:
+                    async with aiosqlite.connect(archive_path) as db:
+                        db.row_factory = aiosqlite.Row
+                        cur = await db.execute(
+                            "SELECT COALESCE(SUM(pnl), 0) as total FROM trades WHERE status = 'closed'"
+                        )
+                        row = await cur.fetchone()
+                        if row:
+                            scalp_total = float(row["total"])
+                        cur = await db.execute("SELECT COUNT(*) as cnt FROM trades WHERE status = 'open'")
+                        row = await cur.fetchone()
+                        if row:
+                            scalp_open_count = int(row["cnt"])
+                        cur = await db.execute(
+                            "SELECT COUNT(*) as total, "
+                            "COALESCE(SUM(CASE WHEN pnl >= 0 THEN 1 ELSE 0 END), 0) as wins, "
+                            "COALESCE(SUM(CASE WHEN pnl < 0 THEN 1 ELSE 0 END), 0) as losses "
+                            "FROM trades WHERE status = 'closed'"
+                        )
+                        row = await cur.fetchone()
+                        if row:
+                            scalp_total_trades = int(row["total"])
+                            scalp_wins = int(row["wins"])
+                            scalp_losses = int(row["losses"])
+                except Exception:
+                    logger.warning("Failed to read archive instances from %s", archive_path)
+
+            inst_name = self.config.get("instance_name", "SCALP")
+            instances.append({
+                "name": inst_name,
+                "service": "stasik-" + inst_name.lower(),
+                "running": False,
+                "daily_pnl": scalp_daily,
+                "total_pnl": scalp_total,
+                "open_positions": scalp_open_count,
+                "total_trades": scalp_total_trades,
+                "wins": scalp_wins,
+                "losses": scalp_losses,
+                "win_rate": (scalp_wins / scalp_total_trades * 100) if scalp_total_trades > 0 else 0,
+                "timeframe": str(self.config["trading"]["timeframe"]),
+                "leverage": self.config["trading"].get("leverage", 1),
+                "pairs": self.config["trading"]["pairs"],
+            })
+        else:
+            scalp_daily = await self.db.get_daily_pnl()
+            scalp_total = await self.db.get_total_pnl()
+            scalp_stats = await self.db.get_trade_stats()
+            scalp_open = await self.db.get_open_trades()
+            inst_name = self.config.get("instance_name", "SCALP")
+            main_service = "stasik-" + inst_name.lower()
+            running = self._check_service_active(main_service)
+
+            instances.append({
+                "name": inst_name,
+                "service": main_service,
+                "running": running,
+                "daily_pnl": scalp_daily,
+                "total_pnl": scalp_total,
+                "open_positions": len(scalp_open),
+                "total_trades": scalp_stats["total"],
+                "wins": scalp_stats["wins"],
+                "losses": scalp_stats["losses"],
+                "win_rate": (scalp_stats["wins"] / scalp_stats["total"] * 100) if scalp_stats["total"] > 0 else 0,
+                "timeframe": str(self.config["trading"]["timeframe"]),
+                "leverage": self.config["trading"].get("leverage", 1),
+                "pairs": self.config["trading"]["pairs"],
+            })
+
+        # Other instances
+        for inst in _other_instances(self.config):
+            data = await self._read_instance_data(inst, source)
+            instances.append(data)
+
+        # Enrich with live leverage from exchange
+        if not is_archive and self._get_client():
+            try:
+                lev_map = self._get_client().get_all_leverage(category="linear")
+                for inst_data in instances:
+                    if "TBANK" in inst_data["name"].upper():
+                        continue
+                    pairs = inst_data.get("pairs", [])
+                    pair_levs = [lev_map.get(p) for p in pairs if p in lev_map]
+                    if pair_levs:
+                        inst_data["leverage"] = pair_levs[0]
+            except Exception:
+                pass
+
+        return web.json_response(instances)
+
+    async def _read_instance_data(self, inst: dict, source: str = "live") -> dict:
+        name = inst.get("name", "???")
+        db_path = _get_db_path(inst.get("db_path", ""), source)
+        service = inst.get("service", "")
+
+        # Check service status (only for live)
+        running = False
+        if service and source != "archive":
+            try:
+                result = subprocess.run(
+                    ["systemctl", "is-active", service],
+                    capture_output=True, text=True, timeout=3,
+                )
+                running = result.stdout.strip() == "active"
+            except Exception:
+                pass
+
+        daily = 0.0
+        total = 0.0
+        open_count = 0
+        total_trades = 0
+        wins = 0
+        losses = 0
+
+        if db_path and Path(db_path).exists():
+            try:
+                async with aiosqlite.connect(db_path) as db:
+                    db.row_factory = aiosqlite.Row
+                    cur = await db.execute(
+                        "SELECT COALESCE(SUM(pnl), 0) as total FROM trades "
+                        "WHERE status = 'closed' AND date(closed_at) = ?",
+                        (date.today().isoformat(),),
+                    )
+                    row = await cur.fetchone()
+                    if row:
+                        daily = float(row["total"])
+
+                    cur = await db.execute(
+                        "SELECT COALESCE(SUM(pnl), 0) as total FROM trades WHERE status = 'closed'"
+                    )
+                    row = await cur.fetchone()
+                    if row:
+                        total = float(row["total"])
+
+                    cur = await db.execute("SELECT COUNT(*) as cnt FROM trades WHERE status = 'open'")
+                    row = await cur.fetchone()
+                    if row:
+                        open_count = int(row["cnt"])
+
+                    cur = await db.execute(
+                        "SELECT COUNT(*) as total, "
+                        "COALESCE(SUM(CASE WHEN pnl >= 0 THEN 1 ELSE 0 END), 0) as wins, "
+                        "COALESCE(SUM(CASE WHEN pnl < 0 THEN 1 ELSE 0 END), 0) as losses "
+                        "FROM trades WHERE status = 'closed'"
+                    )
+                    row = await cur.fetchone()
+                    if row:
+                        total_trades = int(row["total"])
+                        wins = int(row["wins"])
+                        losses = int(row["losses"])
+            except Exception:
+                logger.warning("Failed to read DB for instance %s", name)
+
+        return {
+            "name": name,
+            "service": service,
+            "running": running,
+            "daily_pnl": daily,
+            "total_pnl": total,
+            "open_positions": open_count,
+            "total_trades": total_trades,
+            "wins": wins,
+            "losses": losses,
+            "win_rate": (wins / total_trades * 100) if total_trades > 0 else 0,
+            "timeframe": inst.get("timeframe", "?"),
+            "leverage": inst.get("leverage", "?"),
+            "pairs": inst.get("pairs", []),
+        }
+
+
+
+# ── Login page ────────────────────────────────────────────────────
+
+_LOGIN_HTML = """<!DOCTYPE html>
+<html lang="ru"><head>
+<meta charset="utf-8">
+<title>Stasik — Вход</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&display=swap" rel="stylesheet">
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{
+  font-family:'Share Tech Mono','JetBrains Mono',monospace;
+  background:#0a0a1a;
+  background-image:
+    linear-gradient(rgba(0,229,255,0.03) 1px,transparent 1px),
+    linear-gradient(90deg,rgba(0,229,255,0.03) 1px,transparent 1px);
+  background-size:40px 40px;
+  min-height:100vh;display:flex;align-items:center;justify-content:center;
+  color:#e0e0f0;
+}
+.login-box{
+  background:#111128;
+  border:1px solid #1a1a3a;
+  border-radius:20px;padding:40px 36px;width:100%;max-width:400px;
+  box-shadow:0 4px 24px rgba(0,0,0,0.4),0 0 40px rgba(0,229,255,0.05);
+  transition:box-shadow 0.3s;
+}
+.login-box:hover{box-shadow:0 4px 24px rgba(0,0,0,0.4),0 0 60px rgba(0,229,255,0.12)}
+.logo{text-align:center;margin-bottom:28px}
+.logo .cyber-logo{width:72px;height:72px;margin:0 auto 12px;filter:drop-shadow(0 0 12px rgba(0,229,255,0.6)) drop-shadow(0 0 24px rgba(191,0,255,0.3));animation:logoPulse 3s ease-in-out infinite}
+@keyframes logoPulse{0%,100%{filter:drop-shadow(0 0 12px rgba(0,229,255,0.6)) drop-shadow(0 0 24px rgba(191,0,255,0.3))}50%{filter:drop-shadow(0 0 20px rgba(0,229,255,0.9)) drop-shadow(0 0 40px rgba(191,0,255,0.5))}}
+.logo h1{font-size:22px;font-weight:700;color:#e0e0f0;letter-spacing:2px;text-shadow:0 0 10px rgba(0,229,255,0.5)}
+.logo p{font-size:13px;color:#667;margin-top:4px}
+.error{
+  background:rgba(255,34,85,0.12);color:#ff2255;
+  padding:10px 14px;border-radius:10px;font-size:13px;
+  margin-bottom:16px;text-align:center;border:1px solid rgba(255,34,85,0.25);
+}
+label{font-size:12px;color:#667;text-transform:uppercase;letter-spacing:1px;display:block;margin-bottom:6px}
+input[type=text],input[type=password]{
+  width:100%;padding:12px 14px;border:1px solid #1a1a3a;
+  border-radius:10px;background:#0a0a1a;color:#e0e0f0;
+  font-size:15px;font-family:inherit;outline:none;transition:all 0.2s;margin-bottom:16px;
+}
+input:focus{border-color:#00e5ff;box-shadow:0 0 10px rgba(0,229,255,0.2)}
+.captcha-row{display:flex;align-items:center;gap:10px;margin-bottom:16px}
+.captcha-q{
+  background:rgba(0,229,255,0.08);border:1px solid rgba(0,229,255,0.25);
+  border-radius:10px;padding:10px 16px;font-size:16px;font-weight:600;
+  color:#00e5ff;white-space:nowrap;
+}
+.captcha-row input{margin-bottom:0;flex:1}
+button{
+  width:100%;padding:13px;border:none;border-radius:10px;
+  background:linear-gradient(135deg,#00e5ff,#bf00ff);
+  color:#fff;font-size:15px;font-weight:600;cursor:pointer;font-family:inherit;
+  transition:opacity 0.2s,transform 0.1s,box-shadow 0.2s;
+  text-shadow:0 1px 2px rgba(0,0,0,0.3);
+}
+button:hover{opacity:0.9;box-shadow:0 0 20px rgba(0,229,255,0.3)}
+button:active{transform:scale(0.98)}
+button:disabled{opacity:0.4;cursor:not-allowed}
+</style>
+</head><body>
+<div class="login-box">
+  <div class="logo">
+    <svg class="cyber-logo" viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg">
+      <defs>
+        <linearGradient id="cg" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#00e5ff"/><stop offset="100%" stop-color="#bf00ff"/></linearGradient>
+        <filter id="glow"><feGaussianBlur stdDeviation="2" result="blur"/><feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
+      </defs>
+      <polygon points="50,8 90,28 90,72 50,92 10,72 10,28" fill="none" stroke="url(#cg)" stroke-width="2" filter="url(#glow)"/>
+      <polygon points="50,16 82,32 82,68 50,84 18,68 18,32" fill="rgba(0,229,255,0.05)" stroke="url(#cg)" stroke-width="0.5"/>
+      <rect x="28" y="38" width="16" height="10" rx="2" fill="#00e5ff" opacity="0.9"><animate attributeName="opacity" values="0.9;0.4;0.9" dur="2s" repeatCount="indefinite"/></rect>
+      <rect x="56" y="38" width="16" height="10" rx="2" fill="#bf00ff" opacity="0.9"><animate attributeName="opacity" values="0.9;0.4;0.9" dur="2s" begin="0.3s" repeatCount="indefinite"/></rect>
+      <line x1="30" y1="58" x2="70" y2="58" stroke="#00e5ff" stroke-width="1" opacity="0.4"/>
+      <line x1="35" y1="62" x2="65" y2="62" stroke="#bf00ff" stroke-width="1" opacity="0.3"/>
+      <line x1="40" y1="66" x2="60" y2="66" stroke="#00e5ff" stroke-width="1" opacity="0.2"/>
+      <circle cx="50" cy="50" r="3" fill="none" stroke="url(#cg)" stroke-width="0.5" opacity="0.6"><animate attributeName="r" values="3;5;3" dur="3s" repeatCount="indefinite"/></circle>
+    </svg>
+    <h1>Stasik Trading Bot</h1>
+    <p>Авторизация в панели управления</p>
+  </div>
+  {{error}}
+  <form method="POST" action="/login">
+    <label>Логин</label>
+    <input type="text" name="username" autocomplete="username" required {{blocked}}>
+    <label>Пароль</label>
+    <input type="password" name="password" autocomplete="current-password" required {{blocked}}>
+    <label>Капча: сколько будет {{captcha_question}} ?</label>
+    <div class="captcha-row">
+      <div class="captcha-q">{{captcha_question}} = ?</div>
+      <input type="text" name="captcha" inputmode="numeric" required {{blocked}}>
+    </div>
+    <input type="hidden" name="captcha_token" value="{{captcha_token}}">
+    <button type="submit" {{blocked}}>Войти</button>
+  </form>
+</div>
+</body></html>"""
+
+
+# ── Main dashboard HTML ───────────────────────────────────────────
+
+_DASHBOARD_HTML = """<!DOCTYPE html>
+<html lang="ru"><head>
+<meta charset="utf-8">
+<title>Stasik Dashboard</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-datalabels@2/dist/chartjs-plugin-datalabels.min.js"></script>
+<link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&display=swap" rel="stylesheet">
+<style>
+:root{
+  --bg:#0a0a1a;--bg2:#111128;--bg3:#161633;
+  --green:#00ff88;--red:#ff2255;--purple:#00e5ff;
+  --text:#e0e0f0;--muted:#667;--border:#1a1a3a;
+  --neon-cyan:#00e5ff;--neon-magenta:#ff00aa;--neon-yellow:#ffe600;
+  --glow-cyan:0 0 10px rgba(0,229,255,0.3);
+  --glow-magenta:0 0 10px rgba(255,0,170,0.3);
+}
+*{box-sizing:border-box;margin:0;padding:0}
+::-webkit-scrollbar{width:6px}
+::-webkit-scrollbar-track{background:#0a0a1a}
+::-webkit-scrollbar-thumb{background:#1a1a3a;border-radius:3px}
+::-webkit-scrollbar-thumb:hover{background:var(--neon-cyan)}
+body{font-family:'Share Tech Mono','JetBrains Mono',monospace;background:linear-gradient(135deg,#0a0a1a 0%,#0d0d2b 50%,#0a0a1a 100%);color:var(--text);min-height:100vh}
+
+.header{
+  background:var(--bg2);
+  border-bottom:1px solid var(--border);
+  padding:12px 24px;display:flex;align-items:center;justify-content:space-between;
+  position:sticky;top:0;z-index:100;gap:16px;flex-wrap:wrap;
+}
+.header-left{display:flex;align-items:center;gap:12px;flex-shrink:0}
+.header .cyber-logo-sm{width:36px;height:36px;filter:drop-shadow(0 0 8px rgba(0,229,255,0.5));animation:logoPulse 3s ease-in-out infinite}
+@keyframes logoPulse{0%,100%{filter:drop-shadow(0 0 8px rgba(0,229,255,0.5))}50%{filter:drop-shadow(0 0 16px rgba(0,229,255,0.8))}}
+.header h1{font-size:20px;font-weight:700;color:var(--text);white-space:nowrap}
+.header h1 span{color:var(--neon-cyan);font-weight:400}
+.header-stats{font-size:13px;color:var(--muted);display:flex;align-items:center;gap:6px;border-left:1px solid var(--border);padding-left:12px;white-space:nowrap}
+.header-stats .hs-val{color:var(--text);font-weight:600}
+.header-stats .hs-sep{color:#334;margin:0 4px}
+.header-center{display:flex;align-items:center;gap:10px;flex-wrap:wrap;font-size:13px}
+.header-center .msk-clock{font-weight:700;color:var(--neon-cyan);font-size:14px;font-variant-numeric:tabular-nums;text-shadow:0 0 8px rgba(0,229,255,0.4)}
+.hsep{color:#334}
+.hmarket{display:flex;align-items:center;gap:5px}
+.hm-label{color:var(--muted);font-size:12px}
+.header-right{display:flex;align-items:center;gap:16px;flex-shrink:0}
+#status-badge{
+  padding:5px 14px;border-radius:20px;font-size:12px;font-weight:600;letter-spacing:0.5px;
+}
+#status-badge.on{background:rgba(0,255,136,0.1);color:var(--green);border:1px solid rgba(0,255,136,0.3);box-shadow:0 0 8px rgba(0,255,136,0.2)}
+#status-badge.off{background:rgba(255,34,85,0.08);color:var(--red);border:1px solid rgba(255,34,85,0.25);box-shadow:0 0 8px rgba(255,34,85,0.15)}
+.logout-btn{
+  background:var(--bg3);border:1px solid var(--border);
+  color:var(--muted);padding:6px 16px;border-radius:10px;font-size:13px;font-family:inherit;
+  text-decoration:none;transition:all 0.2s;
+}
+.logout-btn:hover{background:rgba(255,34,85,0.08);color:var(--red);border-color:rgba(255,34,85,0.25)}
+
+.container{max-width:1200px;margin:0 auto;padding:24px}
+
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:14px;margin-bottom:24px}
+.card{
+  background:var(--bg2);border:1px solid var(--border);border-radius:12px;
+  padding:20px;transition:transform 0.2s,box-shadow 0.2s,border-color 0.2s;position:relative;overflow:hidden;
+  box-shadow:none;
+}
+.card:hover{transform:translateY(-2px);box-shadow:var(--glow-cyan);border-color:var(--neon-cyan)}
+.card::before{
+  content:'';position:absolute;top:0;left:0;right:0;height:3px;
+  background:linear-gradient(90deg,var(--neon-cyan),var(--neon-magenta));border-radius:12px 12px 0 0;
+}
+.card .card-icon{font-size:24px;margin-bottom:8px;display:block}
+.card h3{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:1.2px}
+.card .val{font-size:26px;font-weight:700;margin-top:6px;transition:all 0.3s}
+.g{color:rgba(0,255,136,0.55);text-shadow:0 0 6px rgba(0,255,136,0.3)}.r{color:rgba(255,34,85,0.55);text-shadow:0 0 6px rgba(255,34,85,0.3)}
+
+.chart-section{
+  background:var(--bg2);border:1px solid var(--border);border-radius:12px;
+  padding:24px;margin-top:32px;margin-bottom:24px;
+}
+.chart-section h2{font-size:16px;color:var(--text);margin-bottom:16px;display:flex;align-items:center;gap:8px}
+
+.section{
+  background:var(--bg2);border:1px solid var(--border);border-radius:12px;
+  padding:20px;margin-bottom:24px;
+}
+.section h2{font-size:16px;color:var(--text);margin-bottom:14px;display:flex;align-items:center;gap:8px}
+
+table{width:100%;border-collapse:collapse}
+th{text-align:left;padding:10px 12px;color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:1px;border-bottom:2px solid var(--border);background:var(--bg3)}
+td{padding:10px 12px;font-size:13px;border-bottom:1px solid var(--border)}
+tr{transition:background 0.2s}
+tr:hover{background:rgba(0,229,255,0.05)}
+.side-long{color:var(--green);font-weight:600}
+.side-short{color:var(--red);font-weight:600}
+.status-closed{color:var(--muted)}
+.status-open{color:var(--neon-cyan);font-weight:600}
+.inst-tag{font-size:10px;padding:2px 8px;border-radius:8px;font-weight:600;letter-spacing:0.5px}
+.inst-scalp{background:rgba(0,229,255,0.1);color:#00e5ff}
+.inst-swing{background:rgba(255,152,0,0.1);color:#ff9800}
+.inst-degen{background:rgba(255,0,170,0.1);color:#ff00aa}
+.inst-tbank{background:rgba(0,255,136,0.1);color:#00ff88}
+.inst-midas{background:rgba(255,230,0,0.1);color:#ffe600}
+.inst-turtle{background:rgba(57,255,20,0.1);color:#39ff14}
+.inst-fiba{background:rgba(191,0,255,0.1);color:#bf00ff}
+.so-badge{font-size:9px;padding:1px 5px;border-radius:6px;font-weight:700;background:rgba(255,230,0,0.12);color:#ffe600;border:1px solid rgba(255,230,0,0.3);margin-left:4px;vertical-align:middle}
+.tbl-wrap{overflow-x:auto}
+
+.pagination{display:flex;align-items:center;justify-content:center;gap:12px;margin-top:14px}
+.pagination button{
+  background:rgba(0,229,255,0.08);border:1px solid rgba(0,229,255,0.25);
+  color:var(--neon-cyan);padding:8px 18px;border-radius:8px;font-size:13px;font-family:inherit;
+  cursor:pointer;transition:all 0.2s;
+}
+.pagination button:hover{background:rgba(0,229,255,0.15);box-shadow:var(--glow-cyan)}
+.pagination button:disabled{opacity:0.3;cursor:not-allowed;box-shadow:none}
+.pagination .page-info{color:var(--muted);font-size:13px}
+
+.instances{
+  display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:14px;margin-bottom:20px;
+}
+.instance-card{
+  background:var(--bg2);border:1px solid var(--border);border-radius:12px;
+  padding:20px;position:relative;overflow:hidden;transition:border-color 0.2s,box-shadow 0.2s;
+}
+.instance-card:hover{border-color:rgba(0,229,255,0.3);box-shadow:0 0 15px rgba(0,229,255,0.1)}
+.instance-card::before{
+  content:'';position:absolute;top:0;left:0;right:0;height:3px;border-radius:12px 12px 0 0;
+}
+.instance-card.scalp::before{background:linear-gradient(90deg,#00e5ff,#00b8d4)}
+.instance-card.swing::before{background:linear-gradient(90deg,#ff9800,#ffb74d)}
+.instance-card.degen::before{background:linear-gradient(90deg,#ff00aa,#ff66cc)}
+.instance-card.tbank::before{background:linear-gradient(90deg,#00ff88,#69f0ae)}
+.instance-card.midas::before{background:linear-gradient(90deg,#ffe600,#fff176)}
+.instance-card.turtle::before{background:linear-gradient(90deg,#39ff14,#76ff03)}
+.instance-card.smc::before{background:linear-gradient(90deg,#bf00ff,#e040fb)}
+.instance-card.buba::before{background:linear-gradient(90deg,#6366f1,#a78bfa)}
+.instance-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px}
+.instance-name{font-size:18px;font-weight:700;color:var(--text);display:flex;align-items:center;gap:8px;flex:1;min-width:0}
+.instance-name .badge{
+  font-size:10px;padding:3px 10px;border-radius:12px;font-weight:600;letter-spacing:0.5px;
+}
+.badge-scalp{background:rgba(0,229,255,0.1);color:#00e5ff;border:1px solid rgba(0,229,255,0.25)}
+.badge-swing{background:rgba(255,152,0,0.1);color:#ff9800;border:1px solid rgba(255,152,0,0.25)}
+.badge-degen{background:rgba(255,0,170,0.1);color:#ff00aa;border:1px solid rgba(255,0,170,0.25)}
+.badge-tbank{background:rgba(0,255,136,0.1);color:#00ff88;border:1px solid rgba(0,255,136,0.25)}
+.badge-midas{background:rgba(255,230,0,0.1);color:#ffe600;border:1px solid rgba(255,230,0,0.25)}
+.badge-turtle{background:rgba(57,255,20,0.1);color:#39ff14;border:1px solid rgba(57,255,20,0.25)}
+.badge-smc{background:rgba(191,0,255,0.1);color:#bf00ff;border:1px solid rgba(191,0,255,0.25)}
+.instance-status{font-size:12px;font-weight:600;padding:4px 12px;border-radius:12px}
+.instance-status.on{background:rgba(0,255,136,0.1);color:var(--green);box-shadow:0 0 6px rgba(0,255,136,0.2)}
+.instance-status.off{background:rgba(255,34,85,0.08);color:var(--red)}
+.instance-stats{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}
+.instance-stat h4{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:1px;margin-bottom:4px}
+.instance-stat .val{font-size:20px;font-weight:700}
+.instance-meta{margin-top:12px;font-size:11px;color:var(--muted);display:flex;gap:14px;flex-wrap:wrap;align-items:center}
+.instance-pairs{margin-top:8px;display:flex;gap:4px;flex-wrap:wrap}
+.pair-tag{font-size:10px;padding:2px 6px;border-radius:4px;background:rgba(0,229,255,0.08);border:1px solid rgba(0,229,255,0.2);color:var(--cyan);font-family:inherit;letter-spacing:0.5px}
+.lev-select{
+  background:var(--bg3);border:1px solid var(--border);border-radius:6px;
+  padding:2px 6px;font-size:11px;font-weight:600;color:var(--text);font-family:inherit;
+  cursor:pointer;outline:none;min-width:52px;
+}
+.lev-select:hover{border-color:var(--neon-cyan)}
+.lev-select:focus{border-color:var(--neon-cyan);box-shadow:0 0 0 2px rgba(0,229,255,0.15)}
+.lev-select:disabled{opacity:0.5;cursor:not-allowed}
+
+@keyframes fadeIn{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:translateY(0)}}
+.fade-in{animation:fadeIn 0.4s ease}
+.tf-buttons{display:flex;gap:4px}
+.tf-buttons button{
+  background:var(--bg3);border:1px solid var(--border);
+  color:var(--muted);padding:6px 14px;border-radius:20px;font-size:12px;font-weight:600;font-family:inherit;
+  cursor:pointer;transition:all 0.2s;
+}
+.tf-buttons button:hover{background:rgba(0,229,255,0.08)}
+.tf-buttons button.active{background:var(--neon-cyan);border-color:var(--neon-cyan);color:#0a0a1a}
+
+.date-nav{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.date-nav button{
+  background:var(--bg3);border:1px solid var(--border);
+  color:var(--muted);padding:5px 12px;border-radius:20px;font-size:12px;font-weight:600;font-family:inherit;
+  cursor:pointer;transition:all 0.2s;
+}
+.date-nav button:hover{background:rgba(0,229,255,0.08)}
+.date-nav button.active{background:var(--neon-cyan);border-color:var(--neon-cyan);color:#0a0a1a}
+.date-nav .date-label{font-size:13px;font-weight:700;color:var(--text);min-width:90px;text-align:center}
+.date-nav .date-badge{
+  background:rgba(255,152,0,0.1);color:#ff9800;padding:3px 10px;border-radius:12px;
+  font-size:11px;font-weight:700;display:none;
+}
+
+.chart-half{background:var(--bg3);border:1px solid var(--border);border-radius:12px;padding:16px;position:relative}
+.chart-half-label{font-size:12px;font-weight:600;color:var(--muted);margin-bottom:10px;display:flex;align-items:center;gap:6px}
+.dot{width:10px;height:10px;border-radius:50%;display:inline-block}
+.dot-bybit{background:#00e5ff;box-shadow:0 0 6px rgba(0,229,255,0.4)}
+.dot-degen{background:#ff00aa;box-shadow:0 0 6px rgba(255,0,170,0.4)}
+.dot-tbank{background:#00ff88;box-shadow:0 0 6px rgba(0,255,136,0.4)}
+.dot-swing{background:#ff9800;box-shadow:0 0 6px rgba(255,152,0,0.4)}
+.dot-midas{background:#ffe600;box-shadow:0 0 6px rgba(255,230,0,0.4)}
+.dot-turtle{background:#39ff14;box-shadow:0 0 6px rgba(57,255,20,0.4)}
+.dot-fiba{background:#bf00ff;box-shadow:0 0 6px rgba(191,0,255,0.4)}
+.chart-legend-custom{display:flex;gap:12px;font-size:12px;color:var(--muted)}
+.chart-legend-custom .leg-item{display:flex;align-items:center;gap:5px}
+.leg-bar{width:12px;height:10px;border-radius:2px}
+.leg-line{width:14px;height:2px;border-radius:1px}
+
+.chart-grid{
+  display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));
+  gap:14px;margin-top:16px;
+}
+.chart-mini{
+  background:var(--bg3);border:1px solid var(--border);border-radius:12px;
+  padding:14px;position:relative;
+}
+.chart-mini-header{
+  display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;
+}
+.expand-btn{
+  background:rgba(0,229,255,0.08);border:1px solid rgba(0,229,255,0.2);
+  color:var(--neon-cyan);width:28px;height:28px;border-radius:6px;
+  cursor:pointer;font-size:14px;transition:all 0.2s;
+}
+.expand-btn:hover{background:rgba(0,229,255,0.15);box-shadow:var(--glow-cyan)}
+.chart-fullscreen-overlay{
+  position:fixed;top:0;left:0;right:0;bottom:0;
+  background:rgba(0,0,0,0.6);z-index:1000;
+  display:flex;align-items:center;justify-content:center;padding:24px;
+}
+.chart-fullscreen-content{
+  background:var(--bg2);border:1px solid var(--border);border-radius:16px;padding:24px;
+  width:95vw;max-height:90vh;position:relative;
+}
+.close-btn{
+  position:absolute;top:12px;right:12px;
+  background:var(--bg3);border:1px solid var(--border);
+  width:32px;height:32px;border-radius:8px;
+  cursor:pointer;font-size:16px;color:var(--muted);
+}
+
+.source-toggle{display:flex;gap:0;border-radius:20px;overflow:hidden;border:1px solid var(--border)}
+.source-toggle button{
+  background:var(--bg3);border:none;color:var(--muted);padding:6px 16px;
+  font-size:12px;font-weight:600;cursor:pointer;transition:all 0.2s;font-family:inherit;
+}
+.source-toggle button:hover{background:rgba(0,229,255,0.08)}
+.source-toggle button.active{background:var(--neon-cyan);color:#0a0a1a}
+.source-toggle button.archive-active{background:#ff9800;color:#0a0a1a}
+.archive-banner{
+  background:rgba(255,152,0,0.08);
+  border:1px solid rgba(255,152,0,0.25);border-radius:10px;
+  padding:10px 20px;margin-bottom:16px;text-align:center;
+  color:#ff9800;font-size:14px;font-weight:600;
+}
+body.archive-mode{background:linear-gradient(135deg,#0a0a1a 0%,#1a0d00 50%,#0a0a1a 100%)}
+body.archive-mode .header{background:var(--bg2);border-bottom-color:rgba(255,152,0,0.25)}
+
+.btn-icon{
+  width:32px;height:32px;border-radius:8px;
+  font-size:14px;cursor:pointer;transition:all 0.2s;
+  border:1px solid;display:flex;align-items:center;justify-content:center;
+}
+.btn-icon-stop{background:rgba(255,34,85,0.08);border-color:rgba(255,34,85,0.25);color:#ff2255}
+.btn-icon-stop:hover{background:rgba(255,34,85,0.18)}
+.btn-icon-play{background:rgba(0,255,136,0.08);border-color:rgba(0,255,136,0.25);color:#00ff88}
+.btn-icon-play:hover{background:rgba(0,255,136,0.18)}
+.btn-icon-restart{background:rgba(0,229,255,0.08);border-color:rgba(0,229,255,0.25);color:#00e5ff}
+.btn-icon-restart:hover{background:rgba(0,229,255,0.18)}
+
+.bulk-actions{display:flex;gap:10px;margin-top:12px;flex-wrap:wrap}
+.btn-bulk{
+  padding:8px 20px;border-radius:10px;font-size:13px;font-weight:600;
+  cursor:pointer;transition:all 0.2s;border:1px solid;
+}
+.btn-bulk:disabled{opacity:0.4;cursor:not-allowed}
+.btn-bulk-restart{background:rgba(0,229,255,0.08);border-color:rgba(0,229,255,0.25);color:#00e5ff}
+.btn-bulk-restart:hover{background:rgba(0,229,255,0.18)}
+.btn-bulk-stop{background:rgba(255,34,85,0.08);border-color:rgba(255,34,85,0.25);color:#ff2255}
+.btn-bulk-stop:hover{background:rgba(255,34,85,0.18)}
+.btn-bulk-nolev{background:rgba(0,229,255,0.08);border-color:rgba(0,229,255,0.25);color:#00e5ff}
+.btn-bulk-nolev:hover{background:rgba(0,229,255,0.18)}
+.btn-icon:disabled{opacity:0.4;cursor:not-allowed}
+
+.btn-close-x{
+  background:none;border:none;color:#ff2255;font-size:20px;font-weight:700;
+  cursor:pointer;transition:all 0.2s;line-height:1;padding:2px 6px;border-radius:50%;
+  opacity:0.5;
+}
+.btn-close-x:hover{opacity:1;background:rgba(255,34,85,0.12)}
+.btn-close-x:disabled{opacity:0.2;cursor:not-allowed}
+.btn-x2:disabled{opacity:0.4;cursor:not-allowed}
+.sl-wrap{display:inline-flex;align-items:center;gap:4px}
+.sl-input{width:60px;padding:3px 6px;border:1px solid rgba(255,34,85,0.3);border-radius:6px;font-size:12px;text-align:right;background:rgba(255,34,85,0.04);color:var(--text);font-family:inherit;-moz-appearance:textfield}
+.sl-input::-webkit-outer-spin-button,.sl-input::-webkit-inner-spin-button{-webkit-appearance:none;margin:0}
+.sl-input:focus{outline:none;border-color:#ff2255}
+.btn-sl{background:rgba(255,34,85,0.08);border:1px solid rgba(255,34,85,0.25);color:#ff2255;padding:3px 8px;border-radius:6px;font-size:11px;font-weight:600;cursor:pointer;white-space:nowrap;font-family:inherit}
+.btn-sl:hover{background:rgba(255,34,85,0.18)}
+.btn-sl:disabled{opacity:0.4;cursor:not-allowed}
+.tp-wrap{display:inline-flex;align-items:center;gap:4px}
+.tp-input{width:60px;padding:3px 6px;border:1px solid rgba(0,255,136,0.3);border-radius:6px;font-size:12px;text-align:right;background:rgba(0,255,136,0.04);color:var(--text);font-family:inherit;-moz-appearance:textfield}
+.tp-input::-webkit-outer-spin-button,.tp-input::-webkit-inner-spin-button{-webkit-appearance:none;margin:0}
+.tp-input:focus{outline:none;border-color:#00ff88}
+.btn-tp{background:rgba(0,255,136,0.08);border:1px solid rgba(0,255,136,0.25);color:#00ff88;padding:3px 8px;border-radius:6px;font-size:11px;font-weight:600;cursor:pointer;white-space:nowrap;font-family:inherit}
+.btn-tp:hover{background:rgba(0,255,136,0.18)}
+.btn-tp:disabled{opacity:0.4;cursor:not-allowed}
+.btn-close-all{
+  background:rgba(255,34,85,0.08);border:1px solid rgba(255,34,85,0.25);
+  color:#ff2255;padding:10px 24px;border-radius:10px;font-size:14px;font-weight:600;
+  cursor:pointer;transition:all 0.2s;font-family:inherit;
+}
+.btn-close-all:hover{background:rgba(255,34,85,0.18)}
+.btn-close-all:disabled{opacity:0.4;cursor:not-allowed}
+
+.market-dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
+.market-dot.open{background:var(--green);box-shadow:0 0 8px rgba(0,255,136,0.5)}
+.market-dot.closed{background:var(--red);box-shadow:0 0 6px rgba(255,34,85,0.3)}
+.market-status{font-weight:600;font-size:12px}
+.market-status.open{color:var(--green)}
+.market-status.closed{color:var(--red)}
+.market-hours{color:var(--muted);font-size:11px}
+.market-bal{font-weight:700;font-size:13px;color:var(--neon-cyan);background:var(--bg3);padding:2px 8px;border-radius:6px;font-variant-numeric:tabular-nums}
+.today-pnl{font-weight:700;font-size:12px;padding:2px 6px;border-radius:6px;font-variant-numeric:tabular-nums}
+
+.summary-bar{
+  background:var(--bg2);border:1px solid var(--border);border-radius:12px;
+  padding:18px 24px;margin-bottom:20px;display:flex;align-items:center;gap:20px;
+  flex-wrap:wrap;
+}
+.summary-main{text-align:center;min-width:140px}
+.summary-label{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:1.2px;margin-bottom:4px}
+.summary-value{font-size:32px;font-weight:800;font-variant-numeric:tabular-nums}
+.summary-divider{width:1px;height:48px;background:var(--border);flex-shrink:0}
+.summary-value{text-shadow:0 0 10px currentColor}
+.summary-details{display:flex;flex-direction:column;gap:6px}
+.summary-item{display:flex;align-items:center;gap:8px}
+.summary-item-label{font-size:11px;color:var(--muted);min-width:56px}
+.summary-item-val{font-size:15px;font-weight:700;font-variant-numeric:tabular-nums}
+.pair-pnl-bar{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:20px}
+.pair-chip{display:flex;align-items:center;gap:6px;background:var(--bg2);border:1px solid var(--border);border-radius:8px;padding:6px 12px;font-size:12px}
+.pair-chip-symbol{color:var(--muted);font-weight:600}
+.pair-chip-cnt{color:var(--muted);font-size:10px}
+.pair-chip-pnl{font-weight:800;font-variant-numeric:tabular-nums}
+@media(max-width:600px){
+  .summary-bar{padding:14px 16px;gap:14px}
+  .summary-value{font-size:24px}
+  .summary-divider{width:100%;height:1px}
+}
+.last-update{text-align:center;color:#445;font-size:11px;padding:16px}
+
+@media(max-width:600px){
+  .container{padding:14px}
+  .cards{grid-template-columns:repeat(2,1fr);gap:10px}
+  .card{padding:14px}
+  .card .val{font-size:20px}
+  .header{padding:12px 16px;flex-wrap:wrap;gap:10px}
+  .header h1{font-size:16px}
+  .chart-grid{grid-template-columns:1fr}
+  .chart-fullscreen-content{width:100vw;padding:16px;border-radius:12px}
+}
+.night-mode-wrap{display:flex;align-items:center;gap:8px}
+.night-label{font-size:11px;color:var(--neon-yellow);font-weight:700;letter-spacing:1px;text-shadow:0 0 6px var(--neon-yellow)}
+.night-input{width:52px;padding:4px 6px;background:rgba(251,191,36,0.08);border:1px solid rgba(251,191,36,0.3);border-radius:6px;color:var(--neon-yellow);font-family:'Share Tech Mono',monospace;font-size:13px;text-align:center;outline:none;transition:border-color .2s,box-shadow .2s}
+.night-input:focus{border-color:var(--neon-yellow);box-shadow:0 0 8px rgba(251,191,36,0.3)}
+.night-input::placeholder{color:rgba(251,191,36,0.3);font-size:11px}
+.night-switch{position:relative;display:inline-block;width:36px;height:20px;flex-shrink:0}
+.night-switch input{opacity:0;width:0;height:0}
+.night-slider{position:absolute;cursor:pointer;top:0;left:0;right:0;bottom:0;background:rgba(255,255,255,0.08);border:1px solid rgba(255,255,255,0.15);border-radius:20px;transition:.3s}
+.night-slider:before{content:'';position:absolute;height:14px;width:14px;left:2px;bottom:2px;background:#555;border-radius:50%;transition:.3s}
+.night-switch input:checked+.night-slider{background:rgba(251,191,36,0.2);border-color:var(--neon-yellow);box-shadow:0 0 10px rgba(251,191,36,0.4)}
+.night-switch input:checked+.night-slider:before{transform:translateX(16px);background:var(--neon-yellow);box-shadow:0 0 6px var(--neon-yellow)}
+.sale-mode-wrap{display:flex;align-items:center;gap:8px}
+.sale-label{font-size:11px;color:var(--neon-cyan);font-weight:700;letter-spacing:1px;text-shadow:0 0 6px var(--neon-cyan)}
+.sale-input{width:52px;padding:4px 6px;background:rgba(0,255,255,0.08);border:1px solid rgba(0,255,255,0.3);border-radius:6px;color:var(--neon-cyan);font-family:'Share Tech Mono',monospace;font-size:13px;text-align:center;outline:none;transition:border-color .2s,box-shadow .2s}
+.sale-input:focus{border-color:var(--neon-cyan);box-shadow:0 0 8px rgba(0,255,255,0.3)}
+.sale-input::placeholder{color:rgba(0,255,255,0.3);font-size:11px}
+.sale-switch{position:relative;display:inline-block;width:36px;height:20px;flex-shrink:0}
+.sale-switch input{opacity:0;width:0;height:0}
+.sale-slider{position:absolute;cursor:pointer;top:0;left:0;right:0;bottom:0;background:rgba(255,255,255,0.08);border:1px solid rgba(255,255,255,0.15);border-radius:20px;transition:.3s}
+.sale-slider:before{content:'';position:absolute;height:14px;width:14px;left:2px;bottom:2px;background:#555;border-radius:50%;transition:.3s}
+.sale-switch input:checked+.sale-slider{background:rgba(0,255,255,0.2);border-color:var(--neon-cyan);box-shadow:0 0 10px rgba(0,255,255,0.4)}
+.sale-switch input:checked+.sale-slider:before{transform:translateX(16px);background:var(--neon-cyan);box-shadow:0 0 6px var(--neon-cyan)}
+</style>
+</head><body>
+
+<div class="header">
+  <div class="header-left">
+    <svg class="cyber-logo-sm" viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg">
+      <defs><linearGradient id="hg" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#00e5ff"/><stop offset="100%" stop-color="#bf00ff"/></linearGradient></defs>
+      <polygon points="50,8 90,28 90,72 50,92 10,72 10,28" fill="none" stroke="url(#hg)" stroke-width="3"/>
+      <rect x="28" y="38" width="16" height="10" rx="2" fill="#00e5ff" opacity="0.9"><animate attributeName="opacity" values="0.9;0.4;0.9" dur="2s" repeatCount="indefinite"/></rect>
+      <rect x="56" y="38" width="16" height="10" rx="2" fill="#bf00ff" opacity="0.9"><animate attributeName="opacity" values="0.9;0.4;0.9" dur="2s" begin="0.3s" repeatCount="indefinite"/></rect>
+      <line x1="30" y1="58" x2="70" y2="58" stroke="#00e5ff" stroke-width="1.5" opacity="0.4"/>
+      <line x1="35" y1="62" x2="65" y2="62" stroke="#bf00ff" stroke-width="1.5" opacity="0.3"/>
+      <line x1="40" y1="66" x2="60" y2="66" stroke="#00e5ff" stroke-width="1.5" opacity="0.2"/>
+    </svg>
+    <h1>Stasik <span>Trading Bot</span></h1>
+    <div class="header-stats" id="header-stats"></div>
+  </div>
+  <div class="header-center">
+    <span class="msk-clock" id="msk-clock">--:--:--</span>
+    <span class="hsep">|</span>
+    <div class="hmarket">
+      <span class="market-dot" id="bybit-dot"></span>
+      <span class="hm-label">Bybit</span>
+      <span class="market-status open">24/7</span>
+      <span class="market-hours" id="bybit-hours"></span>
+      <span class="market-bal" id="bybit-bal">—</span>
+      <span class="today-pnl" id="bybit-pnl"></span>
+    </div>
+    <span class="hsep">|</span>
+    <div class="hmarket">
+      <span class="market-dot" id="moex-dot"></span>
+      <span class="hm-label">MOEX</span>
+      <span class="market-status" id="moex-status">—</span>
+      <span class="market-hours" id="moex-hours"></span>
+      <span class="market-bal" id="tbank-bal">—</span>
+      <span class="today-pnl" id="tbank-pnl"></span>
+    </div>
+  </div>
+  <div class="header-right">
+    <div class="night-mode-wrap" id="night-mode-wrap">
+      <span class="night-label">NIGHT</span>
+      <input type="text" class="night-input" id="night-target" maxlength="4" inputmode="numeric" placeholder="PnL">
+      <label class="night-switch"><input type="checkbox" id="night-toggle"><span class="night-slider"></span></label>
+    </div>
+    <div class="sale-mode-wrap" id="sale-mode-wrap">
+      <span class="sale-label">SALE</span>
+      <input type="text" class="sale-input" id="sale-target" maxlength="4" inputmode="numeric" placeholder="PnL">
+      <label class="sale-switch"><input type="checkbox" id="sale-toggle"><span class="sale-slider"></span></label>
+    </div>
+    <div class="source-toggle" id="source-toggle">
+      <button class="active" onclick="setSource('live')" data-source="live">Live</button>
+      <button onclick="setSource('archive')" data-source="archive">Архив</button>
+    </div>
+    <div id="status-badge" class="off">...</div>
+    <a href="/logout" class="logout-btn">Выход</a>
+  </div>
+</div>
+
+<div class="container">
+  <div class="archive-banner" id="archive-banner" style="display:none">АРХИВ — данные до перехода на стратегию Котегавы</div>
+
+  <div class="summary-bar" id="summary-bar">
+    <div class="summary-details">
+      <div class="summary-item">
+        <span class="summary-item-label">Bybit</span>
+        <span class="summary-item-val" id="summary-bybit">—</span>
+      </div>
+      <div class="summary-item">
+        <span class="summary-item-label">TBank</span>
+        <span class="summary-item-val" id="summary-tbank">—</span>
+      </div>
+    </div>
+    <div class="summary-divider"></div>
+    <div class="summary-details">
+      <div class="summary-item">
+        <span class="summary-item-label">Сделок</span>
+        <span class="summary-item-val" id="summary-trades">0</span>
+      </div>
+      <div class="summary-item">
+        <span class="summary-item-label">Позиции</span>
+        <span class="summary-item-val" id="summary-positions">0</span>
+      </div>
+    </div>
+    <div class="summary-divider"></div>
+    <div class="summary-details">
+      <div class="summary-item">
+        <span class="summary-item-label">Win Rate</span>
+        <span class="summary-item-val" id="summary-wr">—</span>
+      </div>
+      <div class="summary-item">
+        <span class="summary-item-label">Всего PnL</span>
+        <span class="summary-item-val" id="summary-all">—</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="pair-pnl-bar" id="pair-pnl-bar"></div>
+
+  <div class="section">
+    <h2>📊 Открытые позиции</h2>
+    <div class="tbl-wrap">
+      <table>
+        <thead><tr><th>Bot</th><th>Pair</th><th>Side</th><th>Lev</th><th>PS</th><th>TP</th><th>SL</th><th>Gross PnL</th><th>Fee</th><th>Net PnL</th><th></th></tr></thead>
+        <tbody id="pos-body"></tbody>
+      </table>
+    </div>
+    <div id="close-all-wrap" style="display:none;margin-top:14px;text-align:right">
+      <button class="btn-close-all" onclick="closeAllPositions()">CLOSE ALL</button>
+    </div>
+  </div>
+
+  <div class="section">
+    <h2>📋 История сделок</h2>
+    <div class="tbl-wrap">
+      <table>
+        <thead><tr>
+          <th>Bot</th><th>Pair</th><th>Side</th><th>Lev</th><th>Size</th><th>Entry</th><th>Exit</th><th>PS</th><th>Gross PnL</th><th>Net PnL</th><th>Time</th><th>Dur</th><th>Status</th>
+        </tr></thead>
+        <tbody id="tbody"></tbody>
+      </table>
+    </div>
+    <div class="pagination">
+      <button id="prev-btn" disabled onclick="changePage(-1)">← Назад</button>
+      <span class="page-info" id="page-info">Стр. 1</span>
+      <button id="next-btn" disabled onclick="changePage(1)">Вперёд →</button>
+    </div>
+  </div>
+
+  <div class="instances" id="instances"></div>
+  <div class="bulk-actions" id="bulk-actions">
+    <button class="btn-bulk btn-bulk-restart" onclick="bulkAction('restart')">&#8635; Restart All</button>
+    <button class="btn-bulk btn-bulk-stop" onclick="bulkAction('stop')">&#9632; Kill All</button>
+  </div>
+
+  <div class="chart-section">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;flex-wrap:wrap;gap:10px">
+      <h2 style="margin:0">📈 PnL</h2>
+      <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+        <div class="chart-legend-custom" id="chart-legend"></div>
+        <div class="tf-buttons" id="tf-buttons">
+          <button class="active" onclick="setTF('1m')" data-tf="1m">1м</button>
+          <button onclick="setTF('5m')" data-tf="5m">5м</button>
+          <button onclick="setTF('10m')" data-tf="10m">10м</button>
+          <button onclick="setTF('30m')" data-tf="30m">30м</button>
+          <button onclick="setTF('1H')" data-tf="1H">1ч</button>
+          <button onclick="setTF('1D')" data-tf="1D">1д</button>
+          <button onclick="setTF('1M')" data-tf="1M">1мес</button>
+        </div>
+      </div>
+    </div>
+    <!-- Date navigator (shown only in archive mode) -->
+    <div class="date-nav" id="date-nav" style="display:none">
+      <button onclick="navDate(-1)">&#8592; Пред</button>
+      <span class="date-label" id="date-label">Сегодня</span>
+      <button onclick="navDate(1)">След &#8594;</button>
+      <button class="active" id="btn-today" onclick="setArchiveDate(null,'day')">Сегодня</button>
+      <button id="btn-week" onclick="toggleWeek()">Неделя</button>
+      <span class="date-badge" id="date-badge">Архив</span>
+    </div>
+    <!-- Combined chart: all instances -->
+    <div class="chart-half">
+      <div class="chart-half-label">Все инстансы — кумулятивный PnL</div>
+      <canvas id="pnlChartCombined"></canvas>
+    </div>
+
+    <!-- Mini-charts grid -->
+    <div class="chart-grid" id="chart-grid">
+      <div class="chart-mini" id="mini-fiba">
+        <div class="chart-mini-header">
+          <span class="chart-half-label" style="margin:0"><span class="dot dot-fiba"></span>FIBA</span>
+          <button class="expand-btn" onclick="expandChart('FIBA')">&#x2922;</button>
+        </div>
+        <canvas id="pnlChartFiba"></canvas>
+      </div>
+    </div>
+  </div>
+
+  <!-- Fullscreen overlay for expanded charts -->
+  <div class="chart-fullscreen-overlay" id="chart-fullscreen" style="display:none" onclick="closeFullscreen(event)">
+    <div class="chart-fullscreen-content" onclick="event.stopPropagation()">
+      <button class="close-btn" onclick="closeFullscreen()">&#x2715;</button>
+      <div id="fullscreen-label" style="font-size:14px;font-weight:600;color:var(--muted);margin-bottom:12px"></div>
+      <canvas id="pnlChartFull"></canvas>
+    </div>
+  </div>
+
+  <div class="last-update" id="last-update"></div>
+</div>
+
+<script>
+let currentPage=1,hasNext=false,currentTF='1m',currentSource='live';
+let archiveDate=null; // null = today (live)
+let archiveRange='day'; // 'day' | 'week'
+let _nightEnabled=false,_nightTarget=0;
+let _nightSaveTimer=null;
+function _nightSave(){
+  clearTimeout(_nightSaveTimer);
+  _nightSaveTimer=setTimeout(()=>{
+    fetch('/api/night-settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:_nightEnabled,target:_nightTarget})});
+  },300);
+}
+(function(){
+  document.addEventListener('DOMContentLoaded',()=>{
+    const inp=document.getElementById('night-target');
+    const tog=document.getElementById('night-toggle');
+    fetch('/api/night-settings').then(r=>r.json()).then(d=>{
+      _nightEnabled=!!d.enabled;_nightTarget=d.target||0;
+      tog.checked=_nightEnabled;
+      if(_nightTarget)inp.value=_nightTarget;
+    }).catch(()=>{});
+    inp.addEventListener('input',()=>{
+      inp.value=inp.value.replace(/[^0-9]/g,'').slice(0,4);
+      _nightTarget=parseInt(inp.value)||0;
+      _nightSave();
+    });
+    tog.addEventListener('change',()=>{
+      _nightEnabled=tog.checked;
+      _nightSave();
+    });
+  });
+})();
+
+let _saleEnabled=false,_saleTarget=0;
+let _saleSaveTimer=null;
+function _saleSave(){
+  clearTimeout(_saleSaveTimer);
+  _saleSaveTimer=setTimeout(()=>{
+    fetch('/api/sale-settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:_saleEnabled,target:_saleTarget})});
+  },300);
+}
+(function(){
+  document.addEventListener('DOMContentLoaded',()=>{
+    const inp=document.getElementById('sale-target');
+    const tog=document.getElementById('sale-toggle');
+    fetch('/api/sale-settings').then(r=>r.json()).then(d=>{
+      _saleEnabled=!!d.enabled;_saleTarget=d.target||0;
+      tog.checked=_saleEnabled;
+      if(_saleTarget)inp.value=_saleTarget;
+    }).catch(()=>{});
+    inp.addEventListener('input',()=>{
+      inp.value=inp.value.replace(/[^0-9]/g,'').slice(0,4);
+      _saleTarget=parseInt(inp.value)||0;
+      _saleSave();
+    });
+    tog.addEventListener('change',()=>{
+      _saleEnabled=tog.checked;
+      _saleSave();
+    });
+  });
+})();
+
+function fmt(v){return(v>=0?'+':'')+v.toFixed(2)}
+function cls(v){return v>=0?'g':'r'}
+
+function fmtDateRu(d){
+  const dd=String(d.getDate()).padStart(2,'0');
+  const mm=String(d.getMonth()+1).padStart(2,'0');
+  return dd+'.'+mm+'.'+d.getFullYear();
+}
+function toISO(d){return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0')}
+
+function updateDateNav(){
+  const label=document.getElementById('date-label');
+  const badge=document.getElementById('date-badge');
+  const btnToday=document.getElementById('btn-today');
+  const btnWeek=document.getElementById('btn-week');
+  if(!archiveDate){
+    label.textContent='Сегодня';
+    badge.style.display='none';
+    btnToday.classList.add('active');
+  }else{
+    const d=new Date(archiveDate+'T00:00:00');
+    if(archiveRange==='week'){
+      const end=new Date(d);end.setDate(end.getDate()+6);
+      label.textContent=fmtDateRu(d)+' — '+fmtDateRu(end);
+    }else{
+      label.textContent=fmtDateRu(d);
+    }
+    badge.style.display='';
+    btnToday.classList.remove('active');
+  }
+  btnWeek.classList.toggle('active',archiveRange==='week');
+}
+
+function setArchiveDate(dateStr,range){
+  archiveDate=dateStr;
+  archiveRange=range||'day';
+  currentPage=1;
+  updateDateNav();
+  loadChart();
+  loadTrades(1);
+}
+
+function navDate(dir){
+  const step=archiveRange==='week'?7:1;
+  let d;
+  if(archiveDate){
+    d=new Date(archiveDate+'T00:00:00');
+  }else{
+    d=new Date();d.setHours(0,0,0,0);
+  }
+  d.setDate(d.getDate()+dir*step);
+  if(currentSource==='archive'){
+    setArchiveDate(toISO(d),archiveRange);
+  }else{
+    const today=new Date();today.setHours(0,0,0,0);
+    if(d>=today){
+      setArchiveDate(null,archiveRange);
+    }else{
+      setArchiveDate(toISO(d),archiveRange);
+    }
+  }
+}
+
+function toggleWeek(){
+  if(archiveRange==='week'){
+    archiveRange='day';
+  }else{
+    archiveRange='week';
+    // Align to Monday
+    if(archiveDate){
+      const d=new Date(archiveDate+'T00:00:00');
+      const dow=d.getDay()||7;
+      d.setDate(d.getDate()-(dow-1));
+      archiveDate=toISO(d);
+    }
+  }
+  currentPage=1;
+  updateDateNav();
+  loadChart();
+  loadTrades(1);
+}
+
+function setTF(tf){
+  currentTF=tf;
+  document.querySelectorAll('.tf-buttons button').forEach(b=>b.classList.toggle('active',b.dataset.tf===tf));
+  loadChart();
+}
+function setSource(src){
+  currentSource=src;
+  currentPage=1;
+  archiveDate=null;archiveRange='day';updateDateNav();
+  document.querySelectorAll('.source-toggle button').forEach(b=>{
+    b.classList.remove('active','archive-active');
+    if(b.dataset.source===src){b.classList.add(src==='archive'?'archive-active':'active')}
+  });
+  const banner=document.getElementById('archive-banner');
+  const badge=document.getElementById('status-badge');
+  const dateNav=document.getElementById('date-nav');
+  const instances=document.getElementById('instances');
+  const bulkActs=document.getElementById('bulk-actions');
+  const nightWrap=document.getElementById('night-mode-wrap');
+  const saleWrap=document.getElementById('sale-mode-wrap');
+  if(src==='archive'){
+    banner.style.display='';
+    badge.style.display='none';
+    dateNav.style.display='';
+    instances.style.display='none';
+    bulkActs.style.display='none';
+    nightWrap.style.display='none';
+    saleWrap.style.display='none';
+    document.body.classList.add('archive-mode');
+  }else{
+    banner.style.display='none';
+    badge.style.display='';
+    dateNav.style.display='';
+    instances.style.display='';
+    bulkActs.style.display='';
+    nightWrap.style.display='flex';
+    saleWrap.style.display='flex';
+    document.body.classList.remove('archive-mode');
+  }
+  loadAll();
+}
+
+async function loadInstances(){
+  try{
+    const list=await(await fetch('/api/instances?source='+currentSource)).json();
+    const el=document.getElementById('instances');
+    el.innerHTML=list.map(i=>{
+      const key=i.name.toUpperCase();
+      const isTbank=key.includes('TBANK');
+      const isDegen=key.includes('DEGEN');
+      const isScalp=key.includes('SCALP')&&!isTbank;
+      const isSwing=key.includes('SWING')&&!isTbank;
+      const isMidas=key.includes('MIDAS');
+      const isTurtle=key.includes('TURTLE')&&!isTbank;
+      const isSmc=key.includes('FIBA');
+      const isBuba=key.includes('BUBA');
+      const cardCls=isTbank?'tbank':isDegen?'degen':isScalp?'scalp':isMidas?'midas':isTurtle?'turtle':isBuba?'buba':isSmc?'smc':'swing';
+      const badgeCls=isTbank?'badge-tbank':isDegen?'badge-degen':isScalp?'badge-scalp':isMidas?'badge-midas':isTurtle?'badge-turtle':isBuba?'badge-buba':isSmc?'badge-smc':'badge-swing';
+      const tf=i.timeframe;
+      const cur=(isTbank||isMidas)?'RUB':'USDT';
+      const icon=isTbank?'🏦':isDegen?'🎰':isScalp?'⚡':isMidas?'🥇':isTurtle?'🐢':isBuba?'🔮':isSmc?'🧠':'🌊';
+      const svc=i.service||'';
+      const toggleBtn=svc&&currentSource==='live'?
+        (i.running?`<button class="btn-icon btn-icon-stop" onclick="toggleService('${svc}','stop',this)" title="Остановить">&#9632;</button>`
+                  :`<button class="btn-icon btn-icon-play" onclick="toggleService('${svc}','start',this)" title="Запустить">&#9654;</button>`):'';
+      const restartBtn=svc&&currentSource==='live'?
+        `<button class="btn-icon btn-icon-restart" onclick="toggleService('${svc}','restart',this)" title="Перезапустить">&#8635;</button>`:'';
+      return`<div class="instance-card ${cardCls} fade-in">
+        <div class="instance-header">
+          <div class="instance-name">
+            ${icon}
+            <span>${i.name}</span>
+          </div>
+          <div style="display:flex;align-items:center;gap:8px;flex-shrink:0">
+            ${restartBtn}
+            ${toggleBtn}
+            <div class="instance-status ${i.running?'on':'off'}">${i.running?'РАБОТАЕТ':'СТОП'}</div>
+          </div>
+        </div>
+        <div class="instance-stats">
+          <div class="instance-stat"><h4>За день</h4><div class="val ${cls(i.daily_pnl)}">${fmt(i.daily_pnl)} ${cur}</div></div>
+          <div class="instance-stat"><h4>Всего PnL</h4><div class="val ${cls(i.total_pnl)}">${fmt(i.total_pnl)} ${cur}</div></div>
+          <div class="instance-stat"><h4>Win Rate</h4><div class="val">${i.total_trades?i.win_rate.toFixed(1)+'%':'—'}</div></div>
+        </div>
+        <div class="instance-meta">
+          <span>📊 Позиции: ${i.open_positions}</span>
+          <span>🔢 Сделок: ${i.total_trades} (${i.wins}W / ${i.losses}L)</span>
+          <span>⚡ ${i.leverage}x</span>
+        </div>
+        <div class="instance-pairs">${i.pairs.map(p=>`<span class="pair-tag">${p}</span>`).join('')}</div>
+      </div>`;
+    }).join('');
+    // Summary widget
+    let bybitDay=0,tbankDay=0,bybitAll=0,tbankAll=0,totalTrades=0,totalPos=0,totalWins=0,totalLosses=0;
+    list.forEach(i=>{
+      const nm=i.name.toUpperCase();
+      const tb=nm.includes('TBANK')||nm.includes('MIDAS');
+      if(tb){tbankDay+=i.daily_pnl;tbankAll+=i.total_pnl}
+      else{bybitDay+=i.daily_pnl;bybitAll+=i.total_pnl}
+      totalTrades+=i.total_trades;totalPos+=i.open_positions;
+      totalWins+=i.wins;totalLosses+=i.losses;
+    });
+    document.getElementById('summary-bybit').className='summary-item-val '+(bybitDay>=0?'g':'r');
+    document.getElementById('summary-bybit').textContent=(bybitDay>=0?'+':'')+bybitDay.toFixed(2)+' USDT';
+    document.getElementById('summary-tbank').className='summary-item-val '+(tbankDay>=0?'g':'r');
+    document.getElementById('summary-tbank').textContent=(tbankDay>=0?'+':'')+tbankDay.toFixed(2)+' RUB';
+    document.getElementById('summary-trades').textContent=totalTrades;
+    document.getElementById('summary-positions').textContent=totalPos;
+    const wr=totalTrades>0?(totalWins/totalTrades*100).toFixed(1)+'%':'—';
+    document.getElementById('summary-wr').textContent=wr;
+    const allEl=document.getElementById('summary-all');
+    let allParts=[];
+    if(bybitAll!==0){const c=bybitAll>=0?'#00ff88':'#ff2255';allParts.push(`<span style="color:${c}">${bybitAll>0?'+':''}${bybitAll.toFixed(0)}$</span>`)}
+    if(tbankAll!==0){const c=tbankAll>=0?'#00ff88':'#ff2255';allParts.push(`<span style="color:${c}">${tbankAll>0?'+':''}${tbankAll.toFixed(0)}\u20bd</span>`)}
+    allEl.innerHTML=allParts.length?allParts.join(' / '):'0';
+  }catch(e){console.error('instances',e)}
+}
+
+async function loadPairPnl(){
+  try{
+    const pairs=await(await fetch('/api/pair-pnl?source='+currentSource)).json();
+    const el=document.getElementById('pair-pnl-bar');
+    el.innerHTML=pairs.map(p=>{
+      const c=p.pnl>=0?'#00ff88':'#ff2255';
+      const sign=p.pnl>0?'+':'';
+      const val=p.cur==='USDT'?`${sign}${p.pnl.toFixed(2)}$`:`${sign}${p.pnl.toFixed(0)}\u20bd`;
+      return`<div class="pair-chip"><span class="pair-chip-symbol">${p.symbol}</span><span class="pair-chip-cnt">${p.trades}</span><span class="pair-chip-pnl" style="color:${c}">${val}</span></div>`;
+    }).join('');
+  }catch(e){console.error('pair-pnl',e)}
+}
+
+async function loadStats(){
+  try{
+    const s=await(await fetch('/api/stats?source='+currentSource)).json();
+    const b=document.getElementById('status-badge');
+    b.className=s.running?'on':'off';
+    b.textContent=s.running?'РАБОТАЕТ':'ОСТАНОВЛЕН';
+    const tb=s.tbank_balance||0;
+    const hs=document.getElementById('header-stats');
+    hs.innerHTML=`сделок: <span class="hs-val">${s.all_trades||s.total_trades}</span>`;
+    // Balance widgets in market bar
+    const bybitBal=document.getElementById('bybit-bal');
+    const tbankBal=document.getElementById('tbank-bal');
+    bybitBal.textContent=s.balance?s.balance.toLocaleString('ru-RU',{maximumFractionDigits:0})+' USDT':'—';
+    tbankBal.textContent=tb?tb.toLocaleString('ru-RU',{maximumFractionDigits:0})+' RUB':'—';
+    // Today's net PnL
+    const bPnl=s.today_pnl_usdt||0;const tPnl=s.today_pnl_rub||0;
+    const bpEl=document.getElementById('bybit-pnl');
+    const tpEl=document.getElementById('tbank-pnl');
+    if(bPnl!==0){bpEl.textContent=(bPnl>0?'+':'')+bPnl.toFixed(2)+'$';bpEl.style.color=bPnl>=0?'#00ff88':'#ff2255'}else{bpEl.textContent=''}
+    if(tPnl!==0){tpEl.textContent=(tPnl>0?'+':'')+tPnl.toFixed(0)+'\u20bd';tpEl.style.color=tPnl>=0?'#00ff88':'#ff2255'}else{tpEl.textContent=''}
+  }catch(e){console.error('stats',e)}
+}
+
+let chartCombined=null, miniCharts={}, chartFull=null, instanceData={};
+const INST_COLORS={FIBA:'#bf00ff','TBANK-SCALP':'#00ff88','TBANK-SWING':'#39ff14',MIDAS:'#ffe600'};
+const INST_CANVAS={FIBA:'pnlChartFiba'};
+const INST_MINI={FIBA:'mini-fiba'};
+const INST_CURRENCY={FIBA:'USDT','TBANK-SCALP':'RUB','TBANK-SWING':'RUB',MIDAS:'RUB'};
+const INST_SYM={FIBA:'$','TBANK-SCALP':'\u20bd','TBANK-SWING':'\u20bd',MIDAS:'\u20bd'};
+
+function buildArea(canvasId, labels, dailyArr, lineColor, currency, sym){
+  const ctx=document.getElementById(canvasId).getContext('2d');
+
+  // Cumulative PnL
+  const cumulative=[];
+  let cum=0;
+  dailyArr.forEach(v=>{cum+=v;cumulative.push(cum)});
+
+  // Y range: ±100% from peak |cumPnL| (symmetric around 0)
+  const peak=Math.max(1,Math.max(...cumulative.map(Math.abs)));
+  const yMax=Math.ceil(peak*2);const yMin=-yMax;
+
+  // Pad x-axis +20% with empty space
+  const extra=Math.max(1,Math.ceil(labels.length*0.2));
+  const padLabels=[...labels];const padCum=[...cumulative];const padDaily=[...dailyArr];
+  for(let i=0;i<extra;i++){padLabels.push('');padCum.push(null);padDaily.push(0)}
+
+  // Plugin: fill green above 0, red below 0
+  const zeroFillPlugin={
+    id:'zeroFill',
+    beforeDatasetsDraw(chart){
+      const meta=chart.getDatasetMeta(0);
+      if(!meta.data.length)return;
+      const {ctx:c,chartArea:{left,right,bottom},scales:{y}}=chart;
+      const zeroY=y.getPixelForValue(0);
+      c.save();
+      // Green region (above zero) — clip to above zero line
+      c.beginPath();
+      c.rect(left,chart.chartArea.top,right-left,zeroY-chart.chartArea.top);
+      c.clip();
+      c.beginPath();
+      c.moveTo(meta.data[0].x,zeroY);
+      meta.data.forEach(pt=>c.lineTo(pt.x,pt.y));
+      c.lineTo(meta.data[meta.data.length-1].x,zeroY);
+      c.closePath();
+      const gGreen=c.createLinearGradient(0,chart.chartArea.top,0,zeroY);
+      gGreen.addColorStop(0,'rgba(0,255,136,0.25)');
+      gGreen.addColorStop(1,'rgba(0,255,136,0.03)');
+      c.fillStyle=gGreen;c.fill();
+      c.restore();
+      // Red region (below zero) — clip to below zero line
+      c.save();
+      c.beginPath();
+      c.rect(left,zeroY,right-left,bottom-zeroY);
+      c.clip();
+      c.beginPath();
+      c.moveTo(meta.data[0].x,zeroY);
+      meta.data.forEach(pt=>c.lineTo(pt.x,pt.y));
+      c.lineTo(meta.data[meta.data.length-1].x,zeroY);
+      c.closePath();
+      const gRed=c.createLinearGradient(0,zeroY,0,bottom);
+      gRed.addColorStop(0,'rgba(255,34,85,0.03)');
+      gRed.addColorStop(1,'rgba(255,34,85,0.25)');
+      c.fillStyle=gRed;c.fill();
+      c.restore();
+    }
+  };
+
+  return new Chart(ctx,{type:'line',
+    plugins:[ChartDataLabels,zeroFillPlugin],
+    data:{labels:padLabels,datasets:[{
+      data:padCum,
+      borderColor:lineColor,
+      borderWidth:2.5,
+      pointRadius:ctx2=>padCum[ctx2.dataIndex]!==null?4:0,
+      pointBackgroundColor:ctx2=>{const v=padCum[ctx2.dataIndex];return v===null?'transparent':v>=0?'#00ff88':'#ff2255'},
+      pointBorderColor:'#111128',
+      pointBorderWidth:2,
+      pointHoverRadius:6,
+      pointHoverBackgroundColor:lineColor,
+      pointHoverBorderColor:'#111128',
+      pointHoverBorderWidth:2,
+      tension:0.3,
+      fill:false,
+      spanGaps:false,
+    }]},
+    options:{responsive:true,maintainAspectRatio:true,
+      interaction:{intersect:false,mode:'index'},
+      plugins:{
+        legend:{display:false},
+        datalabels:{display:false},
+        tooltip:{
+          filter:c=>padCum[c.dataIndex]!==null,
+          backgroundColor:'#111128',titleColor:'#e0e0f0',bodyColor:'#aab',
+          borderColor:'#00e5ff',borderWidth:1,cornerRadius:10,padding:12,
+          displayColors:false,
+          callbacks:{
+            label:c=>{
+              const i=c.dataIndex;
+              const d=padDaily[i];
+              const total=padCum[i];
+              if(total===null)return'';
+              return[
+                '\u0417\u0430 \u043f\u0435\u0440\u0438\u043e\u0434: '+(d>=0?'+':'')+d.toFixed(2)+' '+currency,
+                '\u0418\u0442\u043e\u0433\u043e: '+(total>=0?'+':'')+total.toFixed(2)+' '+currency
+              ];
+            }
+          }
+        }
+      },
+      scales:{
+        x:{ticks:{color:'#667',maxRotation:45,font:{size:11}},grid:{display:false}},
+        y:{
+          min:yMin,max:yMax,
+          ticks:{color:'#667',callback:v=>(v>=0?'+':'')+v.toFixed(0)+' '+sym,font:{size:10}},
+          grid:{color:c=>c.tick.value===0?'rgba(255,255,255,0.15)':'rgba(255,255,255,0.05)',lineWidth:c=>c.tick.value===0?2:1},
+        }
+      }
+    }
+  });
+}
+
+function buildCombinedChart(canvasId, allLabels, seriesMap){
+  // seriesMap: {SCALP: {labels:[], daily:[]}, DEGEN: {...}, ...}
+  const ctx=document.getElementById(canvasId).getContext('2d');
+
+  // Pad x-axis +20% with empty space (same as buildArea)
+  const extra=Math.max(1,Math.ceil(allLabels.length*0.2));
+  const padLabels=[...allLabels];
+  for(let i=0;i<extra;i++){padLabels.push('')}
+
+  const datasets=[];
+  const dailyMaps={};  // for datalabels: dailyMaps[datasetIdx][pointIdx]
+  let dsIdx=0;
+  Object.keys(seriesMap).forEach(name=>{
+    const s=seriesMap[name];
+    const color=INST_COLORS[name]||'#999';
+    // Build cumulative PnL aligned to allLabels
+    const cumMap={};const dayMap={};let cum=0;
+    for(let i=0;i<s.labels.length;i++){cum+=s.daily[i];cumMap[s.labels[i]]=cum;dayMap[s.labels[i]]=s.daily[i]}
+    const data=[];const daily=[];let lastVal=null;
+    allLabels.forEach(l=>{
+      if(cumMap[l]!==undefined){lastVal=cumMap[l];data.push(lastVal);daily.push(dayMap[l]||0)}
+      else{data.push(lastVal);daily.push(0)}
+    });
+    // Pad with nulls
+    for(let i=0;i<extra;i++){data.push(null);daily.push(0)}
+    dailyMaps[dsIdx]=daily;
+    datasets.push({
+      label:name,
+      data:data,
+      borderColor:color,
+      backgroundColor:color,
+      borderWidth:2.5,
+      pointRadius:c=>data[c.dataIndex]!==null?4:0,
+      pointBackgroundColor:color,
+      pointBorderColor:'#111128',
+      pointBorderWidth:2,
+      pointHoverRadius:6,
+      pointHoverBackgroundColor:color,
+      pointHoverBorderColor:'#111128',
+      pointHoverBorderWidth:2,
+      tension:0.3,
+      fill:false,
+      spanGaps:true,
+    });
+    dsIdx++;
+  });
+
+  return new Chart(ctx,{type:'line',
+    plugins:[ChartDataLabels],
+    data:{labels:padLabels,datasets:datasets},
+    options:{responsive:true,maintainAspectRatio:true,
+      interaction:{intersect:false,mode:'index'},
+      plugins:{
+        legend:{display:true,position:'top',labels:{
+          usePointStyle:true,pointStyle:'circle',padding:16,
+          font:{size:12,weight:'600'},color:'#aab',
+        }},
+        datalabels:{display:false},
+        tooltip:{
+          filter:c=>c.parsed.y!==null,
+          backgroundColor:'#111128',titleColor:'#e0e0f0',bodyColor:'#aab',
+          borderColor:'#00e5ff',borderWidth:1,cornerRadius:10,padding:12,
+          callbacks:{
+            label:c=>{
+              const v=c.parsed.y;
+              if(v===null)return'';
+              const cur=INST_CURRENCY[c.dataset.label]||'USDT';
+              const d=dailyMaps[c.datasetIndex][c.dataIndex];
+              return c.dataset.label+': '+(v>=0?'+':'')+v.toFixed(2)+' '+cur+' ('+(d>=0?'+':'')+d.toFixed(2)+')';
+            }
+          }
+        }
+      },
+      scales:{
+        x:{ticks:{color:'#667',maxRotation:45,font:{size:10},maxTicksLimit:20},grid:{display:false}},
+        y:{
+          ticks:{color:'#667',callback:v=>(v>=0?'+':'')+v.toFixed(0),font:{size:10}},
+          grid:{color:c=>c.tick.value===0?'rgba(255,255,255,0.15)':'rgba(255,255,255,0.05)',lineWidth:c=>c.tick.value===0?2:1},
+        }
+      }
+    }
+  });
+}
+
+function expandChart(instName){
+  const d=instanceData[instName];
+  if(!d||!d.labels.length)return;
+  if(chartFull){chartFull.destroy();chartFull=null}
+  const color=INST_COLORS[instName]||'#818cf8';
+  const cur=INST_CURRENCY[instName]||'USDT';
+  const sym=INST_SYM[instName]||'$';
+  document.getElementById('fullscreen-label').textContent=instName+' — кумулятивный PnL ('+cur+')';
+  chartFull=buildArea('pnlChartFull',d.labels,d.daily,color,cur,sym);
+  document.getElementById('chart-fullscreen').style.display='flex';
+}
+
+function closeFullscreen(e){
+  if(e&&e.target!==document.getElementById('chart-fullscreen'))return;
+  document.getElementById('chart-fullscreen').style.display='none';
+  if(chartFull){chartFull.destroy();chartFull=null}
+}
+
+async function loadChart(){
+  try{
+    let pnlUrl='/api/pnl?days=30&tf='+currentTF+'&source='+currentSource;
+    if(archiveDate)pnlUrl+='&date='+archiveDate+'&range='+archiveRange;
+    const pnl=await(await fetch(pnlUrl)).json();
+    // Destroy old charts
+    if(chartCombined){chartCombined.destroy();chartCombined=null}
+    Object.values(miniCharts).forEach(c=>c.destroy());miniCharts={};
+    instanceData={};
+
+    if(!pnl.length){
+      const cc=document.getElementById('pnlChartCombined');
+      const cx=cc.getContext('2d');cx.clearRect(0,0,cc.width,cc.height);
+      cx.fillStyle='#445';cx.font='14px monospace';cx.textAlign='center';
+      cx.fillText('Нет данных за выбранный период',cc.width/2,cc.height/2);
+      // Show all mini-charts with "no data" placeholder
+      Object.keys(INST_MINI).forEach(name=>{
+        const el=document.getElementById(INST_MINI[name]);
+        el.style.display='';
+        const c=document.getElementById(INST_CANVAS[name]);
+        const cx2=c.getContext('2d');cx2.clearRect(0,0,c.width,c.height);
+        cx2.fillStyle='#445';cx2.font='13px monospace';cx2.textAlign='center';
+        cx2.fillText('Нет данных',c.width/2,c.height/2);
+      });
+      document.getElementById('chart-legend').innerHTML='';
+      return;
+    }
+
+    const labels=pnl.map(d=>{
+      const dt=d.trade_date;
+      if(currentTF==='1M')return dt.slice(0,7);
+      if(currentTF==='1D')return dt.slice(5,10);
+      return dt.length>16?dt.slice(5,16).replace('T',' '):dt.length>10?dt.slice(11,16):dt;
+    });
+
+    // Parse per-instance data from API response
+    // API keys: SCALP, DEGEN, SWING, TBANK-SCALP, TBANK-SWING
+    const instDaily={};
+    const KNOWN_INST=['FIBA','TBANK-SCALP','TBANK-SWING','MIDAS'];
+
+    pnl.forEach((d,i)=>{
+      const keys=Object.keys(d).filter(k=>!['trade_date','pnl','trades_count'].includes(k));
+      if(keys.length===0){
+        // Fallback: no instance keys, assign all pnl to SCALP
+        if(!instDaily['SCALP'])instDaily['SCALP']=new Array(pnl.length).fill(0);
+        instDaily['SCALP'][i]=d.pnl||0;
+        return;
+      }
+      keys.forEach(k=>{
+        const name=k.toUpperCase();
+        // Normalize to known instance names
+        let mapped=KNOWN_INST.find(n=>name===n||name.replace(/_/g,'-')===n);
+        if(!mapped){
+          // Fuzzy: TBANK_SCALP -> TBANK-SCALP, etc
+          if(name.includes('TBANK')&&name.includes('SCALP'))mapped='TBANK-SCALP';
+          else if(name.includes('TBANK')&&name.includes('SWING'))mapped='TBANK-SWING';
+          else if(name.includes('MIDAS'))mapped='MIDAS';
+          else if(name.includes('FIBA')||name.includes('SMC'))mapped='FIBA';
+          else mapped='FIBA';
+        }
+        if(!instDaily[mapped])instDaily[mapped]=new Array(pnl.length).fill(0);
+        instDaily[mapped][i]+=(d[k]||0);
+      });
+    });
+
+    // Filter: keep only points where instance had a trade
+    function filterSeries(lbl,daily){
+      const fl=[],fd=[];
+      for(let i=0;i<daily.length;i++){if(daily[i]!==0){fl.push(lbl[i]);fd.push(daily[i])}}
+      return{labels:fl,daily:fd};
+    }
+
+    // Build per-instance data (no filtering — show gaps/zeros)
+    const seriesMap={};
+    const allInstLabels=new Set();
+    Object.keys(instDaily).forEach(name=>{
+      const hasData=instDaily[name].some(v=>v!==0);
+      if(hasData){
+        const all={labels:labels,daily:instDaily[name]};
+        instanceData[name]=all;
+        seriesMap[name]=all;
+        labels.forEach(l=>allInstLabels.add(l));
+      }
+    });
+
+    // Combined chart — all instances with data
+    const allLabels=[...allInstLabels].sort();
+    if(Object.keys(seriesMap).length>0){
+      chartCombined=buildCombinedChart('pnlChartCombined',allLabels,seriesMap);
+    }else{
+      const cc=document.getElementById('pnlChartCombined');
+      const cx=cc.getContext('2d');cx.clearRect(0,0,cc.width,cc.height);
+      cx.fillStyle='#445';cx.font='14px monospace';cx.textAlign='center';
+      cx.fillText('Нет закрытых сделок',cc.width/2,cc.height/2);
+    }
+
+    // Mini-charts per instance (always show all)
+    KNOWN_INST.forEach(name=>{
+      const miniEl=document.getElementById(INST_MINI[name]);
+      miniEl.style.display='';
+      const d=instanceData[name];
+      if(d&&d.daily.length>0){
+        const canvasId=INST_CANVAS[name];
+        const color=INST_COLORS[name];
+        const cur=INST_CURRENCY[name];
+        const sym=INST_SYM[name];
+        miniCharts[name]=buildArea(canvasId,d.labels,d.daily,color,cur,sym);
+      }else{
+        const c=document.getElementById(INST_CANVAS[name]);
+        const cx=c.getContext('2d');cx.clearRect(0,0,c.width,c.height);
+        cx.fillStyle='#445';cx.font='13px monospace';cx.textAlign='center';
+        cx.fillText('Нет данных',c.width/2,c.height/2);
+      }
+    });
+
+    // Legend (all instances)
+    const legHtml=KNOWN_INST.map(name=>
+      '<span class="leg-item"><span class="dot" style="background:'+INST_COLORS[name]+'"></span>'+name+'</span>'
+    ).join('');
+    document.getElementById('chart-legend').innerHTML=legHtml;
+
+  }catch(e){console.error('chart',e)}
+}
+
+const ALL_SERVICES=['stasik-smc','stasik-tbank-scalp','stasik-tbank-swing','stasik-midas'];
+async function bulkAction(action){
+  const label=action==='restart'?'Перезапустить':'Остановить';
+  if(!confirm(label+' ВСЕХ ботов ('+ALL_SERVICES.length+')?'))return;
+  const btns=document.querySelectorAll('.btn-bulk');
+  btns.forEach(b=>{b.disabled=true});
+  let ok=0,fail=0;
+  for(const svc of ALL_SERVICES){
+    try{
+      const r=await fetch('/api/toggle-service',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({service:svc,action})});
+      const d=await r.json();
+      if(d.ok)ok++;else fail++;
+    }catch(e){fail++}
+  }
+  btns.forEach(b=>{b.disabled=false});
+  if(fail)alert(label+': '+ok+' ок, '+fail+' ошибок');
+  setTimeout(()=>loadAll(),2000);
+}
+
+async function toggleAllLeverage(){
+  const btn=document.getElementById('btn-nolev');
+  const isOff=btn.dataset.state==='1x';
+  const newLev=isOff?0:1;
+  const label=isOff?'Вернуть плечо из конфигов':'Убрать плечо (1x) для ВСЕХ Bybit инстансов';
+  if(!confirm(label+'?'))return;
+  btn.disabled=true;
+  const instances=['SCALP','DEGEN','SWING'];
+  let ok=0,fail=0;
+  if(isOff){
+    for(const inst of instances){
+      try{
+        const r=await fetch('/api/set-leverage',{method:'POST',headers:{'Content-Type':'application/json'},
+          body:JSON.stringify({instance:inst,leverage:'config'})});
+        const d=await r.json();if(d.ok)ok++;else fail++;
+      }catch(e){fail++}
+    }
+    btn.dataset.state='';btn.textContent='1x No Leverage';
+  }else{
+    for(const inst of instances){
+      try{
+        const r=await fetch('/api/set-leverage',{method:'POST',headers:{'Content-Type':'application/json'},
+          body:JSON.stringify({instance:inst,leverage:1})});
+        const d=await r.json();if(d.ok)ok++;else fail++;
+      }catch(e){fail++}
+    }
+    btn.dataset.state='1x';btn.textContent='Restore Leverage';
+  }
+  btn.disabled=false;
+  if(fail)alert(ok+' ok, '+fail+' errors');
+  loadInstances();
+}
+
+async function toggleService(service,action,btn){
+  const label=action==='stop'?'Остановить':action==='restart'?'Перезапустить':'Запустить';
+  if(!confirm(label+' '+service+'?'))return;
+  const old=btn.innerHTML;
+  btn.disabled=true;btn.innerHTML='&#8987;';
+  try{
+    const r=await fetch('/api/toggle-service',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({service,action})});
+    const d=await r.json();
+    if(d.ok){btn.innerHTML='&#10003;';setTimeout(()=>loadAll(),2000)}
+    else{alert(d.error||'Ошибка');btn.disabled=false;btn.innerHTML=old}
+  }catch(e){alert('Ошибка: '+e);btn.disabled=false;btn.innerHTML=old}
+}
+
+async function setInstanceLeverage(instance,leverage,sel){
+  leverage=parseInt(leverage);
+  if(!confirm('Set leverage '+leverage+'x for ALL pairs in '+instance+'?')){
+    sel.value=sel.dataset.prev||sel.value;return;
+  }
+  sel.disabled=true;
+  try{
+    const r=await fetch('/api/set-leverage',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({instance,leverage})});
+    const d=await r.json();
+    if(d.ok){sel.dataset.prev=String(leverage);sel.disabled=false;loadInstances()}
+    else{alert(d.error||'Error');sel.disabled=false;sel.value=sel.dataset.prev||sel.value}
+  }catch(e){alert('Error: '+e);sel.disabled=false;sel.value=sel.dataset.prev||sel.value}
+}
+
+async function setPairLeverage(symbol,leverage,sel){
+  leverage=parseInt(leverage);
+  sel.disabled=true;
+  try{
+    const r=await fetch('/api/set-leverage',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({symbol,leverage})});
+    const d=await r.json();
+    if(d.ok){sel.disabled=false}
+    else{alert(d.error||'Error');sel.disabled=false;sel.value=sel.dataset.prev||sel.value}
+  }catch(e){alert('Error: '+e);sel.disabled=false;sel.value=sel.dataset.prev||sel.value}
+}
+
+async function closePosition(symbol,instance,btn){
+  if(!confirm('Закрыть '+symbol+'?'))return;
+  btn.disabled=true;btn.textContent='...';
+  try{
+    const r=await fetch('/api/close-position',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({symbol,instance})});
+    const d=await r.json();
+    if(d.ok){btn.innerHTML='&#10003;';loadPositions()}
+    else{alert(d.error||'Ошибка');btn.disabled=false;btn.innerHTML='&times;'}
+  }catch(e){alert('Ошибка: '+e);btn.disabled=false;btn.innerHTML='&times;'}
+}
+async function doublePosition(symbol,side,qty,instance,btn){
+  if(!confirm('Удвоить позицию '+symbol+'? (добавить +'+qty+' '+side+')'))return;
+  btn.disabled=true;btn.textContent='...';
+  try{
+    const r=await fetch('/api/double-position',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({symbol,side,qty,instance})});
+    const d=await r.json();
+    if(d.ok){btn.textContent='OK';setTimeout(()=>loadAll(),1500)}
+    else{alert(d.error||'Ошибка');btn.disabled=false;btn.textContent='X2'}
+  }catch(e){alert('Ошибка: '+e);btn.disabled=false;btn.textContent='X2'}
+}
+async function closeAllPositions(){
+  if(!confirm('Flatten all positions?'))return;
+  const btn=document.querySelector('.btn-close-all');
+  btn.disabled=true;btn.textContent='Closing...';
+  try{
+    const r=await fetch('/api/close-all',{method:'POST',headers:{'Content-Type':'application/json'}});
+    const d=await r.json();
+    if(d.ok){btn.textContent='Done';loadAll()}
+    else{alert(d.error||'Error');btn.disabled=false;btn.textContent='CLOSE ALL'}
+  }catch(e){alert('Ошибка: '+e);btn.disabled=false;btn.textContent='Закрыть все позиции'}
+}
+
+let slEditing=false;
+async function setSL(symbol,side,entryPrice,qty,instance,btn){
+  const input=btn.parentElement.querySelector('.sl-input');
+  const amount=parseFloat(input.value);
+  if(!amount||amount<=0){alert('Введите сумму стоп-лосса');return}
+  btn.disabled=true;btn.textContent='...';
+  try{
+    const r=await fetch('/api/set-sl',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({symbol,side,amount,entry_price:entryPrice,qty,instance})});
+    const d=await r.json();
+    if(d.ok){btn.textContent='OK';input.blur();slEditing=false;setTimeout(()=>loadAll(),1000)}
+    else{alert(d.error||'Ошибка');btn.disabled=false;btn.textContent='OK'}
+  }catch(e){alert('Ошибка: '+e);btn.disabled=false;btn.textContent='OK'}
+}
+async function setTP(symbol,side,entryPrice,qty,instance,btn){
+  const input=btn.parentElement.querySelector('.tp-input');
+  const amount=parseFloat(input.value);
+  if(!amount||amount<=0){alert('Введите сумму тейк-профита');return}
+  btn.disabled=true;btn.textContent='...';
+  try{
+    const r=await fetch('/api/set-tp',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({symbol,side,amount,entry_price:entryPrice,qty,instance})});
+    const d=await r.json();
+    if(d.ok){btn.textContent='OK';input.blur();slEditing=false;setTimeout(()=>loadAll(),1000)}
+    else{alert(d.error||'Ошибка');btn.disabled=false;btn.textContent='OK'}
+  }catch(e){alert('Ошибка: '+e);btn.disabled=false;btn.textContent='OK'}
+}
+
+let _posCache=[];
+// _nightCheck removed — night mode runs server-side
+function _renderPosRow(p){
+      const grossPnl=parseFloat(p.unrealised_pnl)||0;
+      const inst=(p.instance||'').toUpperCase();
+      const isCls=inst.includes('TBANK')?'inst-tbank':inst.includes('DEGEN')?'inst-degen':inst.includes('SCALP')?'inst-scalp':inst.includes('MIDAS')?'inst-midas':inst.includes('TURTLE')?'inst-turtle':inst.includes('FIBA')?'inst-fiba':inst.includes('BUBA')?'inst-buba':'inst-other';
+      const iLabel=inst.includes('TBANK-SCALP')?'TB-SCALP':inst.includes('TBANK-SWING')?'TB-SWING':inst.includes('DEGEN')?'DEGEN':inst.includes('SCALP')?'SCALP':inst.includes('MIDAS')?'MIDAS':inst.includes('TURTLE-TB')?'TURTLE-TB':inst.includes('TURTLE')?'TURTLE':inst.includes('FIBA')?'FIBA':inst.includes('BUBA')?'BUBA':inst;
+      const closeBtn=currentSource==='live'?`<button class="btn-close-x" onclick="closePosition('${p.symbol}','${p.instance||''}',this)" title="Закрыть позицию">&times;</button>`:'';
+      const entryAmt=parseFloat(p.entry_amount)||0;
+      const feeRate=inst.includes('TBANK')?0.0004:0.00055;
+      const fee=Math.round(entryAmt*feeRate*2);
+      const pnl=grossPnl-fee;
+      const tpPnl=p.tp_pnl!=null?p.tp_pnl:null;
+      const tpTxt=tpPnl!=null?fmt(tpPnl):'—';
+      const slPnl=p.sl_pnl!=null?p.sl_pnl:null;
+      const slTxt=slPnl!=null?fmt(slPnl):'—';
+      const pc=p.partial_closed||0;
+      const soBadge=pc>0?` <span class="so-badge">${pc}/3</span>`:'';
+      const key=`${p.instance||''}_${p.symbol}_${p.side}`;
+      const lev=p.leverage||'?';
+      return`<tr data-pos-key="${key}" class="fade-in">
+        <td><span class="inst-tag ${isCls}">${iLabel}</span></td>
+        <td style="color:var(--muted)">${p.symbol}${soBadge}</td>
+        <td style="color:var(--muted)">${p.side==='Buy'?'<span style="color:#00ff88">\u2191</span> LONG':'<span style="color:#ff2255">\u2193</span> SHORT'}</td>
+        <td style="color:var(--neon-cyan);font-size:11px">x${lev}</td>
+        <td style="color:var(--muted)">${Math.round(entryAmt).toLocaleString()}</td>
+        <td style="color:var(--muted)">${tpTxt}</td>
+        <td style="color:var(--muted)">${slTxt}</td>
+        <td class="${cls(grossPnl)}" data-col="gross">${fmt(grossPnl)}</td>
+        <td style="color:#ff9800">${fee.toLocaleString()}</td>
+        <td class="${cls(pnl)}" data-col="net"><strong>${fmt(pnl)}</strong></td>
+        <td>${closeBtn}</td></tr>`;
+}
+async function loadPositions(){
+  try{
+    if(slEditing)return;
+    const pos=await(await fetch('/api/positions?source='+currentSource)).json();
+    const body=document.getElementById('pos-body');
+    const wrap=document.getElementById('close-all-wrap');
+    if(!pos.length){
+      body.innerHTML='<tr><td colspan="11" style="text-align:center;color:#445;padding:20px">Нет открытых позиций</td></tr>';
+      wrap.style.display='none';_posCache=[];return;
+    }
+    wrap.style.display=currentSource==='live'?'':'none';
+    _posCache=pos;
+    body.innerHTML=pos.map(p=>_renderPosRow(p)).join('');
+    // night mode runs server-side
+  }catch(e){console.error('positions',e)}
+}
+async function updatePnlOnly(){
+  try{
+    if(slEditing)return;
+    const pos=await(await fetch('/api/positions?source='+currentSource)).json();
+    const body=document.getElementById('pos-body');
+    if(!pos.length){
+      if(_posCache.length>0)loadPositions();
+      return;
+    }
+    if(pos.length!==_posCache.length){loadPositions();return}
+    const rows=body.querySelectorAll('tr[data-pos-key]');
+    for(const p of pos){
+      const key=`${p.instance||''}_${p.symbol}_${p.side}`;
+      const row=[...rows].find(r=>r.dataset.posKey===key);
+      if(!row){loadPositions();return}
+      const grossPnl=parseFloat(p.unrealised_pnl)||0;
+      const inst=(p.instance||'').toUpperCase();
+      const entryAmt=parseFloat(p.entry_amount)||0;
+      const feeRate=inst.includes('TBANK')?0.0004:0.00055;
+      const fee=Math.round(entryAmt*feeRate*2);
+      const pnl=grossPnl-fee;
+      const grossTd=row.querySelector('[data-col="gross"]');
+      const netTd=row.querySelector('[data-col="net"]');
+      if(grossTd){grossTd.className=cls(grossPnl);grossTd.textContent=fmt(grossPnl)}
+      if(netTd){netTd.className=cls(pnl);netTd.innerHTML='<strong>'+fmt(pnl)+'</strong>'}
+    }
+    _posCache=pos;
+    // night mode runs server-side
+  }catch(e){console.error('pnl-update',e)}
+}
+
+async function loadTrades(page){
+  try{
+    let tradesUrl='/api/trades?page='+page+'&per_page=20&source='+currentSource;
+    if(archiveDate)tradesUrl+='&date='+archiveDate+'&range='+archiveRange;
+    const r=await(await fetch(tradesUrl)).json();
+    currentPage=r.page;hasNext=r.has_next;
+    document.getElementById('prev-btn').disabled=currentPage<=1;
+    document.getElementById('next-btn').disabled=!hasNext;
+    document.getElementById('page-info').textContent='Page '+currentPage;
+    document.getElementById('tbody').innerHTML=r.trades.map(t=>{
+      const p=t.pnl||0;
+      const inst=(t.instance||'').toUpperCase();
+      const isCls=inst.includes('TBANK')?'inst-tbank':inst.includes('DEGEN')?'inst-degen':inst.includes('SCALP')?'inst-scalp':inst.includes('MIDAS')?'inst-midas':inst.includes('TURTLE')?'inst-turtle':inst.includes('FIBA')?'inst-fiba':inst.includes('BUBA')?'inst-buba':'inst-other';
+      const iLabel=inst.includes('TBANK-SCALP')?'TB-SCALP':inst.includes('TBANK-SWING')?'TB-SWING':inst.includes('DEGEN')?'DEGEN':inst.includes('SCALP')?'SCALP':inst.includes('MIDAS')?'MIDAS':inst.includes('TURTLE-TB')?'TURTLE-TB':inst.includes('TURTLE')?'TURTLE':inst.includes('FIBA')?'FIBA':inst.includes('BUBA')?'BUBA':inst;
+      const tTime=t.closed_at||t.opened_at||'';
+      let tFmt='—';
+      if(tTime){const mskD=new Date(tTime.replace(' ','T'));tFmt=String(mskD.getDate()).padStart(2,'0')+'.'+String(mskD.getMonth()+1).padStart(2,'0')+' '+String(mskD.getHours()).padStart(2,'0')+':'+String(mskD.getMinutes()).padStart(2,'0')}
+      const tpc=t.partial_closed||0;
+      const tSoBadge=tpc>0?` <span class="so-badge">${tpc}/3</span>`:'';
+      const feeRate=inst.includes('TBANK')?0.0004:0.00055;
+      const entryAmt=(t.entry_price||0)*(t.qty||0);
+      const fee=entryAmt*feeRate*2;
+      const netPnl=p-fee;
+      const qty=t.qty||0;
+      const ps=entryAmt;
+      const psFmt=ps>=1000?(ps/1000).toFixed(1)+'k':ps.toFixed(0);
+      let dur='—';
+      if(t.opened_at&&t.closed_at){
+        const ms=new Date(t.closed_at.replace(' ','T'))-new Date(t.opened_at.replace(' ','T'));
+        if(ms>0){const s=Math.floor(ms/1000),m=Math.floor(s/60),h=Math.floor(m/60),d=Math.floor(h/24);dur=d>0?d+'d '+h%24+'h':h>0?h+'h '+m%60+'m':m>0?m+'m':s+'s'}
+      }else if(t.opened_at&&t.status==='open'){
+        const ms=Date.now()-new Date(t.opened_at.replace(' ','T'));
+        if(ms>0){const s=Math.floor(ms/1000),m=Math.floor(s/60),h=Math.floor(m/60),d=Math.floor(h/24);dur=d>0?d+'d '+h%24+'h':h>0?h+'h '+m%60+'m':m>0?m+'m':s+'s'}
+      }
+      const tLev=t.leverage||'?';
+      return`<tr class="fade-in">
+        <td><span class="inst-tag ${isCls}">${iLabel}</span></td>
+        <td style="color:var(--muted)">${t.symbol}${tSoBadge}</td>
+        <td style="color:var(--muted)">${t.side==='Buy'?'<span style="color:#00ff88">\u2191</span> LONG':'<span style="color:#ff2255">\u2193</span> SHORT'}</td>
+        <td style="color:var(--neon-cyan);font-size:11px">x${tLev}</td>
+        <td style="color:var(--muted);font-size:12px">${qty}</td>
+        <td style="color:var(--muted)">${t.entry_price||'-'}</td><td style="color:var(--muted)">${t.exit_price||'-'}</td>
+        <td style="font-size:12px;color:var(--muted)">$${psFmt}</td>
+        <td class="${cls(p)}">${p?p.toFixed(2):'-'}</td>
+        <td class="${cls(netPnl)}"><strong>${p?netPnl.toFixed(2):'-'}</strong></td>
+        <td style="color:var(--muted);font-size:12px">${tFmt}</td>
+        <td style="color:var(--muted);font-size:11px;white-space:nowrap">${dur}</td>
+        <td class="${t.status==='closed'?'status-closed':'status-open'}">${t.status==='closed'?'Closed':'Open'}</td></tr>`;
+    }).join('');
+  }catch(e){console.error('trades',e)}
+}
+
+function changePage(d){loadTrades(currentPage+d)}
+
+async function loadAll(){
+  await Promise.all([loadInstances(),loadStats(),loadChart(),loadPositions(),loadTrades(currentPage),loadPairPnl()]);
+  document.getElementById('last-update').textContent=
+    'Обновлено: '+new Date().toLocaleTimeString('ru-RU');
+}
+function updateMarketBar(){
+  const now=new Date();
+  const msk=new Date(now.toLocaleString('en-US',{timeZone:'Europe/Moscow'}));
+  const h=msk.getHours(),m=msk.getMinutes(),day=msk.getDay();
+  const pad=n=>String(n).padStart(2,'0');
+  document.getElementById('msk-clock').textContent=pad(h)+':'+pad(m)+':'+pad(msk.getSeconds())+' МСК';
+  // Bybit always open — show UTC time
+  document.getElementById('bybit-dot').className='market-dot open';
+  const utc=new Date(now.toLocaleString('en-US',{timeZone:'UTC'}));
+  document.getElementById('bybit-hours').textContent='UTC '+pad(utc.getHours())+':'+pad(utc.getMinutes());
+  // MOEX: Mon-Fri 10:00-18:50 MSK
+  const moexDot=document.getElementById('moex-dot');
+  const moexSt=document.getElementById('moex-status');
+  const moexHr=document.getElementById('moex-hours');
+  const t=h*60+m;
+  const isWeekday=day>=1&&day<=5;
+  const mainOpen=10*60, mainClose=18*60+50;  // 10:00-18:50
+  const evenOpen=19*60+5, evenClose=23*60+50; // 19:05-23:50
+  if(!isWeekday){
+    moexDot.className='market-dot closed';moexSt.className='market-status closed';
+    moexSt.textContent='Выходной';moexHr.textContent='пн-пт 10:00-18:50';
+  }else if(t>=mainOpen&&t<mainClose){
+    moexDot.className='market-dot open';moexSt.className='market-status open';
+    moexSt.textContent='Основная';moexHr.textContent='до '+pad(18)+':'+pad(50);
+  }else if(t>=evenOpen&&t<evenClose){
+    moexDot.className='market-dot open';moexSt.className='market-status open';
+    moexSt.textContent='Вечерняя';moexHr.textContent='до '+pad(23)+':'+pad(50);
+  }else{
+    moexDot.className='market-dot closed';moexSt.className='market-status closed';
+    if(t<mainOpen){moexSt.textContent='Закрыта';moexHr.textContent='откроется в 10:00'}
+    else{moexSt.textContent='Закрыта';moexHr.textContent='откроется в 10:00'}
+  }
+}
+updateMarketBar();setInterval(updateMarketBar,10000);
+
+loadAll();
+setInterval(updatePnlOnly,5000);
+setInterval(()=>{if(slEditing)return;loadAll()},15000);
+
+// SSE: instant trade updates
+let _sseThrottle=0;
+function _sseRefresh(full){
+  const now=Date.now();
+  if(now-_sseThrottle<2000)return;
+  _sseThrottle=now;
+  if(full){loadAll()}else{loadPositions();loadStats()}
+}
+function connectSSE(){
+  const es=new EventSource('/api/events');
+  es.addEventListener('trade_closed',()=>{console.log('SSE: trade closed');_sseRefresh(true)});
+  es.addEventListener('trade_opened',()=>{console.log('SSE: trade opened');_sseRefresh(false)});
+  es.onerror=()=>{es.close();setTimeout(connectSSE,5000)};
+}
+connectSSE();
+</script>
+</body></html>"""
