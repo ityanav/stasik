@@ -27,8 +27,9 @@ class BybitClient(ExchangeClient):
 
         self.session = HTTP(**http_kwargs)
         self.leverage = config["trading"].get("leverage", 1)
+        self.hedge_mode = config["trading"].get("hedge_mode", False)
         mode = "demo" if self.demo else f"testnet={self.testnet}"
-        logger.info("BybitClient initialized (%s)", mode)
+        logger.info("BybitClient initialized (%s, hedge=%s)", mode, self.hedge_mode)
 
     # ── Balance ──────────────────────────────────────────────
 
@@ -70,6 +71,15 @@ class BybitClient(ExchangeClient):
 
     # ── Orders ───────────────────────────────────────────────
 
+    def _pos_idx(self, side: str, reduce_only: bool = False) -> int:
+        """Compute positionIdx for Hedge mode. 1=Buy/Long, 2=Sell/Short, 0=OneWay."""
+        if not self.hedge_mode:
+            return 0
+        # positionIdx indicates which position side we target
+        if reduce_only:
+            return 2 if side == "Buy" else 1  # Buy closes Short(2), Sell closes Long(1)
+        return 1 if side == "Buy" else 2  # Buy opens Long(1), Sell opens Short(2)
+
     def place_order(
         self,
         symbol: str,
@@ -87,6 +97,7 @@ class BybitClient(ExchangeClient):
             "side": side,
             "orderType": order_type,
             "qty": str(qty),
+            "positionIdx": self._pos_idx(side, reduce_only),
         }
         if stop_loss is not None:
             params["stopLoss"] = str(round(stop_loss, 6))
@@ -180,14 +191,16 @@ class BybitClient(ExchangeClient):
         trailing_stop: float,
         active_price: float,
         category: str = "linear",
+        side: str = "Buy",
     ):
         try:
+            pos_idx = self._pos_idx(side) if self.hedge_mode else 0
             self.session.set_trading_stop(
                 category=category,
                 symbol=symbol,
                 trailingStop=str(round(trailing_stop, 6)),
                 activePrice=str(round(active_price, 6)),
-                positionIdx=0,
+                positionIdx=pos_idx,
             )
             logger.info(
                 "Trailing stop set: %s trail=%s activePrice=%s",

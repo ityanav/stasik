@@ -91,7 +91,7 @@ smc:
   murray_proximity_pct: 0.3
 
 risk:
-  risk_per_trade: 2.0                 # 2% — плечо 1x, можно больше (было 1.5%)
+  risk_per_trade: 0.6
   stop_loss: 1.5                      # фолбэк SL 1.5% (было 1%)
   take_profit: 3.0                    # фолбэк TP 3% (было 2%)
   max_open_positions: 3

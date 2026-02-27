@@ -98,7 +98,7 @@ smc:
   murray_proximity_pct: 0.3
 
 risk:
-  risk_per_trade: 0.5
+  risk_per_trade: 0.15
   max_open_positions: 4
   max_per_symbol: 1
   max_per_group: 2
@@ -176,7 +176,19 @@ other_instances:
     service: "stasik-buba"
     timeframe: "1H"
     leverage: "3x"
+    pairs: ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "AVAXUSDT", "LINKUSDT", "SUIUSDT", "APTUSDT"]
+  - name: "SHAKAL"
+    db_path: "/root/stasik/data/shakal.db"
+    service: "stasik-shakal"
+    timeframe: "15м"
+    leverage: "3x"
     pairs: ["BTCUSDT", "ETHUSDT", "SOLUSDT", "SUIUSDT", "APTUSDT"]
+  - name: "SHAKAL-1H"
+    db_path: "/root/stasik/data/shakal1h.db"
+    service: "stasik-shakal1h"
+    timeframe: "1H"
+    leverage: "3x"
+    pairs: ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "AVAXUSDT", "LINKUSDT", "SUIUSDT", "APTUSDT"]
   - name: "MIDAS"
     db_path: "/root/stasik/data/midas.db"
     config_path: "/root/stasik/config/midas.yaml"

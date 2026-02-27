@@ -500,7 +500,7 @@ class PositionCloseMixin:
                 if self.exchange_type == "bybit":
                     self.client.session.set_trading_stop(
                         category="linear", symbol=symbol,
-                        stopLoss=str(round(entry, 6)), positionIdx=0,
+                        stopLoss=str(round(entry, 6)), positionIdx=self.client._pos_idx(side),
                     )
                 else:
                     logger.info("Breakeven SL for %s: exchange does not support SL move, skipping", symbol)

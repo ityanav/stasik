@@ -93,7 +93,7 @@ smc:
   murray_proximity_pct: 0.3
 
 risk:
-  risk_per_trade: 0.5
+  risk_per_trade: 0.15
   max_open_positions: 4
   max_per_symbol: 1
   max_per_group: 2

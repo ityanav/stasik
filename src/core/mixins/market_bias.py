@@ -256,6 +256,15 @@ class MarketBiasMixin:
             if not self._check_margin_limit():
                 return
 
+            # One-way conflict: check exchange for opposite-side positions from other instances
+            if self.exchange_type == "bybit" and not getattr(self.client, 'hedge_mode', False):
+                ex_positions = self.client.get_positions(symbol=symbol)
+                for ep in ex_positions:
+                    if ep["symbol"] == symbol and ep["side"] != side and ep["size"] > 0:
+                        logger.info("One-way конфликт: %s %s занят (%s) другим инстансом, пропуск",
+                                    symbol, side, ep["side"])
+                        return
+
             # Correlation group limit (count unique symbols, not trades)
             group = self._corr_groups.get(symbol)
             if group:

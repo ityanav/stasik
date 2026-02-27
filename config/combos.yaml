@@ -17,4 +17,6 @@ shakal:
   - [cluster, fib, ote, sweep]
   - [cluster, fib, ob]
   - [cluster, fib, sweep]
+  - [cd, cluster, fib, sweep]
+  - [cd, cluster, fib, ote, sweep]
   - [fib, fvg, sweep]

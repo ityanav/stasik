@@ -59,7 +59,7 @@ strategy:
   scale_out_sizes: [0.35, 0.35, 0.30]
 
 risk:
-  risk_per_trade: 2.0                # 2% баланса на сделку
+  risk_per_trade: 0.6
   stop_loss: 1.5                     # фолбэк SL 1.5%
   take_profit: 3.0                   # фолбэк TP 3%
   max_open_positions: 4

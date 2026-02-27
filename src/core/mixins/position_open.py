@@ -254,6 +254,7 @@ class PositionOpenMixin:
                         symbol=symbol,
                         trailing_stop=trailing_distance,
                         active_price=active_price,
+                        side=side,
                     )
                     trailing_msg = f"\n📐 Trailing SL: {trail_pct:.2f}% ATR (активация при {trail_activation_pct}% прибыли)"
             else:
@@ -269,6 +270,7 @@ class PositionOpenMixin:
                         symbol=symbol,
                         trailing_stop=trailing_distance,
                         active_price=active_price,
+                        side=side,
                     )
                     trailing_msg = f"\n📐 Trailing SL: {trail_pct}% (активация при {trail_activation_pct}% прибыли)"
         elif symbol_count > 1:
