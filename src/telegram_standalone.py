@@ -31,7 +31,6 @@ logger = logging.getLogger(__name__)
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     [
         [KeyboardButton("📊 Статус"), KeyboardButton("📈 Позиции")],
-        [KeyboardButton("💰 Баланс")],
         [KeyboardButton("▶️ Старт"), KeyboardButton("🛑 Стоп")],
     ],
     resize_keyboard=True,
@@ -76,19 +75,144 @@ def _systemctl(action: str, service: str) -> bool:
         return False
 
 
-def _get_status() -> str:
-    lines = ["🤖 Stasik Status\n"]
+def _get_dashboard() -> str:
+    lines = ["━━━ 📊 DASHBOARD ━━━\n"]
+
+    # ── Balances ──
+    bybit_balance = 0.0
+    try:
+        from pybit.unified_trading import HTTP
+        with open("/root/stasik/config/fiba.yaml") as f:
+            cfg = yaml.safe_load(f)
+        bybit_cfg = cfg["bybit"]
+        http_kwargs = {"api_key": bybit_cfg["api_key"], "api_secret": bybit_cfg["api_secret"]}
+        if bybit_cfg.get("demo"):
+            http_kwargs["demo"] = True
+        else:
+            http_kwargs["testnet"] = bybit_cfg.get("testnet", False)
+        session = HTTP(**http_kwargs)
+        resp = session.get_wallet_balance(accountType="UNIFIED", coin="USDT")
+        for acct in resp["result"]["list"]:
+            for c in acct["coin"]:
+                if c["coin"] == "USDT":
+                    bybit_balance = float(c["walletBalance"])
+    except Exception as e:
+        logger.warning("Bybit balance error: %s", e)
+
+    tbank_balance = 0.0
+    try:
+        from src.exchange.tbank_client import TBankClient
+        with open("/root/stasik/config/tbank_scalp.yaml") as f:
+            cfg = yaml.safe_load(f)
+        tc = TBankClient(cfg)
+        tbank_balance = tc.get_balance("RUB")
+    except Exception as e:
+        logger.warning("TBank balance error: %s", e)
+
+    # ── Daily PnL per instance ──
+    today = datetime.now(timezone(timedelta(hours=3))).strftime("%Y-%m-%d")
+    total_usdt = 0.0
+    total_rub = 0.0
+    total_wins = 0
+    total_losses = 0
+    total_open = 0
+    inst_lines = []
+
     for inst in INSTANCES:
         active = _is_service_active(inst["service"])
         icon = "🟢" if active else "🔴"
         name = inst["name"]
+        cur = inst["currency"]
 
-        if inst["db"] and Path(inst["db"]).exists():
-            rows = _query_db(inst["db"], "SELECT COUNT(*) as cnt FROM trades WHERE status='open'")
-            open_cnt = rows[0]["cnt"] if rows else 0
-            lines.append(f"{icon} {name}: {'active' if active else 'stopped'} | {open_cnt} open")
+        # Short name for display
+        short = name.replace("TBANK-", "TB-")
+
+        if not inst["db"] or not Path(inst["db"]).exists():
+            inst_lines.append(f"{icon} {short:9s} —")
+            continue
+
+        # Open positions count
+        open_rows = _query_db(inst["db"], "SELECT COUNT(*) as cnt FROM trades WHERE status='open'")
+        open_cnt = open_rows[0]["cnt"] if open_rows else 0
+        total_open += open_cnt
+
+        if not active:
+            inst_lines.append(f"{icon} {short:9s} стоп")
+            continue
+
+        # Daily net PnL
+        rows = _query_db(
+            inst["db"],
+            "SELECT SUM(pnl) as total, "
+            "SUM(CASE WHEN pnl >= 0 THEN 1 ELSE 0 END) as wins, "
+            "SUM(CASE WHEN pnl < 0 THEN 1 ELSE 0 END) as losses "
+            "FROM trades WHERE status='closed' AND date(closed_at)=?",
+            (today,),
+        )
+        day_pnl = 0.0
+        wins = 0
+        losses = 0
+        if rows and rows[0]["total"] is not None:
+            gross = float(rows[0]["total"])
+            wins = int(rows[0]["wins"] or 0)
+            losses = int(rows[0]["losses"] or 0)
+
+            # Calc fees for net PnL
+            fee_rows = _query_db(
+                inst["db"],
+                "SELECT entry_price, exit_price, qty FROM trades "
+                "WHERE status='closed' AND date(closed_at)=?",
+                (today,),
+            )
+            fee_rate = 0.0004 if cur == "RUB" else 0.00055
+            total_fee = sum(
+                (float(r["entry_price"] or 0) * float(r["qty"] or 0) +
+                 float(r["exit_price"] or 0) * float(r["qty"] or 0)) * fee_rate
+                for r in fee_rows
+            )
+            day_pnl = gross - total_fee
+
+        total_wins += wins
+        total_losses += losses
+        if cur == "USDT":
+            total_usdt += day_pnl
         else:
-            lines.append(f"{icon} {name}: {'active' if active else 'stopped'}")
+            total_rub += day_pnl
+
+        # Format PnL
+        cur_sym = "$" if cur == "USDT" else "₽"
+        sign = "+" if day_pnl >= 0 else ""
+        pos_str = f"{open_cnt} поз" if open_cnt > 0 else "0 поз"
+        pnl_str = f"{sign}{day_pnl:,.2f}{cur_sym}" if cur == "USDT" else f"{sign}{day_pnl:,.0f}{cur_sym}"
+        inst_lines.append(f"{icon} {short:9s} {pos_str} │ {pnl_str}")
+
+    # Bybit daily PnL
+    bybit_sign = "+" if total_usdt >= 0 else ""
+    lines.append(f"💰 Bybit: {bybit_balance:,.0f} USDT ({bybit_sign}{total_usdt:,.0f}$)")
+    lines.append(f"💰 TBank: {tbank_balance:,.0f} RUB ({'+' if total_rub >= 0 else ''}{total_rub:,.0f}₽)")
+
+    lines.append("\n── Боты ──")
+    lines.extend(inst_lines)
+
+    # ── Totals ──
+    total_trades = total_wins + total_losses
+    lines.append("\n── Итого сегодня ──")
+    parts = []
+    if total_usdt != 0 or any(i["currency"] == "USDT" for i in INSTANCES):
+        parts.append(f"USDT: {'+' if total_usdt >= 0 else ''}{total_usdt:,.2f}")
+    if total_rub != 0 or any(i["currency"] == "RUB" for i in INSTANCES):
+        parts.append(f"RUB: {'+' if total_rub >= 0 else ''}{total_rub:,.0f}")
+    lines.append("  │  ".join(parts))
+
+    if total_trades > 0:
+        wr = total_wins / total_trades * 100
+        lines.append(f"WR: {wr:.1f}% ({total_wins}W/{total_losses}L/{total_open}O)")
+    elif total_open > 0:
+        lines.append(f"Открыто: {total_open}")
+
+    msk = datetime.now(timezone(timedelta(hours=3)))
+    lines.append(f"\n🕐 {msk.strftime('%H:%M')} MSK")
+    lines.append("━━━━━━━━━━━━━━━━━")
     return "\n".join(lines)
 
 
@@ -163,6 +287,15 @@ def _enrich_pnl(positions: list[dict]):
             pos["net_pnl"] = 0.0
 
 
+INSTANCE_ICONS = {
+    "FIBA": "🧠",
+    "BUBA": "🦬",
+    "TBANK-SCALP": "🏦",
+    "TBANK-SWING": "📅",
+    "MIDAS": "👑",
+}
+
+
 def _get_positions() -> tuple[str, list[dict]]:
     all_positions = []
     for inst in INSTANCES:
@@ -183,12 +316,42 @@ def _get_positions() -> tuple[str, list[dict]]:
 
     _enrich_pnl(all_positions)
 
-    lines = [f"📈 Позиции ({len(all_positions)})\n"]
+    lines = [f"━━ 📈 Позиции ({len(all_positions)}) ━━\n"]
+
+    # Group by instance
+    from collections import OrderedDict
+    grouped = OrderedDict()
     for p in all_positions:
-        d = "L" if p["side"] == "Buy" else "S"
-        pnl = p.get("net_pnl", 0)
-        sign = "+" if pnl >= 0 else ""
-        lines.append(f"[{p['instance']}] {p['symbol']} {d} @ {p['entry_price']} | {sign}{pnl:,.2f} {p['currency']}")
+        grouped.setdefault(p["instance"], []).append(p)
+
+    net_usdt = 0.0
+    net_rub = 0.0
+    for inst_name, positions in grouped.items():
+        icon = INSTANCE_ICONS.get(inst_name, "📊")
+        short = inst_name.replace("TBANK-", "TB-")
+        lines.append(f"{icon} {short}")
+        for p in positions:
+            arrow = "↑" if p["side"] == "Buy" else "↓"
+            direction = "LONG" if p["side"] == "Buy" else "SHORT"
+            pnl = p.get("net_pnl", 0)
+            sign = "+" if pnl >= 0 else ""
+            cur_sym = "$" if p["currency"] == "USDT" else "₽"
+            pnl_str = f"{sign}{pnl:,.2f}{cur_sym}" if p["currency"] == "USDT" else f"{sign}{pnl:,.0f}{cur_sym}"
+            lines.append(f"  {arrow} {direction} {p['symbol']}  {pnl_str}")
+            if p["currency"] == "USDT":
+                net_usdt += pnl
+            else:
+                net_rub += pnl
+        lines.append("")
+
+    # Net totals
+    parts = []
+    if net_usdt != 0:
+        parts.append(f"{'+' if net_usdt >= 0 else ''}{net_usdt:,.2f}$")
+    if net_rub != 0:
+        parts.append(f"{'+' if net_rub >= 0 else ''}{net_rub:,.0f}₽")
+    if parts:
+        lines.append(f"Net: {' | '.join(parts)}")
 
     return "\n".join(lines), all_positions
 
@@ -427,7 +590,6 @@ class StandaloneTelegramBot:
         handlers = {
             "📊 Статус": self._cmd_status,
             "📈 Позиции": self._cmd_positions,
-            "💰 Баланс": self._cmd_balance,
             "▶️ Старт": self._cmd_run,
             "🛑 Стоп": self._cmd_stop,
         }
@@ -442,9 +604,8 @@ class StandaloneTelegramBot:
             return
         await update.message.reply_text(
             "🤖 Stasik Trading Bot\n\n"
-            "📊 Статус — состояние ботов\n"
+            "📊 Статус — дашборд с балансом и PnL\n"
             "📈 Позиции — открытые сделки + закрытие\n"
-            "💰 Баланс — Bybit/TBank + дневной PnL\n"
             "▶️ Старт — запустить бота\n"
             "🛑 Стоп — остановить бота",
             reply_markup=MAIN_KEYBOARD,
@@ -453,32 +614,25 @@ class StandaloneTelegramBot:
     async def _cmd_status(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not self._check_auth(update):
             return
-        await update.message.reply_text(_get_status(), reply_markup=MAIN_KEYBOARD)
-
-    async def _cmd_balance(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-        if not self._check_auth(update):
-            return
         loop = asyncio.get_event_loop()
-        text = await loop.run_in_executor(None, _get_balance_info)
+        text = await loop.run_in_executor(None, _get_dashboard)
         await update.message.reply_text(text, reply_markup=MAIN_KEYBOARD)
 
     async def _cmd_positions(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not self._check_auth(update):
             return
-        _, positions = _get_positions()
+        loop = asyncio.get_event_loop()
+        text, positions = await loop.run_in_executor(None, _get_positions)
 
         if positions:
             buttons = []
             for p in positions:
-                d = "L" if p["side"] == "Buy" else "S"
-                pnl = p.get("net_pnl", 0)
-                sign = "+" if pnl >= 0 else ""
-                label = f"❌ {p['instance']} {p['symbol']} {d} ({sign}{pnl:.2f})"
+                label = f"❌ {p['symbol']}"
                 cb_data = f"close_{p['instance']}_{p['id']}_{p['symbol']}"
                 buttons.append([InlineKeyboardButton(label, callback_data=cb_data)])
             buttons.append([InlineKeyboardButton("❌ Закрыть ВСЕ", callback_data="close_all")])
             buttons.append([InlineKeyboardButton("Отмена", callback_data="cancel")])
-            await update.message.reply_text(f"📈 Позиции ({len(positions)})", reply_markup=InlineKeyboardMarkup(buttons))
+            await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(buttons))
         else:
             await update.message.reply_text("📈 Нет открытых позиций.", reply_markup=MAIN_KEYBOARD)
 

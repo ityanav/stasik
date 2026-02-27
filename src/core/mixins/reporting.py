@@ -78,8 +78,6 @@ class ReportingMixin:
     async def _notify(self, text: str):
         if self.notifier:
             try:
-                if self.instance_name:
-                    text = f"[{self.instance_name}] {text}"
                 await self.notifier(text)
             except Exception:
                 logger.exception("Failed to send notification")

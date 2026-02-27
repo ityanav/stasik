@@ -272,7 +272,9 @@ class PositionOpenMixin:
         exchange = self.config.get("exchange", "bybit")
         cur = "RUB" if exchange == "tbank" else "USDT"
         ps_fmt = f"{pos_value:,.0f}" if pos_value < 100_000 else f"{pos_value/1000:,.1f}k"
-        msg = f"OPEN [{direction}] [{symbol}] [{ps_fmt} {cur}] [{msk_time} MSK]"
+        inst = self.instance_name or "BOT"
+        lev = self.leverage if hasattr(self, 'leverage') and self.leverage else 1
+        msg = f"📥 {inst} | {direction} {symbol}\n   {ps_fmt} {cur} × {lev}x | {msk_time} MSK"
         logger.info(msg)
         await self._notify(msg)
 

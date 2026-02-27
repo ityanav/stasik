@@ -114,7 +114,10 @@ class PositionCloseMixin:
                     dur_str = f"{dur_sec}s"
             except Exception:
                 pass
-        msg = f"{icon} {pnl:+,.2f} {currency} [CLOSED] [{dur_str}] [{msk_time} MSK]"
+        direction = "LONG" if side == "Buy" else "SHORT"
+        inst = self.instance_name or "BOT"
+        dur_part = f" | {dur_str}" if dur_str else ""
+        msg = f"{icon} {inst} | {symbol} {direction} закрыт\n   {pnl:+,.2f} {currency} (net){dur_part} | {msk_time}"
         logger.info(msg)
         await self._notify(msg)
 
@@ -172,7 +175,10 @@ class PositionCloseMixin:
                     dur_str = f"{dur_sec}s"
             except Exception:
                 pass
-        msg = f"🟢 +{net_pnl:,.2f} {currency} [CLOSED] [{dur_str}] [{msk_time} MSK]"
+        direction = "LONG" if side == "Buy" else "SHORT"
+        inst = self.instance_name or "BOT"
+        dur_part = f" | {dur_str}" if dur_str else ""
+        msg = f"🟢 {inst} | {symbol} {direction} закрыт\n   +{net_pnl:,.2f} {currency} (net){dur_part} | {msk_time}"
         logger.info(msg)
         await self._notify(msg)
 

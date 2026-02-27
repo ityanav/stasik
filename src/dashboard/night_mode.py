@@ -205,9 +205,10 @@ class NightModeMixin:
             return
         currency = "RUB" if any(k in (instance or "").upper() for k in ("TBANK", "MIDAS")) else "USDT"
         icon = "\U0001f7e2" if net_pnl >= 0 else "\U0001f534"
+        direction = "LONG" if side == "Buy" else "SHORT"
         msk = datetime.now(timezone(timedelta(hours=3)))
         msk_time = msk.strftime("%H:%M")
-        text = f"{icon} {net_pnl:+,.2f} {currency} [{instance}] [{msk_time} MSK]"
+        text = f"{icon} {instance} | {symbol} {direction} закрыт\n   {net_pnl:+,.2f} {currency} (net) | {msk_time} MSK"
         url = f"https://api.telegram.org/bot{token}/sendMessage"
         try:
             async with aiohttp.ClientSession() as session:

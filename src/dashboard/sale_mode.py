@@ -80,14 +80,12 @@ class SaleModeMixin:
         chat_id = tg.get("chat_id")
         if not token or not chat_id:
             return
-        # Calculate net PnL
-        inst_upper = (instance or "").upper()
-        fee_rate = 0.0004 if ("TBANK" in inst_upper or "MIDAS" in inst_upper) else 0.00055
         net_pnl = gross_pnl  # gross_pnl passed from sale_loop already
         icon = "\U0001f7e2" if net_pnl >= 0 else "\U0001f534"
+        direction = "LONG" if side == "Buy" else "SHORT"
         msk = datetime.now(timezone(timedelta(hours=3)))
         msk_time = msk.strftime("%H:%M")
-        text = f"{icon} {net_pnl:+,.2f} USDT [{instance}] [{msk_time} MSK]"
+        text = f"{icon} {instance} | {symbol} {direction} закрыт\n   {net_pnl:+,.2f} USDT (net) | {msk_time} MSK"
         url = f"https://api.telegram.org/bot{token}/sendMessage"
         try:
             async with aiohttp.ClientSession() as session:
