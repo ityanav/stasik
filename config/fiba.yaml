@@ -31,7 +31,7 @@ strategy:
   bb_period: 20
   bb_std: 2.0
   vol_period: 20
-  vol_threshold: 1.5
+  vol_threshold: 1.2              # optimized (was 1.5) — lower threshold = more confirmations
   sma_period: 25
   htf_filter: true
   htf_min_sma_dev: 0.0
@@ -57,11 +57,11 @@ smc:
   fib_premium_max: 0.786
   fib_standard_min: 0.382
   fib_standard_max: 0.618
-  sweep_lookback: 30
+  sweep_lookback: 20              # optimized (was 30) — fresher sweeps only
   sweep_fresh_candles: 5
   fvg_lookback: 20
   fvg_proximity_pct: 0.5
-  displacement_body_pct: 0.3
+  displacement_body_pct: 0.2      # optimized (was 0.3) — more sensitive displacement detection
   displacement_vol_mult: 1.5
   ob_lookback: 50
   ob_proximity_pct: 1.0
@@ -75,7 +75,7 @@ smc:
   # ZigZag ATR-based swing detection (adaptive to volatility)
   zigzag_enabled: true
   zigzag_atr_period: 14
-  zigzag_atr_mult: 2.0
+  zigzag_atr_mult: 3.0            # optimized (was 2.0) — wider swings = more reliable levels
   # Fibonacci Clusters (multi-swing confluence zones)
   cluster_enabled: true
   cluster_threshold_pct: 1.0
@@ -109,8 +109,8 @@ risk:
   stop_loss: 1.5
   take_profit: 4.0
   atr_period: 14
-  atr_sl_multiplier: 1.0
-  atr_tp_multiplier: 2.5
+  atr_sl_multiplier: 1.5          # optimized (was 1.0) — wider stops, less noise stopouts
+  atr_tp_multiplier: 2.0          # optimized (was 2.5) — closer TP = higher WR
   atr_trailing_multiplier: 1.0
   atr_sl_max: 5.0
   atr_sl_min: 0.5
@@ -184,3 +184,9 @@ other_instances:
     timeframe: "5м"
     leverage: "1x"
     pairs: ["GLDRUB_TOM", "SLVRUB_TOM", "PLTRUB_TOM", "CNYRUB_TOM", "USD000UTSTOM", "KZTRUB_TOM"]
+  - name: "SCALPER"
+    state_file: "/root/stasik/data/scalper_state.json"
+    service: "stasik-scalper"
+    timeframe: "1H"
+    leverage: "3x"
+    pairs: ["SOLUSDT", "ETHUSDT"]
